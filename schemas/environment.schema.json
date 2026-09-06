@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/magtheo/deploy-toolkit/schemas/environment.schema.json",
+  "title": "Environment",
+  "description": "Human-approved desired state for one environment: which release, on which target. Promotion is a one-line diff of spec.release.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": { "const": "deploy.toolkit/v1" },
+    "kind": { "const": "Environment" },
+    "metadata": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "required": ["release", "target"],
+      "additionalProperties": false,
+      "properties": {
+        "release": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "repo-relative or environment-file-relative path to the release manifest"
+        },
+        "target": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
+        "failurePolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "autoRollback": { "enum": ["off", "safe-only", "always"], "default": "safe-only" }
+          }
+        }
+      }
+    }
+  }
+}

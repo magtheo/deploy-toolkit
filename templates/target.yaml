@@ -1,0 +1,16 @@
+apiVersion: deploy.toolkit/v1
+kind: Target
+
+metadata:
+  name: production-primary
+
+spec:
+  transport:
+    type: ssh
+
+    hostFrom: DEPLOY_HOST
+    port: 22
+    user: deploy
+
+    hostKeyFrom: DEPLOY_HOST_KEY
+    credentialFrom: DEPLOY_SSH_KEY

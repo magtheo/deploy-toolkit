@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/magtheo/deploy-toolkit/schemas/target.schema.json",
+  "title": "Target",
+  "description": "A deployment target: anything that can receive a release over a trusted connection. Provider details are deliberately out of scope.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "additionalProperties": false,
+  "properties": {
+    "apiVersion": { "const": "deploy.toolkit/v1" },
+    "kind": { "const": "Target" },
+    "metadata": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" }
+      }
+    },
+    "spec": {
+      "type": "object",
+      "required": ["transport"],
+      "additionalProperties": false,
+      "properties": {
+        "transport": {
+          "oneOf": [
+            { "$ref": "#/$defs/localTransport" },
+            { "$ref": "#/$defs/sshTransport" }
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "envVarName": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]*$" },
+    "localTransport": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "local" }
+      }
+    },
+    "sshTransport": {
+      "type": "object",
+      "required": ["type", "hostFrom", "user", "hostKeyFrom", "credentialFrom"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "ssh" },
+        "hostFrom": { "$ref": "#/$defs/envVarName" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 22 },
+        "user": { "type": "string", "minLength": 1 },
+        "hostKeyFrom": { "$ref": "#/$defs/envVarName" },
+        "credentialFrom": { "$ref": "#/$defs/envVarName" }
+      }
+    }
+  }
+}

@@ -1,0 +1,39 @@
+apiVersion: deploy.toolkit/v1
+kind: Project
+
+metadata:
+  name: my-app
+
+release:
+  source:
+    branch: main
+
+  requiredChecks:
+    - Tests
+
+artifacts:
+  app:
+    type: oci
+    repository: ghcr.io/example/my-app
+
+bundle:
+  include:
+    - docker-compose.yml
+    - config/**
+    - deploy/**
+
+lifecycle:
+  preflight:
+    argv: ["./deploy/preflight.sh"]
+
+  migrate:
+    argv: ["./deploy/migrate.sh"]
+
+  apply:
+    argv: ["./deploy/apply.sh"]
+
+  verify:
+    argv: ["./deploy/verify.sh"]
+
+  rollback:
+    argv: ["./deploy/rollback.sh"]

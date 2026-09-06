@@ -1,0 +1,27 @@
+apiVersion: deploy.toolkit/v1
+kind: Release
+
+metadata:
+  project: my-app
+  version: 0.1.0
+
+source:
+  repository: ghcr.io/example/my-app
+  revision: "0000000000000000000000000000000000000000"
+
+artifacts:
+  app:
+    type: oci
+    image: ghcr.io/example/my-app
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+bundle:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+deploymentContract:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+migration:
+  head: "000"
+  mode: none
+  rollbackSafe: true

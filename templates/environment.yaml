@@ -1,0 +1,13 @@
+apiVersion: deploy.toolkit/v1
+kind: Environment
+
+metadata:
+  name: production
+
+spec:
+  release: ../releases/my-app-0.1.0.yaml
+
+  target: production-primary
+
+  failurePolicy:
+    autoRollback: safe-only
