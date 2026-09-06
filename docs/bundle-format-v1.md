@@ -62,6 +62,9 @@ bundle.
   target).
 - No devices, no sockets, no fifos — Git does not track them; fail closed if
   somehow present.
+- Any path or symlink target that cannot be represented in the chosen ustar
+  format **fails bundle construction**; Deploy Toolkit does not silently
+  switch to PAX/GNU extensions.
 
 ## Digest definitions
 

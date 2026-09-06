@@ -16,23 +16,26 @@ HUMAN MERGE ──► main
        │
        ▼
 build + test + publish  (SHA-tagged artifacts)
-       │
-       ▼
-deployctl release propose <env> <revision>
-       │  deterministic eligibility
-       ▼
+        │
+        ▼
+deployctl release create --revision <sha>
+        │  deterministic eligibility
+        ▼
+deployctl promotion propose <env> --release <version>
+        │
 promotion PR
-       │
+        │
 HUMAN MERGE = authorize
-       │
-       ▼
+        │
+        ▼
 Deploy Toolkit deploys
 ```
 
-## Release proposal
+## Release creation and promotion proposal are separate commands
 
-`deployctl release propose production abc123` performs deterministic
-eligibility checks — no judgment, just verification:
+**`deployctl release create --revision abc123`** owns eligibility, artifact
+resolution, bundle construction and the release manifest. It never opens PRs
+and never changes an environment:
 
 1. revision exists and belongs to permitted `main`;
 2. every required check for that exact SHA concluded successfully
@@ -41,16 +44,49 @@ eligibility checks — no judgment, just verification:
 4. deployment bundle built and digested per
    [bundle-format-v1.md](bundle-format-v1.md);
 5. migration semantics read from explicit inputs — never inferred;
-6. release manifest generated and validated;
-7. environment file updated;
+6. release manifest generated and validated.
+
+**`deployctl promotion propose production --release 0.1.17`** owns the
+environment change and the human gate:
+
+7. environment file updated to the new release;
 8. promotion PR opened.
 
-Eligibility never opens PRs — that is the separate promotion step. The
-semantic version and migration safety are explicit inputs to the proposal, not
-inventions of `deployctl`.
+The split is deliberate vocabulary: *creation* produces an immutable release;
+*proposal* is the human-facing authorization act. The semantic version and
+migration safety are explicit inputs to `release create`, not inventions of
+`deployctl`.
+
+## Eligibility architecture (bounded)
+
+`release create` is decomposed, not one big package — GitHub is the only
+candidate-v1 SCM, so there is a clean GitHub client boundary and no generic
+adapter registries:
 
 ```
-$ deployctl release propose production abc123
+internal/
+├── github/    client, revision ancestry, required checks
+├── oci/       digest resolution via the SHA discovery tag
+├── bundle/    builder + digest (bundle-format-v1)
+└── release/   eligibility + create
+```
+
+The result is structured data, not prose — the promotion PR in the next step
+renders this report without reinterpreting what happened:
+
+```go
+type EligibilityReport struct {
+    SourceRevision string
+    BranchHead     string
+    Checks         []CheckResult
+    Artifacts      map[string]ResolvedArtifact
+    BundleDigest   string
+    ContractDigest string
+}
+```
+
+```
+$ deployctl release create --revision abc123
 
 ✓ source revision exists
 ✓ revision belongs to main
@@ -60,6 +96,11 @@ $ deployctl release propose production abc123
 ✓ workspace artifact found
 ✓ bundle constructed
 ✓ manifest validated
+
+Created:
+.deploy/releases/platform-core-0.1.17.yaml
+
+$ deployctl promotion propose production --release 0.1.17
 
 Opened:
 deploy: promote platform-core 0.1.17 to production

@@ -20,15 +20,15 @@ var bundleIncludePattern = regexp.MustCompile(
 )
 
 func checkOCIRepository(name string) error {
-	if !ociRepositoryPattern.MatchString(name) {
-		return fmt.Errorf("%q is not a valid OCI repository name", name)
-	}
 	last := name
 	if i := strings.LastIndex(name, "/"); i >= 0 {
 		last = name[i+1:]
 	}
 	if strings.ContainsAny(last, ":@") {
 		return fmt.Errorf("%q carries a tag or digest; repository fields must be untagged — releases pin the digest separately", name)
+	}
+	if !ociRepositoryPattern.MatchString(name) {
+		return fmt.Errorf("%q is not a valid OCI repository name", name)
 	}
 	return nil
 }

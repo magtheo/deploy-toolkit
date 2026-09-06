@@ -75,6 +75,52 @@ This does not make deployment provider-specific — source provider (GitHub) and
 deployment target (generic SSH/local) are separate planes. Later source
 adapters (`gitlab`, `forgejo`, …) are earned, not pretended.
 
+## Artifact discovery convention
+
+Eligibility must answer: *which OCI artifact corresponds to source SHA X?*
+Candidate v1 uses one simple rule:
+
+> **Every releasable OCI artifact MUST be published with the full source Git
+> SHA as a temporary discovery tag.**
+
+Resolution therefore reads `ghcr.io/example/app:<full-source-sha>`, captures
+the registry digest, and records only:
+
+```yaml
+image: ghcr.io/example/app
+digest: sha256:...
+```
+
+The SHA tag is an **input to resolution**, never part of the immutable
+Release manifest. Once the digest is pinned, the tag is disposable and may be
+garbage-collected:
+
+```
+mutable/discovery identity    repo:<git-sha>
+        ↓ registry resolution
+immutable identity            repo@sha256:...
+```
+
+## Policy authority: current main vs candidate
+
+For an old commit on `main` there are two versions of `.deploy/project.yaml`:
+the candidate's and current main's. They answer different questions:
+
+| Authority              | Source revision      | Decides                                            |
+| ---------------------- | -------------------- | -------------------------------------------------- |
+| **Eligibility policy** | current trusted main | source repository, permitted branch, requiredChecks |
+| **Deployment material**| candidate revision   | artifact repositories, bundle definition, lifecycle, deployment contract |
+
+`release create` reads policy from current `main` and deployment material from
+the candidate. Consequence: new security policy (e.g. an added
+`requiredChecks` entry) applies to old candidates, while an old application is
+never paired with new deployment scripts.
+
+Candidate v1 defines `requiredChecks` as exact **GitHub check-run names** for
+the candidate SHA. Any state other than `success` — missing, queued,
+in_progress, failure, cancelled, timed_out, skipped, neutral,
+action_required — fails eligibility. No "probably fine."
+
 ## Path safety rules
 
 - `Environment.spec.release` is a **canonical repo-root-relative** path that

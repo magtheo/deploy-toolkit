@@ -90,14 +90,32 @@ toolkit repository push code into every consumer's secret-bearing jobs.
 Before a promotion PR can be generated, the release must pass deterministic
 eligibility:
 
-- revision exists and belongs to the permitted branch (`main`);
-- all required GitHub checks passed;
-- all declared artifacts resolved with pinned digests;
-- bundle built and digested;
+- revision exists and is an **ancestor of** the configured branch head — mere
+  existence is not enough, a commit on an unmerged feature branch also exists;
+- every required GitHub check for **that exact SHA** concluded successfully;
+  missing/queued/in-progress/failure/cancelled/timed_out/skipped all fail
+  closed;
+- all declared artifacts resolved via the SHA discovery tag and pinned to
+  immutable digests;
+- bundle built and digested from the exact Git tree at the revision;
 - manifest validates against the contract schemas.
 
 CI Toolkit's AI review, where present, remains advisory evidence — it gates
 nothing here.
+
+## Policy authority: current main vs candidate
+
+Two versions of `.deploy/project.yaml` can exist for an old candidate: the
+candidate's and current main's. Authority is split:
+
+- **current trusted main** owns release *eligibility policy* — source
+  repository, permitted branch, `requiredChecks`;
+- **the candidate revision** owns *deployment material* — artifact
+  repositories, bundle definition, lifecycle, deployment contract.
+
+Hardened security policy therefore applies to old candidates (you cannot
+promote your way around a newly added required check), while the old
+application is never paired with new deployment scripts.
 
 ## Rollback policy
 

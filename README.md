@@ -98,7 +98,7 @@ Manifests pass through one authoritative pipeline: header check → JSON Schema
 → strict typed decoding → semantic invariants. The schemas are the structural
 contract; `validate` is the definitive validator.
 
-Planned (not yet implemented): `release propose`, promotion PR generation,
+Planned (not yet implemented): `release create`, `promotion propose`,
 `deploy`, `rollback`, `status`. See the roadmap in
 [docs/release-lifecycle.md](docs/release-lifecycle.md).
 
@@ -143,3 +143,7 @@ See [docs/trust-model.md](docs/trust-model.md) for the full trust model and
 ## Governance
 
 Branches: `main` (permanent), plus `fix/*`, `docs/*`, `chore/*`, `feature/*` (with `phase/*` prefixes for substantial work). Substantial features get a plan first. Deterministic tests are required. AI review is advisory; humans hold merge authority.
+
+## License
+
+[Apache-2.0](LICENSE).
