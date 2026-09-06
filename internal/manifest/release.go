@@ -2,7 +2,13 @@ package manifest
 
 import (
 	"fmt"
-	"os"
+)
+
+const (
+	MigrationNone                = "none"
+	MigrationForwardCompatible   = "forward-compatible"
+	MigrationMaintenanceRequired = "maintenance-required"
+	MigrationIrreversible        = "irreversible"
 )
 
 type ReleaseMetadata struct {
@@ -11,6 +17,7 @@ type ReleaseMetadata struct {
 }
 
 type ReleaseSource struct {
+	Type       string `yaml:"type" json:"type"`
 	Repository string `yaml:"repository" json:"repository"`
 	Revision   string `yaml:"revision" json:"revision"`
 }
@@ -46,17 +53,22 @@ type Release struct {
 	Migration          MigrationSpec            `yaml:"migration" json:"migration"`
 }
 
+func (r *Release) check() error {
+	if r.Migration.Mode == MigrationIrreversible && r.Migration.RollbackSafe {
+		return fmt.Errorf("migration mode %q cannot have rollbackSafe: true", MigrationIrreversible)
+	}
+	for name, a := range r.Artifacts {
+		if err := checkOCIRepository(a.Image); err != nil {
+			return fmt.Errorf("artifact %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
 func LoadRelease(path string) (*Release, error) {
-	data, err := os.ReadFile(path)
+	res, err := loadFile(path, KindRelease)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := Validate(data, KindRelease); err != nil {
-		return nil, err
-	}
-	var r Release
-	if err := decodeStrict(data, &r); err != nil {
-		return nil, fmt.Errorf("decode release: %w", err)
-	}
-	return &r, nil
+	return res.Release, nil
 }

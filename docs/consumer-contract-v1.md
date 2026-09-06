@@ -1,5 +1,10 @@
 # Consumer Contract v1
 
+> **Status: candidate.** v1 is not frozen yet. It freezes only after (1) this
+> contract-hardening pass and (2) a real `platform-core` deployment has
+> exercised release generation end to end. Freezing before the reference
+> consumer has used the contract would be backwards.
+
 The configuration surface of Deploy Toolkit is an **API**. This document is the
 compatibility promise for `deploy.toolkit/v1` and the policy for changing it.
 
@@ -8,11 +13,14 @@ compatibility promise for `deploy.toolkit/v1` and the policy for changing it.
 1. The JSON Schemas in [`schemas/`](../schemas/) — Project, Release,
    Environment, Target. Any manifest passing `deployctl validate` today must
    keep passing (same or newer toolkit) under v1.
-2. The lifecycle hook protocol — argv semantics, exit codes, working directory
+2. The semantic invariants enforced on top of the schemas (`internal/manifest`
+   checks): untagged OCI repository names, `irreversible ⇒ rollbackSafe: false`,
+   release-reference and bundle-include path safety.
+3. The lifecycle hook protocol — argv semantics, exit codes, working directory
    and environment (below).
-3. The GitHub workflow interface — inputs, permissions, and required secrets of
+4. The GitHub workflow interface — inputs, permissions, and required secrets of
    the published reusable workflows.
-4. Consumer pinning — consumers pin full SHAs; that pinning model itself is
+5. Consumer pinning — consumers pin full SHAs; that pinning model itself is
    part of the contract.
 
 Everything else (CLI UX, internal Go APIs, server-side layout details) is
@@ -40,6 +48,47 @@ implementation and may change.
 | Target      | `.deploy/targets/<name>.yaml`               | human         |
 
 Start from [`templates/`](../templates/). Never hand-edit a Release manifest.
+
+## Source identity
+
+Source identity is **SCM identity**, never a registry. For v1 the source
+adapter is explicitly **GitHub**:
+
+```yaml
+release:
+  source:
+    type: github
+    repository: example/my-app    # owner/repo — where the revision lives
+    branch: main                  # permitted promotion branch
+```
+
+Generated releases carry the same shape:
+
+```yaml
+source:
+  type: github
+  repository: example/my-app
+  revision: "4ecd4114647f7dda41d98bc17e50ec027f28fac9"
+```
+
+This does not make deployment provider-specific — source provider (GitHub) and
+deployment target (generic SSH/local) are separate planes. Later source
+adapters (`gitlab`, `forgejo`, …) are earned, not pretended.
+
+## Path safety rules
+
+- `Environment.spec.release` is a **canonical repo-root-relative** path that
+  must resolve within `.deploy/releases/` as a flat file name
+  (`.deploy/releases/<project>-<version>.yaml`). Absolute paths, `..`
+  traversal, nested directories and non-canonical forms are rejected. There is
+  exactly one resolution rule; no per-file relative bases.
+- `bundle.include` entries are repo-root-relative globs matched against the
+  Git-tracked tree at the release revision — see
+  [bundle-format-v1.md](bundle-format-v1.md). Leading `/`, backslashes, `.`
+  and `..` segments are rejected; `*`/`**` are allowed only as whole segments.
+- OCI `repository`/`image` fields are **untagged repository names**; tags and
+  floating references (`latest`) are structurally impossible, releases pin the
+  digest separately.
 
 ## Lifecycle hook protocol
 
@@ -102,6 +151,13 @@ migration:
 | `irreversible`        | Cannot be undone; auto-rollback disabled                    |
 
 `rollbackSafe: false` disables auto rollback regardless of mode.
+**`irreversible ⇒ rollbackSafe: false`** is enforced structurally (schema) and
+semantically (Go checks) — the combination `mode: irreversible,
+rollbackSafe: true` cannot validate.
+
+Migration semantics are declared by the project/release, never inferred.
+`forward-compatible` vs `irreversible` is a semantic claim about the
+application's database; deployctl must not guess it.
 
 ## Target contract
 

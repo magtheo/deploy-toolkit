@@ -81,9 +81,11 @@ deployment is a deterministic machine act.
 
 ## Status
 
-Pre-v0.1. The Consumer Contract v1 schemas are defined and `deployctl validate`
-works. See [docs/consumer-contract-v1.md](docs/consumer-contract-v1.md) and the
-v0.1 scope in [docs/architecture.md](docs/architecture.md).
+Pre-v0.1. **Consumer Contract v1 is a candidate, not yet frozen** — it freezes
+after contract hardening has been exercised by a real `platform-core`
+deployment. The schemas are defined and `deployctl validate` enforces them;
+see [docs/consumer-contract-v1.md](docs/consumer-contract-v1.md) and the v0.1
+scope in [docs/architecture.md](docs/architecture.md).
 
 ## Current CLI
 
@@ -92,9 +94,9 @@ deployctl validate <manifest.yaml>...   validate project/release/environment/tar
 deployctl version                       print version
 ```
 
-Manifests are validated against the JSON Schemas in [`schemas/`](schemas/),
-which are embedded in the binary. The schemas are the contract; `validate` is
-how you check that a manifest honors it.
+Manifests pass through one authoritative pipeline: header check → JSON Schema
+→ strict typed decoding → semantic invariants. The schemas are the structural
+contract; `validate` is the definitive validator.
 
 Planned (not yet implemented): `release propose`, promotion PR generation,
 `deploy`, `rollback`, `status`. See the roadmap in
@@ -117,8 +119,8 @@ Promotion is a one-line diff:
 
 ```diff
  spec:
--  release: ../releases/my-app-0.1.16.yaml
-+  release: ../releases/my-app-0.1.17.yaml
+-  release: .deploy/releases/my-app-0.1.16.yaml
++  release: .deploy/releases/my-app-0.1.17.yaml
 ```
 
 **Merge = authorize production.** Rollback is the same diff in reverse.

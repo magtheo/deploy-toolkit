@@ -72,10 +72,10 @@ func validateFile(path string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	h, err := manifest.Validate(data, "")
+	res, err := manifest.Parse(data, "")
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "✓ %s  %s  %s\n", filepath.Base(path), h.Kind, h.APIVersion)
+	fmt.Fprintf(stdout, "✓ %s  %s  %s\n", filepath.Base(path), res.Header.Kind, res.Header.APIVersion)
 	return nil
 }

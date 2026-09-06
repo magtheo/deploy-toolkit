@@ -2,7 +2,8 @@ package manifest
 
 import (
 	"fmt"
-	"os"
+	"path"
+	"strings"
 )
 
 type EnvironmentMetadata struct {
@@ -33,17 +34,35 @@ func (e *Environment) AutoRollback() string {
 	return e.Spec.FailurePolicy.AutoRollback
 }
 
+func (e *Environment) check() error {
+	if err := checkReleaseRef(e.Spec.Release); err != nil {
+		return fmt.Errorf("spec.release: %w", err)
+	}
+	return nil
+}
+
 func LoadEnvironment(path string) (*Environment, error) {
-	data, err := os.ReadFile(path)
+	res, err := loadFile(path, KindEnvironment)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := Validate(data, KindEnvironment); err != nil {
-		return nil, err
+	return res.Environment, nil
+}
+
+func checkReleaseRef(ref string) error {
+	if path.Clean(ref) != ref {
+		return fmt.Errorf("must be a canonical repo-root-relative path, got %q", ref)
 	}
-	var env Environment
-	if err := decodeStrict(data, &env); err != nil {
-		return nil, fmt.Errorf("decode environment: %w", err)
+	const prefix = ".deploy/releases/"
+	if !strings.HasPrefix(ref, prefix) {
+		return fmt.Errorf("must resolve within %s, got %q", prefix, ref)
 	}
-	return &env, nil
+	base := strings.TrimPrefix(ref, prefix)
+	if base == "" || strings.Contains(base, "/") {
+		return fmt.Errorf("release file must be a flat file name, got %q", ref)
+	}
+	if strings.Contains(base, "..") {
+		return fmt.Errorf("path traversal is not allowed, got %q", ref)
+	}
+	return nil
 }

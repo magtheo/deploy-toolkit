@@ -1,8 +1,9 @@
 package manifest
 
-import (
-	"fmt"
-	"os"
+import "fmt"
+
+const (
+	SourceGitHub = "github"
 )
 
 type ArtifactSource struct {
@@ -26,13 +27,15 @@ type Lifecycle struct {
 	Rollback  *LifecycleStep `yaml:"rollback" json:"rollback"`
 }
 
+type ProjectSource struct {
+	Type       string `yaml:"type" json:"type"`
+	Repository string `yaml:"repository" json:"repository"`
+	Branch     string `yaml:"branch" json:"branch"`
+}
+
 type ReleasePolicy struct {
 	Source         ProjectSource `yaml:"source" json:"source"`
 	RequiredChecks []string      `yaml:"requiredChecks" json:"requiredChecks"`
-}
-
-type ProjectSource struct {
-	Branch string `yaml:"branch" json:"branch"`
 }
 
 type ProjectMetadata struct {
@@ -43,23 +46,30 @@ type Project struct {
 	APIVersion string                    `yaml:"apiVersion" json:"apiVersion"`
 	Kind       string                    `yaml:"kind" json:"kind"`
 	Metadata   ProjectMetadata           `yaml:"metadata" json:"metadata"`
-	Release    *ReleasePolicy            `yaml:"release" json:"release"`
+	Release    ReleasePolicy             `yaml:"release" json:"release"`
 	Artifacts  map[string]ArtifactSource `yaml:"artifacts" json:"artifacts"`
-	Bundle     *BundleSpec               `yaml:"bundle" json:"bundle"`
+	Bundle     BundleSpec                `yaml:"bundle" json:"bundle"`
 	Lifecycle  Lifecycle                 `yaml:"lifecycle" json:"lifecycle"`
 }
 
+func (p *Project) check() error {
+	for name, a := range p.Artifacts {
+		if err := checkOCIRepository(a.Repository); err != nil {
+			return fmt.Errorf("artifact %q: %w", name, err)
+		}
+	}
+	for i, inc := range p.Bundle.Include {
+		if err := checkBundleInclude(inc); err != nil {
+			return fmt.Errorf("bundle.include[%d]: %w", i, err)
+		}
+	}
+	return nil
+}
+
 func LoadProject(path string) (*Project, error) {
-	data, err := os.ReadFile(path)
+	res, err := loadFile(path, KindProject)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := Validate(data, KindProject); err != nil {
-		return nil, err
-	}
-	var p Project
-	if err := decodeStrict(data, &p); err != nil {
-		return nil, fmt.Errorf("decode project: %w", err)
-	}
-	return &p, nil
+	return res.Project, nil
 }

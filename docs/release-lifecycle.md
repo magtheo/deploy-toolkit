@@ -35,13 +35,19 @@ Deploy Toolkit deploys
 eligibility checks — no judgment, just verification:
 
 1. revision exists and belongs to permitted `main`;
-2. required GitHub checks passed;
-3. artifact digests resolved;
-4. deployment bundle built and digested;
-5. migration metadata inspected;
+2. every required check for that exact SHA concluded successfully
+   (missing/in-progress/cancelled fail closed);
+3. artifact digests resolved from the registry (repository + immutable digest);
+4. deployment bundle built and digested per
+   [bundle-format-v1.md](bundle-format-v1.md);
+5. migration semantics read from explicit inputs — never inferred;
 6. release manifest generated and validated;
 7. environment file updated;
 8. promotion PR opened.
+
+Eligibility never opens PRs — that is the separate promotion step. The
+semantic version and migration safety are explicit inputs to the proposal, not
+inventions of `deployctl`.
 
 ```
 $ deployctl release propose production abc123
@@ -129,8 +135,8 @@ wins: no silent undo of an unsafe state.
 
 ```diff
  spec:
--  release: ../releases/platform-core-0.1.17.yaml
-+  release: ../releases/platform-core-0.1.16.yaml
+-  release: .deploy/releases/platform-core-0.1.17.yaml
++  release: .deploy/releases/platform-core-0.1.16.yaml
 ```
 
 PR title: `deploy: roll production back to 0.1.16`. Human merges; the toolkit
@@ -158,11 +164,12 @@ GitHub Deployments         audit / UI projection
 ## Implementation sequence
 
 1. ~~Schemas (Project, Release, Environment, Target) + `deployctl validate`~~ **done**
-2. Release eligibility + immutable artifact resolution
-3. Generated promotion PR flow (+ diff allowlist check)
-4. `local` transport (deterministic integration tests)
-5. SSH transport (strict host verification)
-6. Server-side staging, observed state, history
-7. Lifecycle execution + verification
-8. Rollback (normal + emergency + reconcile)
-9. `platform-core` integration, then `examples/static-site`
+2. ~~Contract hardening: single parse pipeline, source identity, untagged OCI names, semantic invariants, CI~~ **done**
+3. Release eligibility + immutable artifact resolution
+4. Generated promotion PR flow (+ diff allowlist check)
+5. `local` transport (deterministic integration tests)
+6. SSH transport (strict host verification)
+7. Server-side staging, observed state, history
+8. Lifecycle execution + verification
+9. Rollback (normal + emergency + reconcile)
+10. `platform-core` integration, then `examples/static-site`

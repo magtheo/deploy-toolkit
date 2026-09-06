@@ -3,6 +3,7 @@ package manifest
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"sync"
 
 	"github.com/magtheo/deploy-toolkit/schemas"
@@ -22,6 +23,14 @@ const (
 type Header struct {
 	APIVersion string `yaml:"apiVersion" json:"apiVersion"`
 	Kind       string `yaml:"kind"       json:"kind"`
+}
+
+type Parsed struct {
+	Header      Header
+	Project     *Project
+	Release     *Release
+	Environment *Environment
+	Target      *Target
 }
 
 func schemaFile(kind string) string {
@@ -86,6 +95,21 @@ func parseHeader(data []byte) (Header, error) {
 	return h, nil
 }
 
+func schemaValidate(kind string, data []byte) error {
+	all, err := schemasForKinds()
+	if err != nil {
+		return err
+	}
+	instance, err := yamlToInstance(data)
+	if err != nil {
+		return err
+	}
+	if err := all[schemaFile(kind)].Validate(instance); err != nil {
+		return fmt.Errorf("schema validation failed for %s: %w", kind, err)
+	}
+	return nil
+}
+
 func normalize(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -117,31 +141,69 @@ func yamlToInstance(data []byte) (any, error) {
 	return normalize(v), nil
 }
 
-func Validate(data []byte, wantKind string) (Header, error) {
-	h, err := parseHeader(data)
-	if err != nil {
-		return h, err
-	}
-	if wantKind != "" && h.Kind != wantKind {
-		return h, fmt.Errorf("expected kind %q, found %q", wantKind, h.Kind)
-	}
-	all, err := schemasForKinds()
-	if err != nil {
-		return h, err
-	}
-	sch := all[schemaFile(h.Kind)]
-	instance, err := yamlToInstance(data)
-	if err != nil {
-		return h, err
-	}
-	if err := sch.Validate(instance); err != nil {
-		return h, fmt.Errorf("schema validation failed for %s: %w", h.Kind, err)
-	}
-	return h, nil
-}
-
 func decodeStrict(data []byte, out any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	return dec.Decode(out)
+}
+
+func Parse(data []byte, wantKind string) (*Parsed, error) {
+	h, err := parseHeader(data)
+	if err != nil {
+		return nil, err
+	}
+	if wantKind != "" && h.Kind != wantKind {
+		return nil, fmt.Errorf("expected kind %q, found %q", wantKind, h.Kind)
+	}
+	if err := schemaValidate(h.Kind, data); err != nil {
+		return nil, err
+	}
+	res := &Parsed{Header: h}
+	switch h.Kind {
+	case KindProject:
+		var m Project
+		if err := decodeStrict(data, &m); err != nil {
+			return nil, fmt.Errorf("decode project: %w", err)
+		}
+		if err := m.check(); err != nil {
+			return nil, fmt.Errorf("invalid project %q: %w", m.Metadata.Name, err)
+		}
+		res.Project = &m
+	case KindRelease:
+		var m Release
+		if err := decodeStrict(data, &m); err != nil {
+			return nil, fmt.Errorf("decode release: %w", err)
+		}
+		if err := m.check(); err != nil {
+			return nil, fmt.Errorf("invalid release %s@%s: %w", m.Metadata.Project, m.Metadata.Version, err)
+		}
+		res.Release = &m
+	case KindEnvironment:
+		var m Environment
+		if err := decodeStrict(data, &m); err != nil {
+			return nil, fmt.Errorf("decode environment: %w", err)
+		}
+		if err := m.check(); err != nil {
+			return nil, fmt.Errorf("invalid environment %q: %w", m.Metadata.Name, err)
+		}
+		res.Environment = &m
+	case KindTarget:
+		var m Target
+		if err := decodeStrict(data, &m); err != nil {
+			return nil, fmt.Errorf("decode target: %w", err)
+		}
+		if err := m.check(); err != nil {
+			return nil, fmt.Errorf("invalid target %q: %w", m.Metadata.Name, err)
+		}
+		res.Target = &m
+	}
+	return res, nil
+}
+
+func loadFile(path string, wantKind string) (*Parsed, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(data, wantKind)
 }

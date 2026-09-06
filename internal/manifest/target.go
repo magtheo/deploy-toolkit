@@ -2,7 +2,6 @@ package manifest
 
 import (
 	"fmt"
-	"os"
 )
 
 type TargetMetadata struct {
@@ -36,17 +35,17 @@ type Target struct {
 	Spec       TargetSpec     `yaml:"spec" json:"spec"`
 }
 
+func (t *Target) check() error {
+	if t.Spec.Transport.Type == TransportSSH && t.Spec.Transport.HostKeyFrom == "" {
+		return fmt.Errorf("ssh transport requires a pinned host key (hostKeyFrom)")
+	}
+	return nil
+}
+
 func LoadTarget(path string) (*Target, error) {
-	data, err := os.ReadFile(path)
+	res, err := loadFile(path, KindTarget)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := Validate(data, KindTarget); err != nil {
-		return nil, err
-	}
-	var t Target
-	if err := decodeStrict(data, &t); err != nil {
-		return nil, fmt.Errorf("decode target: %w", err)
-	}
-	return &t, nil
+	return res.Target, nil
 }

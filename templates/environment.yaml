@@ -5,7 +5,7 @@ metadata:
   name: production
 
 spec:
-  release: ../releases/my-app-0.1.0.yaml
+  release: .deploy/releases/my-app-0.1.0.yaml
 
   target: production-primary
 

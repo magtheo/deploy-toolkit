@@ -6,6 +6,8 @@ metadata:
 
 release:
   source:
+    type: github
+    repository: example/my-app
     branch: main
 
   requiredChecks:

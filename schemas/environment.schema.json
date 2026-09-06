@@ -24,8 +24,8 @@
       "properties": {
         "release": {
           "type": "string",
-          "minLength": 1,
-          "$comment": "repo-relative or environment-file-relative path to the release manifest"
+          "$comment": "canonical repo-root-relative path resolving only within .deploy/releases/; enforced further by semantic checks (no traversal, flat lowercase file name)",
+          "pattern": "^\\.deploy/releases/[A-Za-z0-9][A-Za-z0-9._-]*\\.yaml$"
         },
         "target": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
         "failurePolicy": {

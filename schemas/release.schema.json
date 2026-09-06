@@ -15,15 +15,20 @@
       "additionalProperties": false,
       "properties": {
         "project": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,62}$" },
-        "version": { "type": "string", "$comment": "semantic version (MAJOR.MINOR.PATCH with optional pre-release/build)", "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$" }
+        "version": {
+          "type": "string",
+          "$comment": "strict SemVer (semver.org)",
+          "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?$"
+        }
       }
     },
     "source": {
       "type": "object",
-      "required": ["repository", "revision"],
+      "required": ["type", "repository", "revision"],
       "additionalProperties": false,
       "properties": {
-        "repository": { "type": "string", "minLength": 1 },
+        "type": { "const": "github" },
+        "repository": { "type": "string", "$comment": "GitHub owner/repo (SCM identity, not a registry)", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$" },
         "revision": { "type": "string", "$comment": "full git commit SHA (SHA-1 or SHA-256 repositories)", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" }
       }
     },
@@ -37,7 +42,11 @@
         "additionalProperties": false,
         "properties": {
           "type": { "const": "oci" },
-          "image": { "type": "string", "minLength": 1 },
+          "image": {
+            "type": "string",
+            "$comment": "OCI repository name WITHOUT tag or digest; the digest field is the only mutable-ref-free pointer",
+            "pattern": "^((?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9])(?:\\.(?:[a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]*[a-zA-Z0-9]))*(?::[0-9]+)?/)?[a-z0-9]+(?:(?:[._]|__|[-]*)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:[._]|__|[-]*)[a-z0-9]+)*)*$"
+          },
           "digest": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" }
         }
       }
@@ -66,7 +75,9 @@
         "head": { "type": "string", "minLength": 1 },
         "mode": { "enum": ["none", "forward-compatible", "maintenance-required", "irreversible"] },
         "rollbackSafe": { "type": "boolean" }
-      }
+      },
+      "if": { "properties": { "mode": { "const": "irreversible" } } },
+      "then": { "properties": { "rollbackSafe": { "const": false } } }
     }
   }
 }

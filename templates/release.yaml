@@ -6,7 +6,8 @@ metadata:
   version: 0.1.0
 
 source:
-  repository: ghcr.io/example/my-app
+  type: github
+  repository: example/my-app
   revision: "0000000000000000000000000000000000000000"
 
 artifacts:

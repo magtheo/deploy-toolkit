@@ -80,13 +80,27 @@ Right: the project declares a `verify` hook in its own `project.yaml`.
 go build ./...          compile
 go vet ./...            vet
 go test ./...           deterministic tests (required for behavior changes)
+gofmt -l .              formatting check (CI fails on output)
 go build -o deployctl ./cmd/deployctl
 ./deployctl validate templates/*.yaml
 ```
 
-The schemas in `schemas/` are the public contract. Go types in
-`internal/manifest` must stay in lockstep with them; validation exercises both
-paths (schema validation of the generic document, then strict typed decoding).
+CI (`.github/workflows/ci.yml`) runs exactly these checks on every push and PR.
+
+## Contract status
+
+The schemas in `schemas/` are the public contract — currently **candidate
+Consumer Contract v1**: frozen only after a real `platform-core` deployment has
+exercised release generation. Go types in `internal/manifest` must stay in
+lockstep with them.
+
+All manifest ingestion goes through **one pipeline** in `manifest.Parse`:
+header → JSON Schema → strict typed decoding → semantic invariants. Never
+validate by schema alone or decode without schema — `deployctl validate` and
+every `Load*` function share the pipeline. Invariants JSON Schema cannot
+express (untagged OCI names, `irreversible ⇒ rollbackSafe: false`, path
+traversal rules) live as `check()` methods in `internal/manifest`.
+
 If you change a schema, you are changing a published API — see the versioning
 policy in `docs/consumer-contract-v1.md`.
 
