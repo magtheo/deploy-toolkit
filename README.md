@@ -91,6 +91,7 @@ scope in [docs/architecture.md](docs/architecture.md).
 
 ```
 deployctl validate <manifest.yaml>...   validate project/release/environment/target manifests
+deployctl release create [flags]        run eligibility and create an immutable release manifest
 deployctl version                       print version
 ```
 
@@ -98,8 +99,16 @@ Manifests pass through one authoritative pipeline: header check → JSON Schema
 → strict typed decoding → semantic invariants. The schemas are the structural
 contract; `validate` is the definitive validator.
 
-Planned (not yet implemented): `release create`, `promotion propose`,
-`deploy`, `rollback`, `status`. See the roadmap in
+`release create` resolves the branch head, proves the candidate is reachable
+from it, verifies every required check on the exact SHA, resolves artifact
+digests via the SHA discovery tag, builds the deterministic bundle from the
+exact Git tree, and writes `.deploy/releases/<project>-<version>.yaml` —
+idempotently, refusing to overwrite a different release with the same version.
+It stops at the Release boundary: no environment changes, no PRs.
+Requires `GITHUB_TOKEN`; run from a checkout containing the candidate.
+
+Planned (not yet implemented): `promotion propose`, `deploy`, `rollback`,
+`status`. See the roadmap in
 [docs/release-lifecycle.md](docs/release-lifecycle.md).
 
 ## For consumers
