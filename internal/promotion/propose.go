@@ -22,10 +22,16 @@ type TreeEntry struct {
 	Content []byte
 }
 
+type TreeLeaf struct {
+	OID  string
+	Mode string
+	Type string
+}
+
 type ChangedFile struct {
-	Path    string
-	Status  string
-	BlobSHA string
+	Path   string
+	Status string
+	Leaf   TreeLeaf
 }
 
 type PullRequest struct {
@@ -41,10 +47,11 @@ type Store interface {
 	VerifyCommit(ctx context.Context, repo, sha string) error
 	IsAncestor(ctx context.Context, repo, ancestor, descendant string) (bool, error)
 	FileAt(ctx context.Context, repo, path, ref string) ([]byte, error)
+	FileAtOptional(ctx context.Context, repo, path, ref string) ([]byte, bool, error)
 	CheckRuns(ctx context.Context, repo, ref string) ([]release.CheckRun, error)
 
 	CommitParents(ctx context.Context, repo, sha string) ([]string, error)
-	CommitTreePaths(ctx context.Context, repo, sha string) (map[string]string, error)
+	CommitTreeLeaves(ctx context.Context, repo, sha string) (map[string]TreeLeaf, error)
 	BlobAt(ctx context.Context, repo, blobSHA string) ([]byte, error)
 
 	HeadTree(ctx context.Context, repo, commitSHA string) (string, error)
@@ -84,23 +91,9 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 		return nil, fmt.Errorf("--repo, <environment> and --release are required")
 	}
 	relPath := filepath.ToSlash(filepath.Clean(in.ReleasePath))
-	relBytes, err := os.ReadFile(relPath)
-	if err != nil {
-		return nil, fmt.Errorf("read release manifest: %w", err)
-	}
-	relRes, err := manifest.Parse(relBytes, manifest.KindRelease)
+	project, version, err := releaseNameFromPath(relPath)
 	if err != nil {
 		return nil, err
-	}
-	rel := relRes.Release
-	if rel.Source.Repository != in.Repo {
-		return nil, fmt.Errorf("release %s declares source repository %q, but %s is being promoted", relPath, rel.Source.Repository, in.Repo)
-	}
-	project := rel.Metadata.Project
-	version := rel.Metadata.Version
-	wantName := release.ReleaseFileName(project, version)
-	if filepath.Base(relPath) != wantName {
-		return nil, fmt.Errorf("release file %s must be named %s (project and version must agree with the manifest)", relPath, wantName)
 	}
 	toRef := release.ReleaseFilePath(ReleasesDir, project, version)
 
@@ -126,10 +119,30 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 	}
 	fromRef := env.Spec.Release
 
-	alreadyAuthorized, err := src.FileAt(ctx, in.Repo, toRef, baseSHA)
-	isNewRelease := err != nil
+	trustedBytes, exists, err := src.FileAtOptional(ctx, in.Repo, toRef, baseSHA)
+	if err != nil {
+		return nil, fmt.Errorf("check for existing release %s at %s: %w", toRef, baseSHA, err)
+	}
+	isNewRelease := !exists
+	var relBytes []byte
+	var rel *manifest.Release
 	var ev *release.Evaluation
 	if isNewRelease {
+		relBytes, err = os.ReadFile(relPath)
+		if err != nil {
+			return nil, fmt.Errorf("read release manifest: %w", err)
+		}
+		relRes, err := manifest.Parse(relBytes, manifest.KindRelease)
+		if err != nil {
+			return nil, err
+		}
+		rel = relRes.Release
+		if rel.Source.Repository != in.Repo {
+			return nil, fmt.Errorf("release %s declares source repository %q, but %s is being promoted", relPath, rel.Source.Repository, in.Repo)
+		}
+		if rel.Metadata.Project != project || rel.Metadata.Version != version {
+			return nil, fmt.Errorf("release file %s must contain project %q version %q", relPath, project, version)
+		}
 		ev, err = release.Evaluate(ctx, release.EvalInput{Repo: in.Repo, Revision: rel.Source.Revision}, src, resolver, bundler)
 		if err != nil {
 			return nil, fmt.Errorf("release %s is not eligible under current policy: %w", version, err)
@@ -142,11 +155,22 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 			return nil, fmt.Errorf("release file %s is not exactly what current deterministic eligibility would generate; refusing to promote a hand-tampered manifest", relPath)
 		}
 	} else {
-		relBytes = alreadyAuthorized
+		relRes, err := manifest.Parse(trustedBytes, manifest.KindRelease)
+		if err != nil {
+			return nil, fmt.Errorf("trusted release %s at %s is not valid: %w", toRef, baseSHA, err)
+		}
+		rel = relRes.Release
+		if rel.Metadata.Project != project || rel.Metadata.Version != version {
+			return nil, fmt.Errorf("trusted release %s at %s disagrees with its canonical file name", toRef, baseSHA)
+		}
+		if rel.Source.Repository != in.Repo {
+			return nil, fmt.Errorf("trusted release %s declares source repository %q, but %s is being promoted", toRef, rel.Source.Repository, in.Repo)
+		}
+		relBytes = trustedBytes
 	}
 
 	branch := fmt.Sprintf(BranchPrefixFmt+"%s", in.Environment, version)
-	exists, err := src.BranchExists(ctx, in.Repo, branch)
+	exists, err = src.BranchExists(ctx, in.Repo, branch)
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +193,9 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 			}
 			if !outcome.Passed {
 				return nil, fmt.Errorf("existing proposal %s (#%d) is stale or modified and no longer matches this transition: %s", pr.URL, pr.Number, strings.Join(outcome.Messages, "; "))
+			}
+			if outcome.Environment != in.Environment || outcome.From != fromRef || outcome.To != toRef {
+				return nil, fmt.Errorf("existing proposal %s (#%d) verifies as a different transition (%s: %s → %s), not the requested (%s: %s → %s)", pr.URL, pr.Number, outcome.Environment, outcome.From, outcome.To, in.Environment, fromRef, toRef)
 			}
 			return &Proposal{Project: project, Environment: in.Environment, From: fromRef, To: toRef, BaseSHA: baseSHA, Branch: branch, PR: pr, Unchanged: true}, nil
 		}
@@ -256,8 +283,8 @@ func oldReleaseSummary(ctx context.Context, src Store, repo, ref, releaseRef str
 	if releaseRef == "" {
 		return nil
 	}
-	data, err := src.FileAt(ctx, repo, releaseRef, ref)
-	if err != nil {
+	data, exists, err := src.FileAtOptional(ctx, repo, releaseRef, ref)
+	if err != nil || !exists {
 		return nil
 	}
 	res, err := manifest.Parse(data, manifest.KindRelease)

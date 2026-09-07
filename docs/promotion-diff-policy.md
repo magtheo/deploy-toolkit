@@ -71,6 +71,10 @@ IF:           main is still BASE and the proposal sits directly on it
   GitHub's compare endpoint, which caps its file list at 300 entries. "Nothing
   else changed" must mean *nothing else*, not *nothing else in the first
   page*.
+- each tree leaf is compared by **OID, Git mode and type together** — chmod-only
+  changes, regular↔symlink flips and submodule (gitlink) additions, removals or
+  changes are all visible to the policy and rejected. A tree whose enumeration
+  is incomplete is never evaluated.
 
 ## Two promotion classes, two evidence rules
 
@@ -84,10 +88,19 @@ a checkout of the release's source revision (`--repo-dir`); without it the
 check **fails closed**.
 
 **Already-immutable release (file exists unchanged on trusted main):**
-the checker reads the release from the trusted base, validates it, and binds
-it to the trusted project (name and source repository). Its pinned
-`repo@sha256:...` digests are the identity — promotion/rollback to it never
-depends on the disposable `<source-sha>` discovery tag still existing.
+the trusted base copy is the only authority — the local file is treated purely
+as a selector for the canonical release path, and every fact rendered into the
+PR (revision, migration claims, version) comes from the trusted-base object,
+never from local claims. Its pinned `repo@sha256:...` digests are the identity;
+promotion/rollback to it never depends on the disposable `<source-sha>`
+discovery tag still existing.
+
+## Read-failure discipline
+
+Distinguishing "release does not exist" from "GitHub failed" is part of the
+gate: only a genuine not-found selects the new-release path. Auth errors, rate
+limits, and API failures fail closed — they never silently reinterpret a
+proposal as new (or vice versa).
 
 ## What propose guarantees at creation
 
@@ -103,9 +116,12 @@ depends on the disposable `<source-sha>` discovery tag still existing.
   data API as **one atomic commit**;
 - proposal creation is idempotent in a strict sense: an existing open proposal
   is returned only if it is still based on the current trusted main, its head
-  is a single commit on that base, and its tree satisfies the full Promotion
-  Diff Policy (including evidence verification) right now. Otherwise it is
-  refused as stale or modified — idempotency never means "trust the old PR".
+  is a single commit on that base, its tree satisfies the full Promotion Diff
+  Policy (including evidence verification) right now, **and the verified
+  transition exactly matches the requested one** (environment, from-release and
+  to-release). A structurally valid proposal for a different transition is
+  refused, not adopted. Otherwise it is refused as stale or modified —
+  idempotency never means "trust the old PR".
 
 What propose deliberately does **not** guarantee: the `version` and
 `migration.*` fields are explicit human claims, not derived evidence — they

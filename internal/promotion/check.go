@@ -14,6 +14,16 @@ import (
 
 var releaseFilePattern = regexp.MustCompile(`^\.deploy/releases/([a-z0-9][a-z0-9-]{0,62})-([0-9A-Za-z.\-+]+)\.yaml$`)
 
+var releaseNamePattern = regexp.MustCompile(`^([a-z0-9][a-z0-9-]{0,62})-([0-9A-Za-z.\-+]+)\.yaml$`)
+
+func releaseNameFromPath(filePath string) (string, string, error) {
+	m := releaseNamePattern.FindStringSubmatch(path.Base(filePath))
+	if m == nil {
+		return "", "", fmt.Errorf("release file %s must be named <project>-<version>.yaml", filePath)
+	}
+	return m[1], m[2], nil
+}
+
 type CheckInput struct {
 	Repo    string
 	Base    string
@@ -22,8 +32,11 @@ type CheckInput struct {
 }
 
 type CheckOutcome struct {
-	Passed   bool
-	Messages []string
+	Passed      bool
+	Messages    []string
+	Environment string
+	From        string
+	To          string
 }
 
 func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resolver, bundler release.Bundler) (*CheckOutcome, error) {
@@ -54,15 +67,15 @@ func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resol
 		return res, nil
 	}
 
-	basePaths, err := src.CommitTreePaths(ctx, in.Repo, in.Base)
+	baseLeaves, err := src.CommitTreeLeaves(ctx, in.Repo, in.Base)
 	if err != nil {
 		return nil, err
 	}
-	headPaths, err := src.CommitTreePaths(ctx, in.Repo, in.Head)
+	headLeaves, err := src.CommitTreeLeaves(ctx, in.Repo, in.Head)
 	if err != nil {
 		return nil, err
 	}
-	changed := treeDiff(basePaths, headPaths)
+	changed := treeDiff(baseLeaves, headLeaves)
 
 	trustedProjectBytes, err := src.FileAt(ctx, in.Repo, release.ProjectPath, liveHead)
 	if err != nil {
@@ -117,7 +130,7 @@ func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resol
 		if m == nil {
 			fail("added release file %s does not match canonical naming %s/<project>-<version>.yaml", addedRelease, ReleasesDir)
 		} else {
-			content, err := src.BlobAt(ctx, in.Repo, headPaths[addedRelease])
+			content, err := src.BlobAt(ctx, in.Repo, headLeaves[addedRelease].OID)
 			if err != nil {
 				return nil, err
 			}
@@ -179,6 +192,9 @@ func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resol
 			return res, nil
 		}
 		be, he := baseRes.Environment, headRes.Environment
+		res.Environment = envName
+		res.From = be.Spec.Release
+		res.To = he.Spec.Release
 		if be.Metadata.Name != envName || he.Metadata.Name != envName {
 			fail("environment file %s must declare metadata.name %q", envPath, envName)
 		}
@@ -199,11 +215,11 @@ func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resol
 			fail("spec.release target %q belongs to project %q, not trusted project %q", target, m[1], trusted.Metadata.Name)
 		}
 		if target != addedRelease {
-			if _, ok := basePaths[target]; !ok {
+			if _, ok := baseLeaves[target]; !ok {
 				fail("spec.release points at %q which does not exist in the trusted base", target)
 				return res, nil
 			}
-			content, err := src.BlobAt(ctx, in.Repo, basePaths[target])
+			content, err := src.BlobAt(ctx, in.Repo, baseLeaves[target].OID)
 			if err != nil {
 				return nil, err
 			}
@@ -228,7 +244,7 @@ func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resol
 	return res, nil
 }
 
-func treeDiff(base, head map[string]string) []ChangedFile {
+func treeDiff(base, head map[string]TreeLeaf) []ChangedFile {
 	var out []ChangedFile
 	paths := make([]string, 0, len(base)+len(head))
 	seen := make(map[string]bool)
@@ -243,17 +259,15 @@ func treeDiff(base, head map[string]string) []ChangedFile {
 		}
 	}
 	sort.Strings(paths)
-	seenBase := func(p string) bool { _, ok := base[p]; return ok }
-	seenHead := func(p string) bool { _, ok := head[p]; return ok }
-	sort.Strings(paths)
 	for _, p := range paths {
+		bl, hl := base[p], head[p]
 		switch {
-		case !seenBase(p):
-			out = append(out, ChangedFile{Path: p, Status: "added", BlobSHA: head[p]})
-		case !seenHead(p):
+		case bl.OID == "":
+			out = append(out, ChangedFile{Path: p, Status: "added", Leaf: hl})
+		case hl.OID == "":
 			out = append(out, ChangedFile{Path: p, Status: "removed"})
-		case base[p] != head[p]:
-			out = append(out, ChangedFile{Path: p, Status: "modified", BlobSHA: head[p]})
+		case bl != hl:
+			out = append(out, ChangedFile{Path: p, Status: "modified", Leaf: hl})
 		}
 	}
 	return out

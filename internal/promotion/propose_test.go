@@ -68,15 +68,18 @@ type fakeStore struct {
 	heads          map[string]string
 	files          map[string]map[string][]byte
 	trees          map[string]map[string]string
+	leaves         map[string]map[string]TreeLeaf
 	parents        map[string][]string
 	runs           []release.CheckRun
 	anc            bool
 	blobs          map[string][]byte
 	branches       map[string]bool
 	openPRs        map[string]PullRequest
+	fileAtErr      error
 	createdCommits []string
 	createdBranch  string
 	createdPR      *PullRequest
+	prBody         string
 	treeEntries    []TreeEntry
 }
 
@@ -91,6 +94,7 @@ func proposeStore(rev string) *fakeStore {
 			rev: {release.ProjectPath: projectDoc()},
 		},
 		trees:    map[string]map[string]string{},
+		leaves:   map[string]map[string]TreeLeaf{},
 		parents:  map[string][]string{},
 		runs:     okRuns(),
 		anc:      true,
@@ -112,6 +116,9 @@ func (f *fakeStore) IsAncestor(ctx context.Context, repo, ancestor, descendant s
 	return f.anc, nil
 }
 func (f *fakeStore) FileAt(ctx context.Context, repo, path, ref string) ([]byte, error) {
+	if f.fileAtErr != nil {
+		return nil, f.fileAtErr
+	}
 	m, ok := f.files[ref]
 	if !ok {
 		return nil, fmt.Errorf("no ref %s", ref)
@@ -122,6 +129,21 @@ func (f *fakeStore) FileAt(ctx context.Context, repo, path, ref string) ([]byte,
 	}
 	return b, nil
 }
+
+func (f *fakeStore) FileAtOptional(ctx context.Context, repo, path, ref string) ([]byte, bool, error) {
+	if f.fileAtErr != nil {
+		return nil, false, f.fileAtErr
+	}
+	m, ok := f.files[ref]
+	if !ok {
+		return nil, false, nil
+	}
+	b, ok := m[path]
+	if !ok {
+		return nil, false, nil
+	}
+	return b, true, nil
+}
 func (f *fakeStore) CheckRuns(ctx context.Context, repo, ref string) ([]release.CheckRun, error) {
 	return f.runs, nil
 }
@@ -131,12 +153,19 @@ func (f *fakeStore) CommitParents(ctx context.Context, repo, sha string) ([]stri
 	}
 	return []string{checkBaseSHA}, nil
 }
-func (f *fakeStore) CommitTreePaths(ctx context.Context, repo, sha string) (map[string]string, error) {
+func (f *fakeStore) CommitTreeLeaves(ctx context.Context, repo, sha string) (map[string]TreeLeaf, error) {
+	if leaves, ok := f.leaves[sha]; ok {
+		return leaves, nil
+	}
 	t, ok := f.trees[sha]
 	if !ok {
 		return nil, fmt.Errorf("no tree for %s", sha)
 	}
-	return t, nil
+	out := make(map[string]TreeLeaf, len(t))
+	for p, oid := range t {
+		out[p] = TreeLeaf{OID: oid, Mode: "100644", Type: "blob"}
+	}
+	return out, nil
 }
 func (f *fakeStore) BlobAt(ctx context.Context, repo, blobSHA string) ([]byte, error) {
 	if b, ok := f.blobs[blobSHA]; ok {
@@ -187,6 +216,7 @@ func (f *fakeStore) OpenPromotionPRs(ctx context.Context, repo, env string) ([]P
 }
 func (f *fakeStore) CreatePR(ctx context.Context, repo, base, head, title, body string) (*PullRequest, error) {
 	f.createdPR = &PullRequest{Number: 41, URL: "https://example.invalid/pull/41", HeadRef: head, BaseRef: base}
+	f.prBody = body
 	return f.createdPR, nil
 }
 
@@ -660,6 +690,168 @@ func TestCheckDiffPolicy(t *testing.T) {
 			t.Errorf("outcome = %+v", outcome)
 		}
 	})
+}
+
+func TestProposeExistingReleaseUsesTrustedClaimsInPR(t *testing.T) {
+	bundler, store, res, releasePath := setupPropose(t)
+	trustedBytes, err := os.ReadFile(releasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.files[checkBaseSHA][relPathConst] = trustedBytes
+	res.digests = map[string]string{}
+
+	localTampered := []byte(strings.Replace(string(trustedBytes), "rollbackSafe: true", "rollbackSafe: false", 1))
+	localTampered = []byte(strings.Replace(string(localTampered), `mode: forward-compatible`, `mode: maintenance-required`, 1))
+	tamperedPath := filepath.Join(t.TempDir(), "my-app-0.1.0.yaml")
+	if err := os.WriteFile(tamperedPath, localTampered, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prop, err := Propose(context.Background(), ProposeInput{
+		Repo: "example/my-app", Environment: "production", ReleasePath: tamperedPath, RepoDir: ".",
+	}, store, res, bundler)
+	if err != nil {
+		t.Fatalf("Propose: %v", err)
+	}
+	if strings.Contains(store.prBody, "| rollback safe | false |") {
+		t.Error("PR body leaked local rollbackSafe claim")
+	}
+	if strings.Contains(store.prBody, "maintenance-required") {
+		t.Error("PR body leaked local migration mode claim")
+	}
+	if !strings.Contains(store.prBody, "forward-compatible") {
+		t.Error("PR body missing trusted migration mode")
+	}
+	if !strings.Contains(store.prBody, "| rollback safe | true |") {
+		t.Error("PR body missing trusted rollbackSafe claim")
+	}
+	if prop.IsNewRelease {
+		t.Error("existing release classified as new")
+	}
+}
+
+func TestProposeNonNotFoundReadFailureFailsClosed(t *testing.T) {
+	bundler, store, res, releasePath := setupPropose(t)
+	store.fileAtErr = fmt.Errorf("500 internal error")
+	_ = res
+
+	_, err := Propose(context.Background(), ProposeInput{
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
+	}, store, res, bundler)
+	if err == nil || !strings.Contains(err.Error(), "500 internal error") {
+		t.Fatalf("expected fail-closed on non-not-found error, got %v", err)
+	}
+	if len(store.createdCommits) != 0 {
+		t.Error("commit created despite source read failure")
+	}
+}
+
+func TestProposeIdempotentRefusesDifferentTransition(t *testing.T) {
+	bundler, store, res, releasePath := setupPropose(t)
+	relBytes, err := os.ReadFile(releasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireVerifiedProposal(store, relBytes)
+	altRel := strings.Replace(string(validOldRelease()), `version: 0.0.9`, `version: 0.2.0`, 1)
+	store.trees[checkBaseSHA][relPathConst+".placeholder"] = "x"
+	delete(store.trees[checkBaseSHA], relPathConst+".placeholder")
+	store.trees[checkBaseSHA][".deploy/releases/my-app-0.2.0.yaml"] = "rel020"
+	store.blobs["rel020"] = []byte(altRel)
+	store.trees[headSHA][".deploy/releases/my-app-0.2.0.yaml"] = "rel020"
+	store.blobs["envblob-head"] = envDoc(".deploy/releases/my-app-0.2.0.yaml")
+	store.files[headSHA][envPathConst] = envDoc(".deploy/releases/my-app-0.2.0.yaml")
+
+	_, err = Propose(context.Background(), ProposeInput{
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
+	}, store, res, bundler)
+	if err == nil || !strings.Contains(err.Error(), "different transition") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func relBytesFixture() []byte {
+	return []byte("apiVersion: deploy.toolkit/v1\nkind: Release\nmetadata:\n  project: my-app\n  version: 0.1.0\nsource:\n  type: github\n  repository: example/my-app\n  revision: \"" + strings.Repeat("a", 40) + "\"\nartifacts:\n  app:\n    type: oci\n    image: ghcr.io/example/app\n    digest: " + digestConst + "\nbundle:\n  digest: " + digestConst + "\ndeploymentContract:\n  digest: " + digestConst + "\nmigration:\n  head: \"043\"\n  mode: forward-compatible\n  rollbackSafe: true\n")
+}
+
+func TestCheckTreeLeafDimensions(t *testing.T) {
+	baseLeaves := func() map[string]TreeLeaf {
+		return map[string]TreeLeaf{
+			release.ProjectPath: {OID: "pblob", Mode: "100644", Type: "blob"},
+			envPathConst:        {OID: "envblob-base", Mode: "100644", Type: "blob"},
+			oldRelConst:         {OID: "oldrelblob", Mode: "100644", Type: "blob"},
+			"config/app.yaml":   {OID: "appblob", Mode: "100644", Type: "blob"},
+		}
+	}
+	headLeaves := func() map[string]TreeLeaf {
+		l := baseLeaves()
+		l[envPathConst] = TreeLeaf{OID: "envblob-head", Mode: "100644", Type: "blob"}
+		l[relPathConst] = TreeLeaf{OID: "relblob", Mode: "100644", Type: "blob"}
+		return l
+	}
+	store := func(base, head map[string]TreeLeaf) *fakeStore {
+		s := proposeStore(strings.Repeat("a", 40))
+		s.leaves[checkBaseSHA] = base
+		s.leaves[headSHA] = head
+		s.files[headSHA] = map[string][]byte{envPathConst: envDoc(relPathConst)}
+		s.blobs["pblob"] = projectDoc()
+		s.blobs["envblob-base"] = envDoc(oldRelConst)
+		s.blobs["envblob-head"] = envDoc(relPathConst)
+		s.blobs["oldrelblob"] = validOldRelease()
+		s.blobs["relblob"] = relBytesFixture()
+		s.parents[headSHA] = []string{checkBaseSHA}
+		return s
+	}
+
+	t.Run("chmod only change is visible", func(t *testing.T) {
+		head := headLeaves()
+		head["config/app.yaml"] = TreeLeaf{OID: "appblob", Mode: "100755", Type: "blob"}
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA}, store(baseLeaves(), head), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed {
+			t.Fatal("mode-only change passed the policy")
+		}
+		if !contains("illegal changes", outcome.Messages) {
+			t.Errorf("messages = %v", outcome.Messages)
+		}
+	})
+	t.Run("blob to symlink flip is visible", func(t *testing.T) {
+		head := headLeaves()
+		head["config/app.yaml"] = TreeLeaf{OID: "appblob", Mode: "120000", Type: "blob"}
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA}, store(baseLeaves(), head), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed {
+			t.Fatal("symlink flip passed the policy")
+		}
+	})
+	t.Run("gitlink change is visible", func(t *testing.T) {
+		head := headLeaves()
+		head["vendor/sub"] = TreeLeaf{OID: "abc123", Mode: "160000", Type: "commit"}
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA}, store(baseLeaves(), head), nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed {
+			t.Fatal("submodule addition passed the policy")
+		}
+		if !contains("illegal changes", outcome.Messages) {
+			t.Errorf("messages = %v", outcome.Messages)
+		}
+	})
+}
+
+func contains(needle string, haystack []string) bool {
+	for _, h := range haystack {
+		if strings.Contains(h, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRenderBodyWarnings(t *testing.T) {

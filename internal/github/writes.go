@@ -3,7 +3,9 @@ package github
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/google/go-github/v68/github"
@@ -220,7 +222,7 @@ func (s *Source) CommitParents(ctx context.Context, repo, sha string) ([]string,
 	return parents, nil
 }
 
-func (s *Source) CommitTreePaths(ctx context.Context, repo, sha string) (map[string]string, error) {
+func (s *Source) CommitTreeLeaves(ctx context.Context, repo, sha string) (map[string]promotion.TreeLeaf, error) {
 	owner, name, err := splitRepo(repo)
 	if err != nil {
 		return nil, err
@@ -229,26 +231,32 @@ func (s *Source) CommitTreePaths(ctx context.Context, repo, sha string) (map[str
 	if err != nil {
 		return nil, fmt.Errorf("read commit %s in %s: %w", sha, repo, err)
 	}
-	out := make(map[string]string)
+	out := make(map[string]promotion.TreeLeaf)
 	if err := s.walkTree(ctx, owner, name, c.GetTree().GetSHA(), "", out); err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (s *Source) walkTree(ctx context.Context, owner, name, treeSHA, prefix string, out map[string]string) error {
+func (s *Source) walkTree(ctx context.Context, owner, name, treeSHA, prefix string, out map[string]promotion.TreeLeaf) error {
+	join := func(base, p string) string {
+		if base == "" {
+			return p
+		}
+		return base + "/" + p
+	}
 	t, _, err := s.client.Git.GetTree(ctx, owner, name, treeSHA, true)
 	if err != nil {
 		return fmt.Errorf("read tree %s: %w", treeSHA, err)
 	}
 	if !t.GetTruncated() {
 		for _, e := range t.Entries {
-			p := e.GetPath()
-			if prefix != "" {
-				p = prefix + "/" + p
-			}
-			if e.GetType() == "blob" {
-				out[p] = e.GetSHA()
+			p := join(prefix, e.GetPath())
+			switch e.GetType() {
+			case "blob":
+				out[p] = promotion.TreeLeaf{OID: e.GetSHA(), Mode: e.GetMode(), Type: "blob"}
+			case "commit":
+				out[p] = promotion.TreeLeaf{OID: e.GetSHA(), Mode: e.GetMode(), Type: "commit"}
 			}
 		}
 		return nil
@@ -257,14 +265,16 @@ func (s *Source) walkTree(ctx context.Context, owner, name, treeSHA, prefix stri
 	if err != nil {
 		return fmt.Errorf("read tree %s: %w", treeSHA, err)
 	}
+	if t.GetTruncated() {
+		return fmt.Errorf("git tree %s is truncated; refusing to evaluate an incomplete tree for the promotion diff", treeSHA)
+	}
 	for _, e := range t.Entries {
-		p := e.GetPath()
-		if prefix != "" {
-			p = prefix + "/" + p
-		}
+		p := join(prefix, e.GetPath())
 		switch e.GetType() {
 		case "blob":
-			out[p] = e.GetSHA()
+			out[p] = promotion.TreeLeaf{OID: e.GetSHA(), Mode: e.GetMode(), Type: "blob"}
+		case "commit":
+			out[p] = promotion.TreeLeaf{OID: e.GetSHA(), Mode: e.GetMode(), Type: "commit"}
 		case "tree":
 			if err := s.walkTree(ctx, owner, name, e.GetSHA(), p, out); err != nil {
 				return err
@@ -272,4 +282,30 @@ func (s *Source) walkTree(ctx context.Context, owner, name, treeSHA, prefix stri
 		}
 	}
 	return nil
+}
+
+func (s *Source) FileAtOptional(ctx context.Context, repo, path, ref string) ([]byte, bool, error) {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return nil, false, err
+	}
+	fc, _, _, err := s.client.Repositories.GetContents(ctx, owner, name, path, &github.RepositoryContentGetOptions{Ref: ref})
+	if err != nil {
+		var ghErr *github.ErrorResponse
+		if errors.As(err, &ghErr) && ghErr.Response.StatusCode == http.StatusNotFound {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if fc == nil || fc.GetType() != "file" {
+		return nil, false, fmt.Errorf("%s @ %s in %s is not a file", path, ref, repo)
+	}
+	data, err := fc.GetContent()
+	if err != nil {
+		return nil, false, fmt.Errorf("decode %s @ %s in %s: %w", path, ref, repo, err)
+	}
+	if len(data) == 0 {
+		return nil, false, fmt.Errorf("%s @ %s in %s is empty or exceeds the contents API size limit", path, ref, repo)
+	}
+	return []byte(data), true, nil
 }
