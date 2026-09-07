@@ -187,6 +187,22 @@ type Transport interface {
 verification) implement the same contract; the deployment state machine never
 knows which one is underneath.
 
+The SSH implementation notes:
+
+- **Mandatory pinned host key** — an OpenSSH public host key line
+  (`ssh-ed25519 AAAA...`) is verified exactly on every connection; there is no
+  code path equivalent to `InsecureIgnoreHostKey`.
+- **Put uses SFTP** — same-directory temp file, chmod, sync, atomic rename;
+  exact bytes and Unix mode.
+- **Run encodes argv deterministically** — SSH's exec request carries a
+  command string, not an argv vector, so the transport renders
+  `cd '<dir>' && exec env -i 'K=V' … 'argv0' 'args…'` through one tested
+  POSIX single-quote encoder. The shell underneath is an implementation
+  mechanism, never an interpretation mechanism: supplied values remain data.
+- SFTP fsync is requested and tolerated only when the server declares the
+  `fsync@openssh.com` extension unsupported; every other sync error fails
+  closed.
+
 ## Two trust stages per deployment
 
 ```

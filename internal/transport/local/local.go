@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/transport"
 )
@@ -19,18 +18,7 @@ func New() *Transport { return &Transport{} }
 var _ transport.Transport = (*Transport)(nil)
 
 func checkTargetPath(path string) (string, error) {
-	if path == "" {
-		return "", fmt.Errorf("destination path is empty")
-	}
-	if !filepath.IsAbs(path) {
-		return "", fmt.Errorf("destination path %q must be absolute", path)
-	}
-	for _, seg := range strings.Split(path, "/") {
-		if seg == ".." {
-			return "", fmt.Errorf("destination path %q contains %q segments", path, "..")
-		}
-	}
-	return filepath.Clean(path), nil
+	return transport.ValidateAbsolutePath(path)
 }
 
 func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
@@ -59,14 +47,15 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 		tmp.Close()
 		return err
 	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, mode); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpName, dst); err != nil {
@@ -93,11 +82,12 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 	if len(req.Argv) == 0 || req.Argv[0] == "" {
 		return transport.RunResult{}, fmt.Errorf("argv must name a program")
 	}
-	if req.Dir == "" {
-		return transport.RunResult{}, fmt.Errorf("an explicit working directory is required")
+	dir, err := transport.ValidateAbsolutePath(req.Dir)
+	if err != nil {
+		return transport.RunResult{}, fmt.Errorf("working directory: %w", err)
 	}
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
-	cmd.Dir = req.Dir
+	cmd.Dir = dir
 	if req.Env != nil {
 		env := make([]string, 0, len(req.Env))
 		for k, v := range req.Env {
@@ -110,7 +100,7 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 	cmd.Stderr = &stderr
 	runErr := cmd.Run()
 	if ctx.Err() != nil {
-		return transport.RunResult{}, ctx.Err()
+		return transport.RunResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
 	}
 	res := transport.RunResult{
 		ExitCode: 0,
@@ -120,7 +110,7 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 	if runErr != nil {
 		exitErr, ok := runErr.(*exec.ExitError)
 		if !ok {
-			return transport.RunResult{Stdout: res.Stdout, Stderr: res.Stderr}, fmt.Errorf("start %s in %s: %w", req.Argv[0], req.Dir, runErr)
+			return transport.RunResult{Stdout: res.Stdout, Stderr: res.Stderr}, fmt.Errorf("start %s in %s: %w", req.Argv[0], dir, runErr)
 		}
 		res.ExitCode = exitErr.ExitCode()
 	}
