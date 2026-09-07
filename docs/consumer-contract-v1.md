@@ -207,11 +207,13 @@ application's database; deployctl must not guess it.
 
 ## Target contract
 
-A Target declares only what the toolkit needs: a trusted connection and the
-credential environment-variable names.
+A Target declares only what the toolkit needs: a trusted connection, the
+credential environment-variable names, and the absolute root of the subtree
+the toolkit owns on that target.
 
 ```yaml
 spec:
+  deployRoot: /srv/deploy       # toolkit-owned subtree root (absolute)
   transport:
     type: ssh
     hostFrom: DEPLOY_HOST        # env var holding the hostname
@@ -223,6 +225,16 @@ spec:
 
 V1 transports: `ssh` and `local`. No provider fields — infrastructure identity
 belongs to Pulumi, which may emit a Target descriptor as an output.
+
+`deployRoot` must be absolute and free of traversal segments. Everything the
+toolkit stores on the target lives inside it; see `docs/target-state.md` for
+the derived layout and the staging/state/history disciplines.
+
+### Target-side utilities (both transports)
+
+The substrate uses only POSIX utilities resolved via the account's PATH:
+`test`, `cat` (state reads and staged-marker reads). Nothing else is
+required of an SSH or local target in V1.
 
 ### SSH target prerequisites (V1)
 

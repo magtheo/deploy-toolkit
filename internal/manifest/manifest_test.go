@@ -80,6 +80,7 @@ kind: Target
 metadata:
   name: production-primary
 spec:
+  deployRoot: /srv/deploy
   transport:
     type: ssh
     hostFrom: DEPLOY_HOST

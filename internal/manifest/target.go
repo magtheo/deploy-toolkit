@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"fmt"
+	"strings"
 )
 
 type TargetMetadata struct {
@@ -25,7 +26,8 @@ func (t Transport) EffectivePort() int {
 }
 
 type TargetSpec struct {
-	Transport Transport `yaml:"transport" json:"transport"`
+	Transport  Transport `yaml:"transport" json:"transport"`
+	DeployRoot string    `yaml:"deployRoot" json:"deployRoot"`
 }
 
 type Target struct {
@@ -36,6 +38,17 @@ type Target struct {
 }
 
 func (t *Target) check() error {
+	if t.Spec.DeployRoot == "" {
+		return fmt.Errorf("spec.deployRoot is required")
+	}
+	if !strings.HasPrefix(t.Spec.DeployRoot, "/") {
+		return fmt.Errorf("spec.deployRoot %q must be an absolute path", t.Spec.DeployRoot)
+	}
+	for _, seg := range strings.Split(strings.Trim(t.Spec.DeployRoot, "/"), "/") {
+		if seg == ".." || seg == "." || seg == "" {
+			return fmt.Errorf("spec.deployRoot %q must not contain %q path segments", t.Spec.DeployRoot, seg)
+		}
+	}
 	if t.Spec.Transport.Type == TransportSSH && t.Spec.Transport.HostKeyFrom == "" {
 		return fmt.Errorf("ssh transport requires a pinned host key (hostKeyFrom)")
 	}

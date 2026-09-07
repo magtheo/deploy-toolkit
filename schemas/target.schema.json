@@ -19,7 +19,7 @@
     },
     "spec": {
       "type": "object",
-      "required": ["transport"],
+      "required": ["transport", "deployRoot"],
       "additionalProperties": false,
       "properties": {
         "transport": {
@@ -27,6 +27,11 @@
             { "$ref": "#/$defs/localTransport" },
             { "$ref": "#/$defs/sshTransport" }
           ]
+        },
+        "deployRoot": {
+          "type": "string",
+          "$comment": "Absolute directory the toolkit owns on the target: <deployRoot>/<project>/{releases,state,history}. Traversal segments are rejected by semantic checks.",
+          "pattern": "^/"
         }
       }
     }

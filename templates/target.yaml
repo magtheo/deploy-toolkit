@@ -5,6 +5,10 @@ metadata:
   name: production-primary
 
 spec:
+  # Absolute directory the toolkit owns on the target. Everything else is
+  # derived: <deployRoot>/<project>/releases, .../state, .../history.
+  deployRoot: /srv/deploy
+
   transport:
     type: ssh
 
