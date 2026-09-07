@@ -7,8 +7,8 @@ import (
 	"net"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
-	"time"
 
 	gossh "golang.org/x/crypto/ssh"
 
@@ -20,6 +20,11 @@ type testServer struct {
 	hostKey   gossh.PublicKey
 	ln        net.Listener
 	stallSftp bool
+	// stallClosed is closed when a client tears down a stalled sftp
+	// channel, letting tests assert bounded resource lifetime, not just
+	// fast caller return.
+	stallClosed     chan struct{}
+	stallClosedOnce sync.Once
 }
 
 func generateSigner(t *testing.T) gossh.Signer {
@@ -53,7 +58,7 @@ func startTestServer(t *testing.T, authorized ...gossh.PublicKey) *testServer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := &testServer{addr: ln.Addr().String(), hostKey: hostSigner.PublicKey(), ln: ln}
+	ts := &testServer{addr: ln.Addr().String(), hostKey: hostSigner.PublicKey(), ln: ln, stallClosed: make(chan struct{})}
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -109,8 +114,13 @@ func (ts *testServer) handleSession(channel gossh.Channel, requests <-chan *goss
 			}
 			req.Reply(true, nil)
 			if ts.stallSftp {
-				time.Sleep(30 * time.Second)
-				return
+				buf := make([]byte, 512)
+				for {
+					if _, err := channel.Read(buf); err != nil {
+						ts.stallClosedOnce.Do(func() { close(ts.stallClosed) })
+						return
+					}
+				}
 			}
 			srv, err := sftp.NewServer(channel)
 			if err != nil {

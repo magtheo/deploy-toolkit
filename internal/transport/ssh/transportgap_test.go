@@ -188,7 +188,15 @@ func TestStalledPutHonorsContext(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want DeadlineExceeded", err)
 	}
-	if time.Since(start) > 5*time.Second {
-		t.Error("put cancellation took too long")
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("put cancellation took too long: %s", elapsed)
+	}
+	// Bounded caller latency is not enough: the stalled SFTP session must
+	// actually be torn down, or a timed-out staging operation leaves a
+	// stuck server-side session while the SSH connection stays in use.
+	select {
+	case <-ts.stallClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("sftp session survived Put cancellation")
 	}
 }

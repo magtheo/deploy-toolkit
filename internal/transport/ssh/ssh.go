@@ -168,8 +168,13 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 	}
 }
 
-type putOutcome struct{ err error }
-
+// Put stages req.Content atomically at req.Path via a dedicated SFTP
+// session. The session is owned by this call: the subsystem request, the
+// SFTP handshake and the transfer all run on one worker goroutine, so a
+// single session.Close() on context cancellation unblocks the worker at
+// any stage — including while the handshake is still waiting for the
+// server's version packet. Closing the session leaves the shared SSH
+// connection usable for later operations.
 func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -182,29 +187,41 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 	if mode == 0 {
 		mode = 0o644
 	}
-	done := make(chan putOutcome, 1)
-	clReady := make(chan *sftp.Client, 1)
+	session, err := t.conn.NewSession()
+	if err != nil {
+		return fmt.Errorf("ssh: open sftp session: %w", err)
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		session.Close()
+		return fmt.Errorf("ssh: sftp stdout pipe: %w", err)
+	}
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		session.Close()
+		return fmt.Errorf("ssh: sftp stdin pipe: %w", err)
+	}
+	done := make(chan error, 1)
 	go func() {
-		cl, err := sftp.NewClient(t.conn)
-		if err != nil {
-			done <- putOutcome{fmt.Errorf("ssh: open sftp: %w", err)}
+		defer session.Close()
+		if err := session.RequestSubsystem("sftp"); err != nil {
+			done <- fmt.Errorf("ssh: request sftp subsystem: %w", err)
 			return
 		}
-		clReady <- cl
+		cl, err := sftp.NewClientPipe(stdout, stdin)
+		if err != nil {
+			done <- fmt.Errorf("ssh: open sftp: %w", err)
+			return
+		}
 		defer cl.Close()
-		done <- putOutcome{sftpPut(cl, dst, mode, req.Content)}
+		done <- sftpPut(cl, dst, mode, req.Content)
 	}()
 	select {
-	case out := <-done:
-		return out.err
+	case err := <-done:
+		return err
 	case <-ctx.Done():
-		go func() {
-			select {
-			case cl := <-clReady:
-				cl.Close()
-			case <-done:
-			}
-		}()
+		session.Close()
+		<-done
 		return ctx.Err()
 	}
 }
