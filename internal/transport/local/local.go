@@ -79,12 +79,12 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 	if ctx.Err() != nil {
 		return transport.RunResult{}, ctx.Err()
 	}
-	if len(req.Argv) == 0 || req.Argv[0] == "" {
-		return transport.RunResult{}, fmt.Errorf("argv must name a program")
+	if err := transport.ValidateRunRequest(req); err != nil {
+		return transport.RunResult{}, err
 	}
 	dir, err := transport.ValidateAbsolutePath(req.Dir)
 	if err != nil {
-		return transport.RunResult{}, fmt.Errorf("working directory: %w", err)
+		return transport.RunResult{}, &transport.StartError{Err: fmt.Errorf("working directory: %w", err)}
 	}
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = dir
@@ -110,7 +110,7 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 	if runErr != nil {
 		exitErr, ok := runErr.(*exec.ExitError)
 		if !ok {
-			return transport.RunResult{Stdout: res.Stdout, Stderr: res.Stderr}, fmt.Errorf("start %s in %s: %w", req.Argv[0], dir, runErr)
+			return transport.RunResult{Stdout: res.Stdout, Stderr: res.Stderr}, &transport.StartError{Err: fmt.Errorf("start %s in %s: %w", req.Argv[0], dir, runErr)}
 		}
 		res.ExitCode = exitErr.ExitCode()
 	}

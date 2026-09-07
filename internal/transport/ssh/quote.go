@@ -28,6 +28,8 @@ func shellQuote(s string) string {
 // transport contract exactly: argv boundaries stay argument boundaries, the
 // working directory is applied, and a non-nil environment replaces the
 // login environment wholesale. Supplied values are data, never shell syntax.
+// A failed cd exits 126 (start failure per the transport contract); '--'
+// stops env from parsing supplied values as options.
 func buildCommand(dir string, env map[string]string, argv []string) (string, error) {
 	if len(argv) == 0 || argv[0] == "" {
 		return "", fmt.Errorf("argv must name a program")
@@ -35,9 +37,9 @@ func buildCommand(dir string, env map[string]string, argv []string) (string, err
 	var b strings.Builder
 	b.WriteString("cd ")
 	b.WriteString(shellQuote(dir))
-	b.WriteString(" && exec")
+	b.WriteString(" || exit 126\nexec")
 	if env != nil {
-		b.WriteString(" env -i")
+		b.WriteString(" env -i --")
 		keys := make([]string, 0, len(env))
 		for k := range env {
 			keys = append(keys, k)

@@ -3,6 +3,8 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -47,22 +49,39 @@ func New(ctx context.Context, cfg Config) (*Transport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ssh: dial %s: %w", net.JoinHostPort(cfg.Host, fmt.Sprint(port)), err)
 	}
-	conn, chans, reqs, err := gossh.NewClientConn(transportConn, net.JoinHostPort(cfg.Host, fmt.Sprint(port)), &gossh.ClientConfig{
-		User: cfg.User,
-		Auth: []gossh.AuthMethod{gossh.PublicKeys(cfg.Signer)},
-		HostKeyCallback: func(hostname string, remote net.Addr, key gossh.PublicKey) error {
-			if !keysEqual(key, cfg.HostKey) {
-				return fmt.Errorf("ssh: host key mismatch for %s: got %s, pinned %s", hostname, gossh.FingerprintSHA256(key), gossh.FingerprintSHA256(cfg.HostKey))
-			}
-			return nil
-		},
-	})
-	if err != nil {
-		transportConn.Close()
-		return nil, fmt.Errorf("ssh: handshake with %s: %w", cfg.Host, err)
+	type handshake struct {
+		conn  gossh.Conn
+		chans <-chan gossh.NewChannel
+		reqs  <-chan *gossh.Request
+		err   error
 	}
-	go gossh.DiscardRequests(reqs)
-	return &Transport{conn: gossh.NewClient(conn, chans, reqs)}, nil
+	handshakeDone := make(chan handshake, 1)
+	go func() {
+		conn, chans, reqs, err := gossh.NewClientConn(transportConn, net.JoinHostPort(cfg.Host, fmt.Sprint(port)), &gossh.ClientConfig{
+			User: cfg.User,
+			Auth: []gossh.AuthMethod{gossh.PublicKeys(cfg.Signer)},
+			HostKeyCallback: func(hostname string, remote net.Addr, key gossh.PublicKey) error {
+				if !keysEqual(key, cfg.HostKey) {
+					return fmt.Errorf("ssh: host key mismatch for %s: got %s, pinned %s", hostname, gossh.FingerprintSHA256(key), gossh.FingerprintSHA256(cfg.HostKey))
+				}
+				return nil
+			},
+		})
+		handshakeDone <- handshake{conn, chans, reqs, err}
+	}()
+	var hs handshake
+	select {
+	case hs = <-handshakeDone:
+	case <-ctx.Done():
+		transportConn.Close()
+		return nil, ctx.Err()
+	}
+	if hs.err != nil {
+		transportConn.Close()
+		return nil, fmt.Errorf("ssh: handshake with %s: %w", cfg.Host, hs.err)
+	}
+	go gossh.DiscardRequests(hs.reqs)
+	return &Transport{conn: gossh.NewClient(hs.conn, hs.chans, hs.reqs)}, nil
 }
 
 func keysEqual(a, b gossh.PublicKey) bool {
@@ -104,9 +123,12 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 	if ctx.Err() != nil {
 		return transport.RunResult{}, ctx.Err()
 	}
+	if err := transport.ValidateRunRequest(req); err != nil {
+		return transport.RunResult{}, err
+	}
 	dir, err := transport.ValidateAbsolutePath(req.Dir)
 	if err != nil {
-		return transport.RunResult{}, fmt.Errorf("working directory: %w", err)
+		return transport.RunResult{}, &transport.StartError{Err: fmt.Errorf("working directory: %w", err)}
 	}
 	command, err := buildCommand(dir, req.Env, req.Argv)
 	if err != nil {
@@ -139,9 +161,14 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 			return res, fmt.Errorf("ssh: run: %w", err)
 		}
 		res.ExitCode = exitErr.ExitStatus()
+		if res.ExitCode == 126 || res.ExitCode == 127 {
+			return res, &transport.StartError{ExitCode: res.ExitCode, Err: fmt.Errorf("target dispatch failed for %s in %s", req.Argv[0], dir)}
+		}
 		return res, nil
 	}
 }
+
+type putOutcome struct{ err error }
 
 func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 	if ctx.Err() != nil {
@@ -155,21 +182,48 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 	if mode == 0 {
 		mode = 0o644
 	}
-	cl, err := sftp.NewClient(t.conn)
-	if err != nil {
-		return fmt.Errorf("ssh: open sftp: %w", err)
+	done := make(chan putOutcome, 1)
+	clReady := make(chan *sftp.Client, 1)
+	go func() {
+		cl, err := sftp.NewClient(t.conn)
+		if err != nil {
+			done <- putOutcome{fmt.Errorf("ssh: open sftp: %w", err)}
+			return
+		}
+		clReady <- cl
+		defer cl.Close()
+		done <- putOutcome{sftpPut(cl, dst, mode, req.Content)}
+	}()
+	select {
+	case out := <-done:
+		return out.err
+	case <-ctx.Done():
+		go func() {
+			select {
+			case cl := <-clReady:
+				cl.Close()
+			case <-done:
+			}
+		}()
+		return ctx.Err()
 	}
-	defer cl.Close()
+}
+
+func sftpPut(cl *sftp.Client, dst string, mode os.FileMode, content []byte) error {
 	dir := filepath.Dir(dst)
 	if err := cl.MkdirAll(dir); err != nil {
 		return fmt.Errorf("ssh: create %s: %w", dir, err)
 	}
-	tmp, err := cl.Create(fmt.Sprintf("%s/.put-%d.tmp", dir, os.Getpid()))
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return err
+	}
+	tmp, err := cl.Create(fmt.Sprintf("%s/.put-%d-%s.tmp", dir, os.Getpid(), hex.EncodeToString(suffix[:])))
 	if err != nil {
 		return fmt.Errorf("ssh: create temp file in %s: %w", dir, err)
 	}
 	tmpName := tmp.Name()
-	if _, err := tmp.Write(req.Content); err != nil {
+	if _, err := tmp.Write(content); err != nil {
 		tmp.Close()
 		cl.Remove(tmpName)
 		return err

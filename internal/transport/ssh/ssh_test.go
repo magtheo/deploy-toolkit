@@ -296,7 +296,10 @@ func TestBuildCommandDeterministic(t *testing.T) {
 	if !strings.Contains(c1, `'it'\''s'`) {
 		t.Errorf("single quote not encoded: %s", c1)
 	}
-	if !strings.Contains(c1, `env -i 'A=1' 'B=2'`) {
-		t.Errorf("env not sorted/quoted: %s", c1)
+	if !strings.Contains(c1, "env -i -- 'A=1' 'B=2'") {
+		t.Errorf("env not sorted/quoted/option-terminated: %s", c1)
+	}
+	if !strings.Contains(c1, "|| exit 126") {
+		t.Errorf("cd failure must map to the start-failure convention: %s", c1)
 	}
 }

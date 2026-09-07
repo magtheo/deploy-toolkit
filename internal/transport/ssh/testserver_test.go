@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	gossh "golang.org/x/crypto/ssh"
 
@@ -15,9 +16,10 @@ import (
 )
 
 type testServer struct {
-	addr    string
-	hostKey gossh.PublicKey
-	ln      net.Listener
+	addr      string
+	hostKey   gossh.PublicKey
+	ln        net.Listener
+	stallSftp bool
 }
 
 func generateSigner(t *testing.T) gossh.Signer {
@@ -106,6 +108,10 @@ func (ts *testServer) handleSession(channel gossh.Channel, requests <-chan *goss
 				continue
 			}
 			req.Reply(true, nil)
+			if ts.stallSftp {
+				time.Sleep(30 * time.Second)
+				return
+			}
 			srv, err := sftp.NewServer(channel)
 			if err != nil {
 				return

@@ -224,6 +224,29 @@ spec:
 V1 transports: `ssh` and `local`. No provider fields — infrastructure identity
 belongs to Pulumi, which may emit a Target descriptor as an output.
 
+### SSH target prerequisites (V1)
+
+An SSH target must provide, and the toolkit may rely on:
+
+- a **POSIX-compatible command shell** at the account's login shell;
+- an **SFTP subsystem**;
+- support for the **`posix-rename@openssh.com`** extension (atomic
+  publication of staged files).
+
+The **`fsync@openssh.com`** extension is optional: if the target declares it
+unsupported, publication remains atomic and only the durability guarantee is
+weakened; any other sync error fails closed.
+
+### Start-failure semantics (both transports)
+
+A target-side *start failure* — the requested program or working directory
+cannot be used — is a **transport error** (`transport.StartError`), not a
+command result. Local transports observe start failures directly. Over SSH,
+exit codes **126** (not usable / failed `cd`) and **127** (program not found)
+follow the POSIX dispatch convention and are reported as start failures; a
+target command that deliberately exits 126/127 is therefore
+indistinguishable from a start failure — a documented protocol limit.
+
 ## GitHub workflow interface (planned for consumers)
 
 ```yaml
