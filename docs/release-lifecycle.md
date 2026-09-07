@@ -207,7 +207,7 @@ GitHub Deployments         audit / UI projection
 1. ~~Schemas (Project, Release, Environment, Target) + `deployctl validate`~~ **done**
 2. ~~Contract hardening: single parse pipeline, source identity, untagged OCI names, semantic invariants, CI~~ **done**
 3. ~~Release eligibility + immutable artifact resolution (`release create`)~~ **done**
-4. Generated promotion PR flow (`promotion propose` + diff allowlist check)
+4. ~~Generated promotion PR flow (`promotion propose` + Promotion Diff Policy)~~ **done**
 5. `local` transport (deterministic integration tests)
 6. SSH transport (strict host verification)
 7. Server-side staging, observed state, history

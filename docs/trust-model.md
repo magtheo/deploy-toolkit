@@ -20,18 +20,27 @@ human judgment):
 summarize changes, or highlight risk — advisory only, never merge authority,
 never deployment authority.
 
-## Promotion PR diff allowlist
+## Promotion Diff Policy
 
-A promotion PR may only modify:
+A promotion PR may only change two things — and only in semantically
+constrained ways (path-level allowlisting alone would still permit a target
+swap inside an allowed file):
 
-```
-.deploy/releases/<new-release>.yaml
-.deploy/environments/<environment>.yaml
-```
+- one **added** immutable release file (`.deploy/releases/<project>-<version>.yaml`,
+  filename agreeing with its contents), or none if promoting an existing release;
+- one environment file in which **only `spec.release` may differ** from the
+  trusted base — never `target`, `failurePolicy` or identity.
 
-Anything else fails the promotion check. Rationale: the authorization PR must
-not be able to modify **the machinery executing the deployment** — workflows,
-deploy scripts, or application code riding along in the same merge.
+Everything else must be byte-for-byte unchanged, including all existing
+release files. The change is a compare-and-swap on the environment's current
+release: if the trusted base has moved, the proposal is stale, fails the
+check, and must be regenerated.
+
+Full rules: [promotion-diff-policy.md](promotion-diff-policy.md). The check
+executes from trusted code — the pinned toolkit workflow — never from
+PR-controlled code, and requires no production secrets. Rationale: the
+authorization PR must not be able to modify the machinery executing the
+deployment.
 
 ## The deployment contract comes from the promoted release
 

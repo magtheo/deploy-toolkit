@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 
@@ -14,6 +15,7 @@ import (
 	gh "github.com/magtheo/deploy-toolkit/internal/github"
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
 	"github.com/magtheo/deploy-toolkit/internal/oci"
+	"github.com/magtheo/deploy-toolkit/internal/promotion"
 	"github.com/magtheo/deploy-toolkit/internal/release"
 )
 
@@ -33,6 +35,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runValidate(args[1:], stdout, stderr)
 	case "release":
 		return runRelease(args[1:], stdout, stderr)
+	case "promotion":
+		return runPromotion(args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintf(stdout, "deployctl %s\n", version)
 		return 0
@@ -52,10 +56,13 @@ func usage(w io.Writer) {
 Usage:
   deployctl validate <manifest.yaml>...      validate project, release, environment or target manifests
   deployctl release create [flags]           run eligibility and create an immutable release manifest
+  deployctl promotion propose <env> [flags]  open the human-authorization PR for a release
+  deployctl promotion check [flags]          verify a promotion diff against the Promotion Diff Policy
   deployctl version                          print version
 
 Release creation stops at the Release boundary: it never updates environments
-and never opens pull requests.
+and never opens pull requests. Promotion proposals stop at the open, verified
+PR; merging it is the human authorization act.
 
 Release create flags:
   --repo owner/name             source repository (required)
@@ -71,6 +78,18 @@ The release policy is anchored to the trusted integration branch (main); the
 candidate must be reachable from its head. Registry authentication uses the
 standard OCI keychain (~/.docker/config.json and credential helpers) — it is
 independent of GITHUB_TOKEN, which is only the source API credential.
+
+Promotion propose flags:
+  --repo owner/name                          source repository (required)
+  --release .deploy/releases/<p>-<v>.yaml    immutable release to promote (required)
+  --repo-dir .                               local checkout containing the revision (for re-verification)
+
+Promotion check flags (for the trusted CI workflow):
+  --repo owner/name                          source repository (required)
+  --base <sha>                               trusted base commit (required)
+  --head <sha>                               promotion branch head (required)
+
+Both require GITHUB_TOKEN.
 `, version)
 }
 
@@ -90,6 +109,100 @@ func runValidate(paths []string, stdout, stderr io.Writer) int {
 	if failed {
 		return 1
 	}
+	return 0
+}
+
+func runPromotion(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, `usage: deployctl promotion propose <env> [flags] | promotion check [flags]`)
+		return 2
+	}
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		fmt.Fprintln(stderr, "deployctl promotion: GITHUB_TOKEN is not set")
+		return 1
+	}
+	ctx := context.Background()
+	switch args[0] {
+	case "propose":
+		return runPromotionPropose(ctx, args[1:], token, stdout, stderr)
+	case "check":
+		return runPromotionCheck(ctx, args[1:], token, stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "deployctl promotion: unknown subcommand %q\n", args[0])
+		return 2
+	}
+}
+
+func runPromotionPropose(ctx context.Context, args []string, token string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("promotion propose", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		repo    = fs.String("repo", "", "source repository owner/name")
+		relPath = fs.String("release", "", "path to the immutable release manifest")
+		repoDir = fs.String("repo-dir", ".", "local checkout containing the revision")
+	)
+	envName := ""
+	rest := fs.Args()
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if len(fs.Args()) > 0 {
+		envName = fs.Arg(0)
+	}
+	_ = rest
+	if envName == "" || strings.HasPrefix(envName, "-") {
+		fmt.Fprintln(stderr, "usage: deployctl promotion propose <environment> --release <path> --repo owner/name")
+		return 2
+	}
+	if strings.Contains(envName, "/") {
+		fmt.Fprintf(stderr, "deployctl promotion propose: environment must be a bare name, got %q\n", envName)
+		return 2
+	}
+	pr, err := promotion.Propose(ctx, promotion.ProposeInput{
+		Repo:        *repo,
+		Environment: envName,
+		ReleasePath: *relPath,
+		RepoDir:     *repoDir,
+	}, gh.New(token), oci.NewRemote(authn.DefaultKeychain), bundle.NewBuilder(*repoDir))
+	if err != nil {
+		fmt.Fprintf(stderr, "✗ promotion propose: %v\n", err)
+		return 1
+	}
+	if pr.Unchanged {
+		fmt.Fprintf(stdout, "✓ existing proposal is current: %s\n", pr.PR.URL)
+		return 0
+	}
+	fmt.Fprintf(stdout, "✓ release re-verified against current eligibility policy\n")
+	fmt.Fprintf(stdout, "✓ environment change limited to spec.release (%s → %s)\n", pr.From, pr.To)
+	fmt.Fprintf(stdout, "✓ promotion commit %s created on %s\n", pr.BaseSHA[:12], pr.Branch)
+	fmt.Fprintf(stdout, "Opened:\n%s\n", pr.PR.URL)
+	return 0
+}
+
+func runPromotionCheck(ctx context.Context, args []string, token string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("promotion check", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	var (
+		repo = fs.String("repo", "", "source repository owner/name")
+		base = fs.String("base", "", "trusted base commit SHA")
+		head = fs.String("head", "", "promotion branch head SHA")
+	)
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	res, err := promotion.Check(ctx, promotion.CheckInput{Repo: *repo, Base: *base, Head: *head}, gh.New(token))
+	if err != nil {
+		fmt.Fprintf(stderr, "✗ promotion check: %v\n", err)
+		return 1
+	}
+	for _, m := range res.Messages {
+		fmt.Fprintln(stdout, m)
+	}
+	if !res.Passed {
+		return 1
+	}
+	fmt.Fprintln(stdout, "✓ promotion diff policy satisfied")
 	return 0
 }
 

@@ -90,9 +90,11 @@ scope in [docs/architecture.md](docs/architecture.md).
 ## Current CLI
 
 ```
-deployctl validate <manifest.yaml>...   validate project/release/environment/target manifests
-deployctl release create [flags]        run eligibility and create an immutable release manifest
-deployctl version                       print version
+deployctl validate <manifest.yaml>...      validate project/release/environment/target manifests
+deployctl release create [flags]           run eligibility and create an immutable release manifest
+deployctl promotion propose <env> [flags]  open the human-authorization PR for a release
+deployctl promotion check [flags]          verify a PR diff against the Promotion Diff Policy
+deployctl version                          print version
 ```
 
 Manifests pass through one authoritative pipeline: header check → JSON Schema
@@ -104,12 +106,21 @@ from it, verifies every required check on the exact SHA, resolves artifact
 digests via the SHA discovery tag, builds the deterministic bundle from the
 exact Git tree, and writes `.deploy/releases/<project>-<version>.yaml` —
 idempotently, refusing to overwrite a different release with the same version.
-It stops at the Release boundary: no environment changes, no PRs.
-Requires `GITHUB_TOKEN`; run from a checkout containing the candidate.
+It stops at the Release boundary.
 
-Planned (not yet implemented): `promotion propose`, `deploy`, `rollback`,
-`status`. See the roadmap in
-[docs/release-lifecycle.md](docs/release-lifecycle.md).
+`promotion propose` re-verifies the release against current eligibility
+policy, reads the environment from trusted `main`, and opens a machine-generated
+authorization PR containing one atomic commit: the release file plus an
+environment change limited to `spec.release`. It is idempotent, detects
+conflicting proposals, and stops at the open PR — **merging is the human
+authorization act** (see
+[docs/promotion-diff-policy.md](docs/promotion-diff-policy.md)).
+
+Requires `GITHUB_TOKEN` for the GitHub API; registry auth uses the standard
+OCI keychain, independent of `GITHUB_TOKEN`.
+
+Planned (not yet implemented): `deploy`, `rollback`, `status`. See the
+roadmap in [docs/release-lifecycle.md](docs/release-lifecycle.md).
 
 ## For consumers
 

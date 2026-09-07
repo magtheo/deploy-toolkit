@@ -8,15 +8,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"gopkg.in/yaml.v3"
-
-	"github.com/magtheo/deploy-toolkit/internal/bundle"
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
 )
-
-type Bundler interface {
-	Build(ctx context.Context, revision string, include []string) (bundle.Result, error)
-}
 
 type CreateInput struct {
 	Repo          string
@@ -60,32 +53,12 @@ func Create(ctx context.Context, in CreateInput, src Source, resolver Resolver, 
 	if err := in.validate(); err != nil {
 		return nil, err
 	}
-	policy, material, branchHead, err := loadProjects(ctx, in.Repo, in.Revision, src)
+	ev, err := Evaluate(ctx, EvalInput{Repo: in.Repo, Revision: in.Revision}, src, resolver, bundler)
 	if err != nil {
 		return nil, err
 	}
-	runs, err := src.CheckRuns(ctx, in.Repo, in.Revision)
-	if err != nil {
-		return nil, err
-	}
-	checks, err := checkEligibility(policy.Release.RequiredChecks, runs)
-	if err != nil {
-		return nil, err
-	}
-
-	artifacts := make(map[string]ResolvedArtifact, len(material.Artifacts))
-	for name, a := range material.Artifacts {
-		digest, err := resolver.Resolve(ctx, a.Repository, in.Revision)
-		if err != nil {
-			return nil, fmt.Errorf("artifact %q: %w", name, err)
-		}
-		artifacts[name] = ResolvedArtifact{Repository: a.Repository, Digest: digest}
-	}
-
-	bres, err := bundler.Build(ctx, in.Revision, material.Bundle.Include)
-	if err != nil {
-		return nil, fmt.Errorf("build bundle: %w", err)
-	}
+	checks, artifacts := ev.Checks, ev.Artifacts
+	branchHead, material := ev.BranchHead, ev.Material
 
 	rel := &manifest.Release{
 		APIVersion: manifest.APIVersion,
@@ -101,10 +74,10 @@ func Create(ctx context.Context, in CreateInput, src Source, resolver Resolver, 
 		},
 		Artifacts: make(map[string]manifest.BuiltArtifact, len(artifacts)),
 		Bundle: manifest.BundleDigest{
-			Digest: bres.Digest,
+			Digest: ev.BundleDigest,
 		},
 		DeploymentContract: manifest.ContractDigest{
-			Digest: bres.ContractDigest,
+			Digest: ev.ContractDigest,
 		},
 		Migration: manifest.MigrationSpec{
 			Head:         in.MigrationHead,
@@ -116,20 +89,17 @@ func Create(ctx context.Context, in CreateInput, src Source, resolver Resolver, 
 		rel.Artifacts[name] = manifest.BuiltArtifact{Type: "oci", Image: a.Repository, Digest: a.Digest}
 	}
 
-	data, err := yaml.Marshal(rel)
+	data, err := RenderManifest(rel)
 	if err != nil {
-		return nil, fmt.Errorf("render release manifest: %w", err)
-	}
-	if _, err := manifest.Parse(data, manifest.KindRelease); err != nil {
-		return nil, fmt.Errorf("generated release manifest is not valid: %w", err)
+		return nil, err
 	}
 
-	path := filepath.Join(in.ReleasesDir, fmt.Sprintf("%s-%s.yaml", material.Metadata.Name, in.Version))
+	path := ReleaseFilePath(in.ReleasesDir, material.Metadata.Name, in.Version)
 	report := func(unchanged bool) *Report {
 		return &Report{
 			Project: material.Metadata.Name, SourceRevision: in.Revision, BranchHead: branchHead,
 			Checks: checks, Artifacts: artifacts,
-			BundleDigest: bres.Digest, ContractDigest: bres.ContractDigest, BundleFiles: bres.Files,
+			BundleDigest: ev.BundleDigest, ContractDigest: ev.ContractDigest, BundleFiles: ev.BundleFiles,
 			ReleasePath: path, Unchanged: unchanged,
 		}
 	}
@@ -186,9 +156,16 @@ func publishAtomic(dir, name string, data []byte) (bool, error) {
 		}
 		return true, nil
 	}
-	if d, err := os.Open(dir); err == nil {
-		d.Sync()
-		d.Close()
+	if d, err := os.Open(dir); err != nil {
+		return false, fmt.Errorf("open releases dir for sync: %w", err)
+	} else {
+		if err := d.Sync(); err != nil {
+			d.Close()
+			return false, fmt.Errorf("sync releases dir: %w", err)
+		}
+		if err := d.Close(); err != nil {
+			return false, fmt.Errorf("close releases dir: %w", err)
+		}
 	}
 	return false, nil
 }
