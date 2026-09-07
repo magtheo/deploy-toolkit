@@ -141,7 +141,7 @@ func TestCreateHappyPath(t *testing.T) {
 	releasesDir := filepath.Join(t.TempDir(), "releases")
 
 	in := CreateInput{
-		Repo: "example/my-app", Branch: "main", Revision: rev,
+		Repo: "example/my-app", Revision: rev,
 		Version: "0.1.0", MigrationHead: "043", MigrationMode: "forward-compatible",
 		RollbackSafe: true, ReleasesDir: releasesDir,
 	}
@@ -188,7 +188,7 @@ func TestCreateRefusesOverwrite(t *testing.T) {
 	}, true)
 	res := &stubResolver{digests: map[string]string{"ghcr.io/example/app:" + rev: testDigest}}
 	releasesDir := filepath.Join(t.TempDir(), "releases")
-	in := CreateInput{Repo: "example/my-app", Branch: "main", Revision: rev, Version: "0.1.0", MigrationHead: "043", MigrationMode: "none", ReleasesDir: releasesDir}
+	in := CreateInput{Repo: "example/my-app", Revision: rev, Version: "0.1.0", MigrationHead: "043", MigrationMode: "none", ReleasesDir: releasesDir}
 	if _, err := Create(context.Background(), in, src, res, bundler); err != nil {
 		t.Fatal(err)
 	}
@@ -206,25 +206,28 @@ func TestCreateRejections(t *testing.T) {
 		{Name: "Tests", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 10},
 		{Name: "CVE scan", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 11},
 	}
-	try := func(t *testing.T, runs []CheckRun, ancestor bool, mutateMaterial func(string) []byte, in CreateInput) error {
+	try := func(t *testing.T, runs []CheckRun, ancestor bool, mutatePolicy, mutateMaterial func() []byte, in CreateInput) error {
 		t.Helper()
 		bundler, rev := gitFixture(t)
-		material := policyDoc()
-		if mutateMaterial != nil {
-			material = mutateMaterial(rev)
+		policy, material := policyDoc(), policyDoc()
+		if mutatePolicy != nil {
+			policy = mutatePolicy()
 		}
-		src := fakeSource(rev, "9999"+rev[4:], policyDoc(), material, runs, ancestor)
+		if mutateMaterial != nil {
+			material = mutateMaterial()
+		}
+		src := fakeSource(rev, "9999"+rev[4:], policy, material, runs, ancestor)
 		_, err := Create(context.Background(), in, src, &stubResolver{digests: map[string]string{"ghcr.io/example/app:" + rev: testDigest}}, bundler)
 		return err
 	}
 	releasesDir := filepath.Join(t.TempDir(), "releases")
-	std := CreateInput{Repo: "example/my-app", Branch: "main", Version: "0.1.0", MigrationHead: "1", MigrationMode: "none", ReleasesDir: releasesDir}
+	std := CreateInput{Repo: "example/my-app", Version: "0.1.0", MigrationHead: "1", MigrationMode: "none", ReleasesDir: releasesDir}
 
 	t.Run("not ancestor", func(t *testing.T) {
 		in := std
 		_, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, okRuns, false, nil, in)
+		err := try(t, okRuns, false, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "not reachable") {
 			t.Errorf("err = %v", err)
 		}
@@ -233,7 +236,7 @@ func TestCreateRejections(t *testing.T) {
 		in := std
 		_, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, okRuns[:1], true, nil, in)
+		err := try(t, okRuns[:1], true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "not found") {
 			t.Errorf("err = %v", err)
 		}
@@ -245,7 +248,7 @@ func TestCreateRejections(t *testing.T) {
 		err := try(t, []CheckRun{
 			{Name: "Tests", Status: "completed", Conclusion: "failure", AppID: 1, SuiteID: 10},
 			{Name: "CVE scan", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 11},
-		}, true, nil, in)
+		}, true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "failure") {
 			t.Errorf("err = %v", err)
 		}
@@ -258,7 +261,7 @@ func TestCreateRejections(t *testing.T) {
 			{Name: "Tests", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 10},
 			{Name: "Tests", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 99},
 			{Name: "CVE scan", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 11},
-		}, true, nil, in)
+		}, true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "ambiguous") {
 			t.Errorf("err = %v", err)
 		}
@@ -267,10 +270,31 @@ func TestCreateRejections(t *testing.T) {
 		in := std
 		_, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, okRuns, true, func(_ string) []byte {
+		err := try(t, okRuns, true, nil, func() []byte {
 			return []byte(strings.Replace(string(policyDoc()), "name: my-app", "name: other-app", 1))
 		}, in)
 		if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+			t.Errorf("err = %v", err)
+		}
+	})
+	t.Run("policy declares foreign repository", func(t *testing.T) {
+		in := std
+		_, rev := gitFixture(t)
+		in.Revision = rev
+		in.Repo = "other/my-app"
+		err := try(t, okRuns, true, nil, nil, in)
+		if err == nil || !strings.Contains(err.Error(), "declares source repository") {
+			t.Errorf("err = %v", err)
+		}
+	})
+	t.Run("policy declares non-trusted branch", func(t *testing.T) {
+		in := std
+		_, rev := gitFixture(t)
+		in.Revision = rev
+		err := try(t, okRuns, true, func() []byte {
+			return []byte(strings.Replace(string(policyDoc()), "branch: main", "branch: develop", 1))
+		}, nil, in)
+		if err == nil || !strings.Contains(err.Error(), "trusted integration branch") {
 			t.Errorf("err = %v", err)
 		}
 	})
@@ -280,7 +304,7 @@ func TestCreateRejections(t *testing.T) {
 		in.Revision = rev
 		in.MigrationMode = "irreversible"
 		in.RollbackSafe = true
-		err := try(t, okRuns, true, nil, in)
+		err := try(t, okRuns, true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "rollback-safe") {
 			t.Errorf("err = %v", err)
 		}
@@ -288,7 +312,7 @@ func TestCreateRejections(t *testing.T) {
 	t.Run("short revision input", func(t *testing.T) {
 		in := std
 		in.Revision = "abc"
-		err := try(t, okRuns, true, nil, in)
+		err := try(t, okRuns, true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "full commit SHA") {
 			t.Errorf("err = %v", err)
 		}

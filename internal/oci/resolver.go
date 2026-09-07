@@ -10,14 +10,14 @@ import (
 )
 
 type Remote struct {
-	Auth authn.Authenticator
+	Keychain authn.Keychain
 }
 
-func NewRemote(auth authn.Authenticator) *Remote {
-	if auth == nil {
-		auth = authn.Anonymous
+func NewRemote(kc authn.Keychain) *Remote {
+	if kc == nil {
+		kc = authn.DefaultKeychain
 	}
-	return &Remote{Auth: auth}
+	return &Remote{Keychain: kc}
 }
 
 func (r *Remote) Resolve(ctx context.Context, repository, tag string) (string, error) {
@@ -25,7 +25,7 @@ func (r *Remote) Resolve(ctx context.Context, repository, tag string) (string, e
 	if err != nil {
 		return "", fmt.Errorf("parse %s:%s: %w", repository, tag, err)
 	}
-	desc, err := remote.Head(ref, remote.WithContext(ctx), remote.WithAuth(r.Auth))
+	desc, err := remote.Head(ref, remote.WithContext(ctx), remote.WithAuthFromKeychain(r.Keychain))
 	if err != nil {
 		return "", fmt.Errorf("resolve %s:%s: %w", repository, tag, err)
 	}

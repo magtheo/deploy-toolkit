@@ -28,11 +28,13 @@ func (s *Source) CheckRuns(ctx context.Context, repo, ref string) ([]release.Che
 		}
 		for _, cr := range res.CheckRuns {
 			out = append(out, release.CheckRun{
+				ID:         cr.GetID(),
 				Name:       cr.GetName(),
 				Status:     cr.GetStatus(),
 				Conclusion: cr.GetConclusion(),
 				AppID:      cr.GetApp().GetID(),
 				SuiteID:    cr.GetCheckSuite().GetID(),
+				StartedAt:  cr.GetStartedAt().Time,
 			})
 		}
 		if resp.NextPage == 0 {

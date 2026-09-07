@@ -3,6 +3,7 @@ package release
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,7 +20,6 @@ type Bundler interface {
 
 type CreateInput struct {
 	Repo          string
-	Branch        string
 	Revision      string
 	RepoDir       string
 	Version       string
@@ -30,8 +30,8 @@ type CreateInput struct {
 }
 
 func (in *CreateInput) validate() error {
-	if in.Repo == "" || in.Branch == "" {
-		return fmt.Errorf("--repo owner/name and --branch are required")
+	if in.Repo == "" {
+		return fmt.Errorf("--repo owner/name is required")
 	}
 	if !revisionPattern.MatchString(in.Revision) {
 		return fmt.Errorf("--revision must be a full commit SHA, got %q", in.Revision)
@@ -60,7 +60,7 @@ func Create(ctx context.Context, in CreateInput, src Source, resolver Resolver, 
 	if err := in.validate(); err != nil {
 		return nil, err
 	}
-	policy, material, branchHead, err := loadProjects(ctx, in.Repo, in.Branch, in.Revision, src)
+	policy, material, branchHead, err := loadProjects(ctx, in.Repo, in.Revision, src)
 	if err != nil {
 		return nil, err
 	}
@@ -125,32 +125,70 @@ func Create(ctx context.Context, in CreateInput, src Source, resolver Resolver, 
 	}
 
 	path := filepath.Join(in.ReleasesDir, fmt.Sprintf("%s-%s.yaml", material.Metadata.Name, in.Version))
+	report := func(unchanged bool) *Report {
+		return &Report{
+			Project: material.Metadata.Name, SourceRevision: in.Revision, BranchHead: branchHead,
+			Checks: checks, Artifacts: artifacts,
+			BundleDigest: bres.Digest, ContractDigest: bres.ContractDigest, BundleFiles: bres.Files,
+			ReleasePath: path, Unchanged: unchanged,
+		}
+	}
 	existing, err := os.ReadFile(path)
 	switch {
 	case err == nil:
 		if !bytes.Equal(existing, data) {
 			return nil, fmt.Errorf("release %s-%s already exists and names a different release; refusing to overwrite", material.Metadata.Name, in.Version)
 		}
-		return &Report{
-			Project: material.Metadata.Name, SourceRevision: in.Revision, BranchHead: branchHead,
-			Checks: checks, Artifacts: artifacts,
-			BundleDigest: bres.Digest, ContractDigest: bres.ContractDigest, BundleFiles: bres.Files,
-			ReleasePath: path, Unchanged: true,
-		}, nil
+		return report(true), nil
 	case os.IsNotExist(err):
 	default:
 		return nil, err
 	}
-	if err := os.MkdirAll(in.ReleasesDir, 0o755); err != nil {
+	unchanged, err := publishAtomic(in.ReleasesDir, filepath.Base(path), data)
+	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return nil, err
+	return report(unchanged), nil
+}
+
+func publishAtomic(dir, name string, data []byte) (bool, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, err
 	}
-	return &Report{
-		Project: material.Metadata.Name, SourceRevision: in.Revision, BranchHead: branchHead,
-		Checks: checks, Artifacts: artifacts,
-		BundleDigest: bres.Digest, ContractDigest: bres.ContractDigest, BundleFiles: bres.Files,
-		ReleasePath: path,
-	}, nil
+	tmp, err := os.CreateTemp(dir, ".release-*.tmp")
+	if err != nil {
+		return false, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return false, err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return false, err
+	}
+	if err := tmp.Close(); err != nil {
+		return false, err
+	}
+	dst := filepath.Join(dir, name)
+	if err := os.Link(tmpName, dst); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return false, err
+		}
+		existing, readErr := os.ReadFile(dst)
+		if readErr != nil {
+			return false, fmt.Errorf("release %s appeared concurrently but cannot be read: %w", dst, readErr)
+		}
+		if !bytes.Equal(existing, data) {
+			return false, fmt.Errorf("release %s already exists and names a different release; refusing to overwrite", dst)
+		}
+		return true, nil
+	}
+	if d, err := os.Open(dir); err == nil {
+		d.Sync()
+		d.Close()
+	}
+	return false, nil
 }

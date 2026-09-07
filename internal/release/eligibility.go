@@ -4,11 +4,16 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"time"
 
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
 )
 
-const ProjectPath = ".deploy/project.yaml"
+const (
+	ProjectPath = ".deploy/project.yaml"
+
+	TrustedBranch = "main"
+)
 
 var revisionPattern = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 
@@ -25,11 +30,13 @@ type Resolver interface {
 }
 
 type CheckRun struct {
+	ID         int64
 	Name       string
 	Status     string
 	Conclusion string
 	AppID      int64
 	SuiteID    int64
+	StartedAt  time.Time
 }
 
 type CheckResult struct {
@@ -55,6 +62,13 @@ type Report struct {
 	Unchanged      bool
 }
 
+func laterRun(a, b CheckRun) bool {
+	if !a.StartedAt.Equal(b.StartedAt) {
+		return a.StartedAt.After(b.StartedAt)
+	}
+	return a.ID > b.ID
+}
+
 func checkEligibility(required []string, runs []CheckRun) ([]CheckResult, error) {
 	byName := make(map[string][]CheckRun)
 	for _, r := range runs {
@@ -66,28 +80,32 @@ func checkEligibility(required []string, runs []CheckRun) ([]CheckResult, error)
 		if len(rs) == 0 {
 			return nil, fmt.Errorf("required check %q not found on candidate (missing fails closed)", name)
 		}
-		producers := make(map[[2]int64]bool)
+		current := make(map[[2]int64]CheckRun)
 		for _, r := range rs {
-			producers[[2]int64{r.AppID, r.SuiteID}] = true
+			key := [2]int64{r.AppID, r.SuiteID}
+			prev, ok := current[key]
+			if !ok || laterRun(r, prev) {
+				current[key] = r
+			}
 		}
-		if len(producers) > 1 {
-			return nil, fmt.Errorf("required check %q is ambiguous: %d different producers report a check with this name", name, len(producers))
+		if len(current) > 1 {
+			return nil, fmt.Errorf("required check %q is ambiguous: %d different producers currently report a check with this name", name, len(current))
 		}
-		for _, r := range rs {
+		for _, r := range current {
 			if r.Status != "completed" {
 				return nil, fmt.Errorf("required check %q has not concluded (status %q)", name, r.Status)
 			}
 			if r.Conclusion != "success" {
 				return nil, fmt.Errorf("required check %q concluded %q (only success is eligible)", name, r.Conclusion)
 			}
+			results = append(results, CheckResult{Name: name, Conclusion: "success"})
 		}
-		results = append(results, CheckResult{Name: name, Conclusion: "success"})
 	}
 	return results, nil
 }
 
-func loadProjects(ctx context.Context, repo, branch, revision string, src Source) (policy, material *manifest.Project, branchHead string, err error) {
-	branchHead, err = src.BranchHead(ctx, repo, branch)
+func loadProjects(ctx context.Context, repo, revision string, src Source) (policy, material *manifest.Project, branchHead string, err error) {
+	branchHead, err = src.BranchHead(ctx, repo, TrustedBranch)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -99,7 +117,7 @@ func loadProjects(ctx context.Context, repo, branch, revision string, src Source
 		return nil, nil, "", err
 	}
 	if !ancestor {
-		return nil, nil, "", fmt.Errorf("revision %s is not reachable from %s@%s (head %s)", revision, repo, branch, branchHead)
+		return nil, nil, "", fmt.Errorf("revision %s is not reachable from %s@%s (head %s)", revision, repo, TrustedBranch, branchHead)
 	}
 	policyBytes, err := src.FileAt(ctx, repo, ProjectPath, branchHead)
 	if err != nil {
@@ -108,6 +126,12 @@ func loadProjects(ctx context.Context, repo, branch, revision string, src Source
 	policyRes, err := manifest.Parse(policyBytes, manifest.KindProject)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("release policy (%s @ %s): %w", ProjectPath, branchHead, err)
+	}
+	if policyRes.Project.Release.Source.Repository != repo {
+		return nil, nil, "", fmt.Errorf("release policy at %s declares source repository %q, but %s is being evaluated", branchHead, policyRes.Project.Release.Source.Repository, repo)
+	}
+	if policyRes.Project.Release.Source.Branch != TrustedBranch {
+		return nil, nil, "", fmt.Errorf("release policy at %s declares permitted branch %q, but %s is the trusted integration branch", branchHead, policyRes.Project.Release.Source.Branch, TrustedBranch)
 	}
 	materialBytes, err := src.FileAt(ctx, repo, ProjectPath, revision)
 	if err != nil {

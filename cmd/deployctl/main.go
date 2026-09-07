@@ -59,7 +59,6 @@ and never opens pull requests.
 
 Release create flags:
   --repo owner/name             source repository (required)
-  --branch main                 permitted promotion branch (required)
   --revision <full-sha>         candidate commit (required)
   --version 0.1.0               semantic version of the release (required)
   --migration-head "043"        migration head (required)
@@ -68,7 +67,10 @@ Release create flags:
   --repo-dir .                  local checkout containing the revision (for the bundle)
   --releases-dir .deploy/releases
 
-Release creation requires GITHUB_TOKEN.
+The release policy is anchored to the trusted integration branch (main); the
+candidate must be reachable from its head. Registry authentication uses the
+standard OCI keychain (~/.docker/config.json and credential helpers) — it is
+independent of GITHUB_TOKEN, which is only the source API credential.
 `, version)
 }
 
@@ -100,7 +102,6 @@ func runRelease(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	var (
 		repo         = fs.String("repo", "", "source repository owner/name")
-		branch       = fs.String("branch", "main", "permitted promotion branch")
 		rev          = fs.String("revision", "", "candidate full commit SHA")
 		ver          = fs.String("version", "", "release version")
 		migHead      = fs.String("migration-head", "", "migration head")
@@ -124,19 +125,18 @@ func runRelease(args []string, stdout, stderr io.Writer) int {
 	ctx := context.Background()
 	rep, err := release.Create(ctx, release.CreateInput{
 		Repo:          *repo,
-		Branch:        *branch,
 		Revision:      *rev,
 		Version:       *ver,
 		MigrationHead: *migHead,
 		MigrationMode: *migMode,
 		RollbackSafe:  *rollbackSafe,
 		ReleasesDir:   *releasesDir,
-	}, gh.New(token), oci.NewRemote(&authn.Basic{Username: "deployctl", Password: token}), bundle.NewBuilder(*repoDir))
+	}, gh.New(token), oci.NewRemote(authn.DefaultKeychain), bundle.NewBuilder(*repoDir))
 	if err != nil {
 		fmt.Fprintf(stderr, "✗ release create: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(stdout, "✓ revision %s is reachable from %s@%s (head %s)\n", rep.SourceRevision, *repo, *branch, rep.BranchHead)
+	fmt.Fprintf(stdout, "✓ revision %s is reachable from %s@%s (head %s)\n", rep.SourceRevision, *repo, release.TrustedBranch, rep.BranchHead)
 	fmt.Fprintf(stdout, "✓ required checks passed (%d/%d)\n", len(rep.Checks), len(rep.Checks))
 	fmt.Fprintf(stdout, "✓ artifacts resolved (%d)\n", len(rep.Artifacts))
 	fmt.Fprintf(stdout, "✓ bundle constructed (%d files, %s)\n", len(rep.BundleFiles), rep.BundleDigest)

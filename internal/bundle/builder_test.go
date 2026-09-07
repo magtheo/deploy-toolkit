@@ -135,6 +135,35 @@ func TestBuildRejectsMissingContract(t *testing.T) {
 	}
 }
 
+func TestBuildIgnoresReplaceRefs(t *testing.T) {
+	dir, rev := fixtureRepo(t)
+	ctx := context.Background()
+	b := NewBuilder(dir)
+
+	before, err := b.Build(ctx, rev, []string{"docker-compose.yml", "config/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := filepath.Join(dir, "config", "app.yaml")
+	if err := os.WriteFile(p, []byte("listen: 9999\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "add", "-A")
+	gitRun(t, dir, "commit", "-q", "-m", "replacement")
+	replacement := strings.TrimSpace(gitRun(t, dir, "rev-parse", "HEAD"))
+	gitRun(t, dir, "replace", rev, replacement)
+
+	after, err := b.Build(ctx, rev, []string{"docker-compose.yml", "config/**"})
+	if err != nil {
+		t.Fatalf("build under active refs/replace: %v", err)
+	}
+	if after.Digest != before.Digest {
+		t.Errorf("replace ref altered the bundle: %s vs %s", before.Digest, after.Digest)
+	}
+	gitRun(t, dir, "replace", "-d", rev)
+}
+
 func TestSymlinkTargetValidation(t *testing.T) {
 	if err := checkSymlinkTarget("current.yaml", "/etc/passwd"); err == nil {
 		t.Error("absolute target accepted")
