@@ -163,6 +163,30 @@ V1 uses a **push** model: GitHub deploys to the server over SSH.
 
 A pull/agent model may be earned later by many hosts, not before.
 
+## Target interaction primitive
+
+Deployment semantics are written once, above a small transport boundary:
+
+```go
+type Transport interface {
+    Put(ctx context.Context, req PutRequest) error
+    Run(ctx context.Context, req RunRequest) (RunResult, error)
+}
+```
+
+- `Put` transfers exact bytes to an absolute destination path with an explicit
+  file mode (atomic write, parent directories created); relative paths and
+  `..` traversal are rejected.
+- `Run` executes an **argv vector** with an explicit working directory and
+  explicit environment (nil inherits; a map replaces wholesale). stdout and
+  stderr are captured separately, the exit code is preserved, and context
+  cancellation kills the process. A non-zero exit is a command *result*, not
+  a transport error.
+
+`local` (V1, deterministic integration tests) and `ssh` (V1, strict host
+verification) implement the same contract; the deployment state machine never
+knows which one is underneath.
+
 ## Two trust stages per deployment
 
 ```
