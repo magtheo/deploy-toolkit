@@ -135,36 +135,12 @@ func runPromotion(args []string, stdout, stderr io.Writer) int {
 }
 
 func runPromotionPropose(ctx context.Context, args []string, token string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("promotion propose", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	var (
-		repo    = fs.String("repo", "", "source repository owner/name")
-		relPath = fs.String("release", "", "path to the immutable release manifest")
-		repoDir = fs.String("repo-dir", ".", "local checkout containing the revision")
-	)
-	envName := ""
-	rest := fs.Args()
-	if err := fs.Parse(args); err != nil {
+	_, in, err := parseProposeArgs(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
 		return 2
 	}
-	if len(fs.Args()) > 0 {
-		envName = fs.Arg(0)
-	}
-	_ = rest
-	if envName == "" || strings.HasPrefix(envName, "-") {
-		fmt.Fprintln(stderr, "usage: deployctl promotion propose <environment> --release <path> --repo owner/name")
-		return 2
-	}
-	if strings.Contains(envName, "/") {
-		fmt.Fprintf(stderr, "deployctl promotion propose: environment must be a bare name, got %q\n", envName)
-		return 2
-	}
-	pr, err := promotion.Propose(ctx, promotion.ProposeInput{
-		Repo:        *repo,
-		Environment: envName,
-		ReleasePath: *relPath,
-		RepoDir:     *repoDir,
-	}, gh.New(token), oci.NewRemote(authn.DefaultKeychain), bundle.NewBuilder(*repoDir))
+	pr, err := promotion.Propose(ctx, *in, gh.New(token), oci.NewRemote(authn.DefaultKeychain), bundle.NewBuilder(in.RepoDir))
 	if err != nil {
 		fmt.Fprintf(stderr, "✗ promotion propose: %v\n", err)
 		return 1
@@ -175,23 +151,62 @@ func runPromotionPropose(ctx context.Context, args []string, token string, stdou
 	}
 	fmt.Fprintf(stdout, "✓ release re-verified against current eligibility policy\n")
 	fmt.Fprintf(stdout, "✓ environment change limited to spec.release (%s → %s)\n", pr.From, pr.To)
-	fmt.Fprintf(stdout, "✓ promotion commit %s created on %s\n", pr.BaseSHA[:12], pr.Branch)
+	fmt.Fprintf(stdout, "✓ promotion commit %s created on %s\n", shortSHA(pr.CommitSHA), pr.Branch)
 	fmt.Fprintf(stdout, "Opened:\n%s\n", pr.PR.URL)
 	return 0
 }
 
-func runPromotionCheck(ctx context.Context, args []string, token string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("promotion check", flag.ContinueOnError)
-	fs.SetOutput(stderr)
+func parseProposeArgs(args []string) (string, *promotion.ProposeInput, error) {
+	fs := flag.NewFlagSet("promotion propose", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	var (
-		repo = fs.String("repo", "", "source repository owner/name")
-		base = fs.String("base", "", "trusted base commit SHA")
-		head = fs.String("head", "", "promotion branch head SHA")
+		repo    = fs.String("repo", "", "source repository owner/name")
+		relPath = fs.String("release", "", "path to the immutable release manifest")
+		repoDir = fs.String("repo-dir", ".", "local checkout containing the revision")
+	)
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return "", nil, fmt.Errorf("usage: deployctl promotion propose <environment> --release <path> --repo owner/name")
+	}
+	envName := args[0]
+	if strings.Contains(envName, "/") {
+		return "", nil, fmt.Errorf("environment must be a bare name, got %q", envName)
+	}
+	if err := fs.Parse(args[1:]); err != nil {
+		return "", nil, err
+	}
+	if fs.NArg() > 0 {
+		return "", nil, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	return envName, &promotion.ProposeInput{
+		Repo:        *repo,
+		Environment: envName,
+		ReleasePath: *relPath,
+		RepoDir:     *repoDir,
+	}, nil
+}
+
+func parseCheckArgs(args []string) (*promotion.CheckInput, error) {
+	fs := flag.NewFlagSet("promotion check", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var (
+		repo    = fs.String("repo", "", "source repository owner/name")
+		base    = fs.String("base", "", "trusted base commit SHA")
+		head    = fs.String("head", "", "promotion branch head SHA")
+		repoDir = fs.String("repo-dir", "", "checkout containing the release source revision (required for new-release proposals)")
 	)
 	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	return &promotion.CheckInput{Repo: *repo, Base: *base, Head: *head, RepoDir: *repoDir}, nil
+}
+
+func runPromotionCheck(ctx context.Context, args []string, token string, stdout, stderr io.Writer) int {
+	in, err := parseCheckArgs(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
 		return 2
 	}
-	res, err := promotion.Check(ctx, promotion.CheckInput{Repo: *repo, Base: *base, Head: *head}, gh.New(token))
+	res, err := promotion.Check(ctx, *in, gh.New(token), oci.NewRemote(authn.DefaultKeychain), bundle.NewBuilder(in.RepoDir))
 	if err != nil {
 		fmt.Fprintf(stderr, "✗ promotion check: %v\n", err)
 		return 1
@@ -204,6 +219,13 @@ func runPromotionCheck(ctx context.Context, args []string, token string, stdout,
 	}
 	fmt.Fprintln(stdout, "✓ promotion diff policy satisfied")
 	return 0
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 func runRelease(args []string, stdout, stderr io.Writer) int {

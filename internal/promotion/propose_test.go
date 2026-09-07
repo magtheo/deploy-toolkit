@@ -18,6 +18,11 @@ import (
 const (
 	checkBaseSHA = "1111111111111111111111111111111111111111"
 	digestConst  = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	altDigest    = "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	headSHA      = "headsha"
+	envPathConst = EnvironmentsDir + "/production.yaml"
+	relPathConst = ".deploy/releases/my-app-0.1.0.yaml"
+	oldRelConst  = ".deploy/releases/my-app-0.0.9.yaml"
 )
 
 func baseTime() time.Time { return time.Unix(1700000000, 0) }
@@ -62,10 +67,11 @@ func okRuns() []release.CheckRun {
 type fakeStore struct {
 	heads          map[string]string
 	files          map[string]map[string][]byte
+	trees          map[string]map[string]string
+	parents        map[string][]string
 	runs           []release.CheckRun
 	anc            bool
 	blobs          map[string][]byte
-	filesStatus    []ChangedFile
 	branches       map[string]bool
 	openPRs        map[string]PullRequest
 	createdCommits []string
@@ -79,11 +85,13 @@ func proposeStore(rev string) *fakeStore {
 		heads: map[string]string{release.TrustedBranch: checkBaseSHA},
 		files: map[string]map[string][]byte{
 			checkBaseSHA: {
-				".deploy/project.yaml":               projectDoc(),
-				EnvironmentsDir + "/production.yaml": envDoc(".deploy/releases/my-app-0.0.9.yaml"),
+				release.ProjectPath: projectDoc(),
+				envPathConst:        envDoc(oldRelConst),
 			},
-			rev: {".deploy/project.yaml": projectDoc()},
+			rev: {release.ProjectPath: projectDoc()},
 		},
+		trees:    map[string]map[string]string{},
+		parents:  map[string][]string{},
 		runs:     okRuns(),
 		anc:      true,
 		branches: map[string]bool{},
@@ -116,6 +124,25 @@ func (f *fakeStore) FileAt(ctx context.Context, repo, path, ref string) ([]byte,
 }
 func (f *fakeStore) CheckRuns(ctx context.Context, repo, ref string) ([]release.CheckRun, error) {
 	return f.runs, nil
+}
+func (f *fakeStore) CommitParents(ctx context.Context, repo, sha string) ([]string, error) {
+	if p, ok := f.parents[sha]; ok {
+		return p, nil
+	}
+	return []string{checkBaseSHA}, nil
+}
+func (f *fakeStore) CommitTreePaths(ctx context.Context, repo, sha string) (map[string]string, error) {
+	t, ok := f.trees[sha]
+	if !ok {
+		return nil, fmt.Errorf("no tree for %s", sha)
+	}
+	return t, nil
+}
+func (f *fakeStore) BlobAt(ctx context.Context, repo, blobSHA string) ([]byte, error) {
+	if b, ok := f.blobs[blobSHA]; ok {
+		return b, nil
+	}
+	return nil, fmt.Errorf("unknown blob %s", blobSHA)
 }
 func (f *fakeStore) HeadTree(ctx context.Context, repo, commitSHA string) (string, error) {
 	return "tree-" + commitSHA, nil
@@ -159,17 +186,8 @@ func (f *fakeStore) OpenPromotionPRs(ctx context.Context, repo, env string) ([]P
 	return out, nil
 }
 func (f *fakeStore) CreatePR(ctx context.Context, repo, base, head, title, body string) (*PullRequest, error) {
-	f.createdPR = &PullRequest{Number: 41, URL: "https://example.invalid/pull/41", HeadRef: head}
+	f.createdPR = &PullRequest{Number: 41, URL: "https://example.invalid/pull/41", HeadRef: head, BaseRef: base}
 	return f.createdPR, nil
-}
-func (f *fakeStore) CompareFiles(ctx context.Context, repo, base, head string) ([]ChangedFile, error) {
-	return f.filesStatus, nil
-}
-func (f *fakeStore) BlobAt(ctx context.Context, repo, blobSHA string) ([]byte, error) {
-	if b, ok := f.blobs[blobSHA]; ok {
-		return b, nil
-	}
-	return nil, fmt.Errorf("unknown blob %s", blobSHA)
 }
 
 type fakeResolver struct {
@@ -183,7 +201,7 @@ func (r *fakeResolver) Resolve(ctx context.Context, repository, tag string) (str
 	return "", fmt.Errorf("manifest unknown")
 }
 
-func gitFixture(t *testing.T) (release.Bundler, string) {
+func gitFixture(t *testing.T) (release.Bundler, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	run := func(args ...string) {
@@ -211,12 +229,12 @@ func gitFixture(t *testing.T) (release.Bundler, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return bundle.NewBuilder(dir), strings.TrimSpace(string(out))
+	return bundle.NewBuilder(dir), strings.TrimSpace(string(out)), dir
 }
 
 func setupPropose(t *testing.T) (release.Bundler, *fakeStore, *fakeResolver, string) {
 	t.Helper()
-	bundler, rev := gitFixture(t)
+	bundler, rev, _ := gitFixture(t)
 	store := proposeStore(rev)
 	res := &fakeResolver{digests: map[string]string{"ghcr.io/example/app:" + rev: digestConst}}
 	releasesDir := filepath.Join(t.TempDir(), "releases")
@@ -233,10 +251,9 @@ func setupPropose(t *testing.T) (release.Bundler, *fakeStore, *fakeResolver, str
 
 func TestProposeFullFlow(t *testing.T) {
 	bundler, store, res, releasePath := setupPropose(t)
-	store.anc = true
 
 	prop, err := Propose(context.Background(), ProposeInput{
-		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath,
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
 	}, store, res, bundler)
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
@@ -247,8 +264,14 @@ func TestProposeFullFlow(t *testing.T) {
 	if prop.Branch != "deploy/promote-production-0.1.0" {
 		t.Errorf("branch = %q", prop.Branch)
 	}
-	if prop.From != ".deploy/releases/my-app-0.0.9.yaml" || prop.To != ".deploy/releases/my-app-0.1.0.yaml" {
+	if prop.CommitSHA != "new-commit" {
+		t.Errorf("commit = %q", prop.CommitSHA)
+	}
+	if prop.From != oldRelConst || prop.To != relPathConst {
 		t.Errorf("from/to = %q → %q", prop.From, prop.To)
+	}
+	if !prop.IsNewRelease {
+		t.Error("expected IsNewRelease")
 	}
 	if len(store.createdCommits) != 1 || !strings.HasPrefix(store.createdCommits[0], "deploy: promote my-app 0.1.0 to production") {
 		t.Errorf("commits = %v", store.createdCommits)
@@ -265,21 +288,77 @@ func TestProposeFullFlow(t *testing.T) {
 	if envEntry == nil {
 		t.Fatal("no environment entry in commit")
 	}
-	if err := onlyReleaseChanged(envDoc(".deploy/releases/my-app-0.0.9.yaml"), envEntry.Content, prop.To); err != nil {
+	if err := onlyReleaseChanged(envDoc(oldRelConst), envEntry.Content, prop.To); err != nil {
 		t.Errorf("environment change not semantic-only: %v", err)
 	}
-	if store.createdPR == nil || store.createdPR.HeadRef != prop.Branch {
+	if store.createdPR == nil || store.createdPR.BaseRef != release.TrustedBranch {
 		t.Errorf("PR = %+v", store.createdPR)
 	}
 }
 
-func TestProposeIdempotentReturnsExistingPR(t *testing.T) {
+func TestProposeExistingReleaseNeedsNoRegistry(t *testing.T) {
 	bundler, store, res, releasePath := setupPropose(t)
-	store.branches["deploy/promote-production-0.1.0"] = true
-	store.openPRs["deploy/promote-production-0.1.0"] = PullRequest{Number: 7, URL: "u", HeadRef: "deploy/promote-production-0.1.0"}
+	relBytes, err := os.ReadFile(releasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.files[checkBaseSHA][relPathConst] = relBytes
+	res.digests = map[string]string{}
 
 	prop, err := Propose(context.Background(), ProposeInput{
-		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath,
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
+	}, store, res, bundler)
+	if err != nil {
+		t.Fatalf("Propose existing release: %v", err)
+	}
+	if prop.IsNewRelease {
+		t.Error("existing release classified as new")
+	}
+	if len(store.treeEntries) != 1 || store.treeEntries[0].Path != envPathConst {
+		t.Fatalf("entries = %+v, want env-only change", store.treeEntries)
+	}
+}
+
+func validOldRelease() []byte {
+	return []byte("apiVersion: deploy.toolkit/v1\nkind: Release\nmetadata:\n  project: my-app\n  version: 0.0.9\nsource:\n  type: github\n  repository: example/my-app\n  revision: \"" + strings.Repeat("b", 40) + "\"\nartifacts:\n  app:\n    type: oci\n    image: ghcr.io/example/app\n    digest: " + altDigest + "\nbundle:\n  digest: " + altDigest + "\ndeploymentContract:\n  digest: " + altDigest + "\nmigration:\n  head: \"040\"\n  mode: none\n  rollbackSafe: true\n")
+}
+
+func wireVerifiedProposal(store *fakeStore, relBytes []byte) {
+	store.files[headSHA] = map[string][]byte{envPathConst: envDoc(relPathConst)}
+	store.trees[checkBaseSHA] = map[string]string{
+		release.ProjectPath: "pblob",
+		envPathConst:        "envblob-base",
+		oldRelConst:         "oldrelblob",
+	}
+	store.trees[headSHA] = map[string]string{
+		release.ProjectPath: "pblob",
+		envPathConst:        "envblob-head",
+		oldRelConst:         "oldrelblob",
+		relPathConst:        "relblob",
+	}
+	store.blobs["pblob"] = projectDoc()
+	store.blobs["envblob-base"] = envDoc(oldRelConst)
+	store.blobs["envblob-head"] = envDoc(relPathConst)
+	store.blobs["oldrelblob"] = validOldRelease()
+	store.blobs["relblob"] = relBytes
+	store.parents[headSHA] = []string{checkBaseSHA}
+	store.heads["deploy/promote-production-0.1.0"] = headSHA
+	store.branches["deploy/promote-production-0.1.0"] = true
+	store.openPRs["deploy/promote-production-0.1.0"] = PullRequest{
+		Number: 7, URL: "u", HeadRef: "deploy/promote-production-0.1.0", BaseRef: release.TrustedBranch,
+	}
+}
+
+func TestProposeIdempotentReturnsVerifiedExistingPR(t *testing.T) {
+	bundler, store, res, releasePath := setupPropose(t)
+	relBytes, err := os.ReadFile(releasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireVerifiedProposal(store, relBytes)
+
+	prop, err := Propose(context.Background(), ProposeInput{
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
 	}, store, res, bundler)
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
@@ -292,12 +371,45 @@ func TestProposeIdempotentReturnsExistingPR(t *testing.T) {
 	}
 }
 
+func TestProposeIdempotentRefusesModifiedProposal(t *testing.T) {
+	bundler, store, res, releasePath := setupPropose(t)
+	relBytes, err := os.ReadFile(releasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireVerifiedProposal(store, relBytes)
+	store.blobs["envblob-head"] = envDoc(".deploy/releases/my-app-9.9.9.yaml")
+	store.files[headSHA][envPathConst] = envDoc(".deploy/releases/my-app-9.9.9.yaml")
+
+	_, err = Propose(context.Background(), ProposeInput{
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
+	}, store, res, bundler)
+	if err == nil || !strings.Contains(err.Error(), "stale or modified") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestProposeIdempotentRefusesForeignBaseBranch(t *testing.T) {
+	bundler, store, res, releasePath := setupPropose(t)
+	store.branches["deploy/promote-production-0.1.0"] = true
+	store.openPRs["deploy/promote-production-0.1.0"] = PullRequest{
+		Number: 7, URL: "u", HeadRef: "deploy/promote-production-0.1.0", BaseRef: "feature-x",
+	}
+
+	_, err := Propose(context.Background(), ProposeInput{
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
+	}, store, res, bundler)
+	if err == nil || !strings.Contains(err.Error(), "no longer targets") {
+		t.Errorf("err = %v", err)
+	}
+}
+
 func TestProposeConflictingOpenPromotion(t *testing.T) {
 	bundler, store, res, releasePath := setupPropose(t)
 	store.openPRs["deploy/promote-production-0.2.0"] = PullRequest{Number: 9, URL: "u9", HeadRef: "deploy/promote-production-0.2.0"}
 
 	_, err := Propose(context.Background(), ProposeInput{
-		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath,
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
 	}, store, res, bundler)
 	if err == nil || !strings.Contains(err.Error(), "conflicting open promotion") {
 		t.Errorf("err = %v", err)
@@ -306,60 +418,36 @@ func TestProposeConflictingOpenPromotion(t *testing.T) {
 
 func TestProposeRefusesNoOpAndWrongProject(t *testing.T) {
 	bundler, store, res, releasePath := setupPropose(t)
-	store.files[checkBaseSHA][EnvironmentsDir+"/production.yaml"] = envDoc(".deploy/releases/my-app-0.1.0.yaml")
+	store.files[checkBaseSHA][envPathConst] = envDoc(relPathConst)
 	if _, err := Propose(context.Background(), ProposeInput{
-		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath,
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
 	}, store, res, bundler); err == nil || !strings.Contains(err.Error(), "no-op") {
 		t.Errorf("no-op err = %v", err)
 	}
 
 	bundler2, store2, res2, releasePath2 := setupPropose(t)
 	if _, err := Propose(context.Background(), ProposeInput{
-		Repo: "other/my-app", Environment: "production", ReleasePath: releasePath2,
+		Repo: "other/my-app", Environment: "production", ReleasePath: releasePath2, RepoDir: ".",
 	}, store2, res2, bundler2); err == nil || !strings.Contains(err.Error(), "declares source repository") {
 		t.Errorf("wrong-repo err = %v", err)
 	}
 }
 
-func TestProposeRefusesTamperedRelease(t *testing.T) {
+func TestProposeRefusesTamperedEvidence(t *testing.T) {
 	bundler, store, res, releasePath := setupPropose(t)
 	tampered, err := os.ReadFile(releasePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	altDigest := "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	tampered = []byte(strings.Replace(string(tampered), digestConst, altDigest, 1))
 	if err := os.WriteFile(releasePath, tampered, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err = Propose(context.Background(), ProposeInput{
-		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath,
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
 	}, store, res, bundler)
 	if err == nil || !strings.Contains(err.Error(), "not exactly what current deterministic eligibility") {
 		t.Errorf("tampered err = %v", err)
-	}
-}
-
-func TestProposeRejectsTamperedMigrationClaim(t *testing.T) {
-	bundler, store, res, releasePath := setupPropose(t)
-	tampered, err := os.ReadFile(releasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tampered = []byte(strings.Replace(string(tampered), "rollbackSafe: true", "rollbackSafe: false", 1))
-	if err := os.WriteFile(releasePath, tampered, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	_, err = Propose(context.Background(), ProposeInput{
-		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath,
-	}, store, res, bundler)
-	// Migration and version are explicit claims, not derived evidence:
-	// propose re-renders them from the manifest itself, so the file is
-	// accepted. The claim record is exactly what the human authorizes in
-	// the PR body. This test pins that boundary explicitly rather than
-	// leaving it accidental.
-	if err != nil {
-		t.Fatalf("migration claims are re-rendered from the manifest by design; got %v", err)
 	}
 }
 
@@ -374,11 +462,11 @@ spec:
   failurePolicy:
     autoRollback: safe-only
 `)
-	out, err := SetRelease(raw, ".deploy/releases/my-app-0.1.0.yaml")
+	out, err := SetRelease(raw, relPathConst)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := onlyReleaseChanged(raw, out, ".deploy/releases/my-app-0.1.0.yaml"); err != nil {
+	if err := onlyReleaseChanged(raw, out, relPathConst); err != nil {
 		t.Fatalf("semantic equality violated: %v", err)
 	}
 	if !strings.Contains(string(out), "autoRollback: safe-only") {
@@ -389,104 +477,195 @@ spec:
 	}
 }
 
-func relBytesFixture() []byte {
-	return []byte("apiVersion: deploy.toolkit/v1\nkind: Release\nmetadata:\n  project: my-app\n  version: 0.1.0\nsource:\n  type: github\n  repository: example/my-app\n  revision: \"" + strings.Repeat("a", 40) + "\"\nartifacts:\n  app:\n    type: oci\n    image: ghcr.io/example/app\n    digest: " + digestConst + "\nbundle:\n  digest: " + digestConst + "\ndeploymentContract:\n  digest: " + digestConst + "\nmigration:\n  head: \"043\"\n  mode: forward-compatible\n  rollbackSafe: true\n")
-}
-
-func checkStore(files []ChangedFile, baseEnv, headEnv []byte) *fakeStore {
-	s := proposeStore(strings.Repeat("a", 40))
-	s.filesStatus = files
-	s.files[checkBaseSHA] = map[string][]byte{EnvironmentsDir + "/production.yaml": baseEnv, ".deploy/releases/my-app-0.0.9.yaml": []byte("old")}
-	s.files["headsha"] = map[string][]byte{EnvironmentsDir + "/production.yaml": headEnv}
-	s.blobs["relblob"] = relBytesFixture()
-	return s
+func checkFixture(t *testing.T) (release.Bundler, *fakeStore, *fakeResolver, string) {
+	t.Helper()
+	bundler, rev, dir := gitFixture(t)
+	store := proposeStore(rev)
+	res := &fakeResolver{digests: map[string]string{"ghcr.io/example/app:" + rev: digestConst}}
+	releasesDir := filepath.Join(t.TempDir(), "releases")
+	rep, err := release.Create(context.Background(), release.CreateInput{
+		Repo: "example/my-app", Revision: rev, Version: "0.1.0",
+		MigrationHead: "043", MigrationMode: "forward-compatible",
+		RollbackSafe: true, ReleasesDir: releasesDir,
+	}, store, res, bundler)
+	if err != nil {
+		t.Fatalf("release create: %v", err)
+	}
+	relBytes, err := os.ReadFile(rep.ReleasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.trees[checkBaseSHA] = map[string]string{
+		release.ProjectPath: "pblob",
+		envPathConst:        "envblob-base",
+		oldRelConst:         "oldrelblob",
+	}
+	store.trees[headSHA] = map[string]string{
+		release.ProjectPath: "pblob",
+		envPathConst:        "envblob-head",
+		oldRelConst:         "oldrelblob",
+		relPathConst:        "relblob",
+	}
+	store.files[headSHA] = map[string][]byte{envPathConst: envDoc(relPathConst)}
+	store.parents[headSHA] = []string{checkBaseSHA}
+	store.blobs["pblob"] = projectDoc()
+	store.blobs["envblob-base"] = envDoc(oldRelConst)
+	store.blobs["envblob-head"] = envDoc(relPathConst)
+	store.blobs["oldrelblob"] = validOldRelease()
+	store.blobs["relblob"] = relBytes
+	return bundler, store, res, dir
 }
 
 func TestCheckDiffPolicy(t *testing.T) {
-	legalEnv := func(from, to string) ([]byte, []byte) {
-		return envDoc(from), envDoc(to)
-	}
-	pass := func(t *testing.T, s Store) {
-		res, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: "headsha"}, s)
+	t.Run("stale base rejected", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		store.heads[release.TrustedBranch] = "moved-on"
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
 		if err != nil {
-			t.Fatalf("Check: %v", err)
+			t.Fatal(err)
 		}
-		if !res.Passed {
-			t.Errorf("expected pass, got: %v", res.Messages)
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "stale") {
+			t.Errorf("outcome = %+v", outcome)
 		}
-	}
-	failMsg := func(t *testing.T, s Store, want string) {
-		res, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: "headsha"}, s)
-		if err != nil {
-			t.Fatalf("Check: %v", err)
-		}
-		if res.Passed {
-			t.Fatalf("expected fail, got pass")
-		}
-		joined := strings.Join(res.Messages, "; ")
-		if !strings.Contains(joined, want) {
-			t.Errorf("messages %q missing %q", joined, want)
-		}
-	}
-
-	t.Run("legal add+modify", func(t *testing.T) {
-		b, h := legalEnv(".deploy/releases/my-app-0.0.9.yaml", ".deploy/releases/my-app-0.1.0.yaml")
-		pass(t, checkStore([]ChangedFile{
-			{Path: ".deploy/releases/my-app-0.1.0.yaml", Status: "added", BlobSHA: "relblob"},
-			{Path: EnvironmentsDir + "/production.yaml", Status: "modified"},
-		}, b, h))
 	})
-	t.Run("env only change to existing release (rollback)", func(t *testing.T) {
-		b, h := legalEnv(".deploy/releases/my-app-0.1.0.yaml", ".deploy/releases/my-app-0.0.9.yaml")
-		pass(t, checkStore([]ChangedFile{
-			{Path: EnvironmentsDir + "/production.yaml", Status: "modified"},
-		}, b, h))
+	t.Run("multi-parent head rejected", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		store.parents[headSHA] = []string{checkBaseSHA, "other"}
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "exactly one commit") {
+			t.Errorf("outcome = %+v", outcome)
+		}
+	})
+	t.Run("legal new release diff passes", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !outcome.Passed {
+			t.Errorf("expected pass, got: %v", outcome.Messages)
+		}
+	})
+	t.Run("added release without checkout fails closed", func(t *testing.T) {
+		_, store, res, _ := checkFixture(t)
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA}, store, res, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "without a checkout") {
+			t.Errorf("outcome = %+v", outcome)
+		}
+	})
+	t.Run("tampered evidence rejected", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		store.blobs["relblob"] = []byte(strings.Replace(string(store.blobs["relblob"]), digestConst, altDigest, 1))
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "differs from what current deterministic eligibility") {
+			t.Errorf("outcome = %+v", outcome)
+		}
+	})
+	t.Run("foreign repository release rejected", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		store.blobs["relblob"] = []byte(strings.Replace(string(store.blobs["relblob"]), "repository: example/my-app", "repository: evil/other", 1))
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "not bound to trusted project") {
+			t.Errorf("outcome = %+v", outcome)
+		}
 	})
 	t.Run("workflow change rejected", func(t *testing.T) {
-		b, h := legalEnv(".deploy/releases/my-app-0.0.9.yaml", ".deploy/releases/my-app-0.1.0.yaml")
-		failMsg(t, checkStore([]ChangedFile{
-			{Path: ".deploy/releases/my-app-0.1.0.yaml", Status: "added", BlobSHA: "relblob"},
-			{Path: EnvironmentsDir + "/production.yaml", Status: "modified"},
-			{Path: ".github/workflows/deploy.yml", Status: "modified"},
-		}, b, h), "illegal changes")
+		bundler, store, res, dir := checkFixture(t)
+		store.trees[headSHA][".github/workflows/deploy.yml"] = "wfblob"
+		store.blobs["wfblob"] = []byte("on: push")
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "illegal changes") {
+			t.Errorf("outcome = %+v", outcome)
+		}
 	})
-	t.Run("target change rejected", func(t *testing.T) {
-		b := envDoc(".deploy/releases/my-app-0.0.9.yaml")
-		h := envDoc(".deploy/releases/my-app-0.1.0.yaml")
-		h = []byte(strings.Replace(string(h), "target: production-primary", "target: attacker-server", 1))
-		failMsg(t, checkStore([]ChangedFile{
-			{Path: ".deploy/releases/my-app-0.1.0.yaml", Status: "added", BlobSHA: "relblob"},
-			{Path: EnvironmentsDir + "/production.yaml", Status: "modified"},
-		}, b, h), "spec.target")
-	})
-	t.Run("filename content disagreement rejected", func(t *testing.T) {
-		b, h := legalEnv(".deploy/releases/my-app-0.0.9.yaml", ".deploy/releases/other-9.9.9.yaml")
-		failMsg(t, checkStore([]ChangedFile{
-			{Path: ".deploy/releases/other-9.9.9.yaml", Status: "added", BlobSHA: "relblob"},
-			{Path: EnvironmentsDir + "/production.yaml", Status: "modified"},
-		}, b, h), "filename must agree")
+	t.Run("target swap rejected", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		swapped := []byte(strings.Replace(string(envDoc(relPathConst)), "target: production-primary", "target: attacker-server", 1))
+		store.blobs["envblob-head"] = swapped
+		store.files[headSHA][envPathConst] = swapped
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "spec.target") {
+			t.Errorf("outcome = %+v", outcome)
+		}
 	})
 	t.Run("existing release modification rejected", func(t *testing.T) {
-		b, h := legalEnv(".deploy/releases/my-app-0.0.9.yaml", ".deploy/releases/my-app-0.1.0.yaml")
-		failMsg(t, checkStore([]ChangedFile{
-			{Path: ".deploy/releases/my-app-0.0.9.yaml", Status: "modified"},
-			{Path: EnvironmentsDir + "/production.yaml", Status: "modified"},
-		}, b, h), "releases are immutable")
+		bundler, store, res, dir := checkFixture(t)
+		delete(store.trees[headSHA], oldRelConst)
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "releases are immutable") {
+			t.Errorf("outcome = %+v", outcome)
+		}
 	})
-	t.Run("stale proposal rejected", func(t *testing.T) {
-		b, h := legalEnv(".deploy/releases/my-app-0.1.0.yaml", ".deploy/releases/my-app-0.1.0.yaml")
-		failMsg(t, checkStore([]ChangedFile{
-			{Path: ".deploy/releases/my-app-0.1.0.yaml", Status: "added", BlobSHA: "relblob"},
-			{Path: EnvironmentsDir + "/production.yaml", Status: "modified"},
-		}, b, h), "stale")
+	t.Run("rollback to existing release passes without registry", func(t *testing.T) {
+		_, store, _, _ := checkFixture(t)
+		store.trees[checkBaseSHA] = map[string]string{
+			release.ProjectPath: "pblob",
+			envPathConst:        "envblob-base",
+			relPathConst:        "relblob",
+			oldRelConst:         "oldrelblob",
+		}
+		store.trees[headSHA] = map[string]string{
+			release.ProjectPath: "pblob",
+			envPathConst:        "envblob-head",
+			relPathConst:        "relblob",
+			oldRelConst:         "oldrelblob",
+		}
+		store.files[checkBaseSHA][envPathConst] = envDoc(relPathConst)
+		store.files[headSHA][envPathConst] = envDoc(oldRelConst)
+		store.blobs["envblob-base"] = envDoc(relPathConst)
+		store.blobs["envblob-head"] = envDoc(oldRelConst)
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA}, store, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !outcome.Passed {
+			t.Errorf("expected pass, got: %v", outcome.Messages)
+		}
+	})
+	t.Run("env only pointing at foreign project rejected", func(t *testing.T) {
+		_, store, _, _ := checkFixture(t)
+		store.trees[headSHA] = map[string]string{
+			release.ProjectPath: "pblob",
+			envPathConst:        "envblob-head",
+			relPathConst:        "relblob",
+		}
+		store.files[headSHA][envPathConst] = envDoc(".deploy/releases/other-9.9.9.yaml")
+		store.blobs["envblob-head"] = envDoc(".deploy/releases/other-9.9.9.yaml")
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA}, store, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "belongs to project") {
+			t.Errorf("outcome = %+v", outcome)
+		}
 	})
 }
 
 func TestRenderBodyWarnings(t *testing.T) {
 	bundler, store, res, releasePath := setupPropose(t)
-	store.anc = true
 	prop, err := Propose(context.Background(), ProposeInput{
-		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath,
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
 	}, store, res, bundler)
 	if err != nil {
 		t.Fatalf("Propose: %v", err)

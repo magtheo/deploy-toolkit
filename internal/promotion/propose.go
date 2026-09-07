@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
 	"github.com/magtheo/deploy-toolkit/internal/release"
@@ -31,6 +32,8 @@ type PullRequest struct {
 	Number  int
 	URL     string
 	HeadRef string
+	BaseRef string
+	HeadSHA string
 }
 
 type Store interface {
@@ -39,6 +42,10 @@ type Store interface {
 	IsAncestor(ctx context.Context, repo, ancestor, descendant string) (bool, error)
 	FileAt(ctx context.Context, repo, path, ref string) ([]byte, error)
 	CheckRuns(ctx context.Context, repo, ref string) ([]release.CheckRun, error)
+
+	CommitParents(ctx context.Context, repo, sha string) ([]string, error)
+	CommitTreePaths(ctx context.Context, repo, sha string) (map[string]string, error)
+	BlobAt(ctx context.Context, repo, blobSHA string) ([]byte, error)
 
 	HeadTree(ctx context.Context, repo, commitSHA string) (string, error)
 	CreateBlob(ctx context.Context, repo string, content []byte) (string, error)
@@ -49,9 +56,6 @@ type Store interface {
 	OpenPRForBranch(ctx context.Context, repo, branch string) (*PullRequest, error)
 	OpenPromotionPRs(ctx context.Context, repo, env string) ([]PullRequest, error)
 	CreatePR(ctx context.Context, repo, base, head, title, body string) (*PullRequest, error)
-
-	CompareFiles(ctx context.Context, repo, base, head string) ([]ChangedFile, error)
-	BlobAt(ctx context.Context, repo, blobSHA string) ([]byte, error)
 }
 
 type ProposeInput struct {
@@ -62,15 +66,17 @@ type ProposeInput struct {
 }
 
 type Proposal struct {
-	Project     string
-	Environment string
-	From        string
-	To          string
-	BaseSHA     string
-	Branch      string
-	PR          *PullRequest
-	Unchanged   bool
-	Report      *release.Report
+	Project      string
+	Environment  string
+	From         string
+	To           string
+	BaseSHA      string
+	CommitSHA    string
+	Branch       string
+	PR           *PullRequest
+	Unchanged    bool
+	IsNewRelease bool
+	Report       *release.Report
 }
 
 func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.Resolver, bundler release.Bundler) (*Proposal, error) {
@@ -120,16 +126,23 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 	}
 	fromRef := env.Spec.Release
 
-	ev, err := release.Evaluate(ctx, release.EvalInput{Repo: in.Repo, Revision: rel.Source.Revision}, src, resolver, bundler)
-	if err != nil {
-		return nil, fmt.Errorf("release %s is not eligible under current policy: %w", version, err)
-	}
-	expected, err := release.RenderReleaseFor(ev, version, rel.Migration)
-	if err != nil {
-		return nil, err
-	}
-	if string(expected) != string(relBytes) {
-		return nil, fmt.Errorf("release file %s is not exactly what current deterministic eligibility would generate; refusing to promote a hand-tampered manifest", relPath)
+	alreadyAuthorized, err := src.FileAt(ctx, in.Repo, toRef, baseSHA)
+	isNewRelease := err != nil
+	var ev *release.Evaluation
+	if isNewRelease {
+		ev, err = release.Evaluate(ctx, release.EvalInput{Repo: in.Repo, Revision: rel.Source.Revision}, src, resolver, bundler)
+		if err != nil {
+			return nil, fmt.Errorf("release %s is not eligible under current policy: %w", version, err)
+		}
+		expected, err := release.RenderReleaseFor(ev, version, rel.Migration)
+		if err != nil {
+			return nil, err
+		}
+		if string(expected) != string(relBytes) {
+			return nil, fmt.Errorf("release file %s is not exactly what current deterministic eligibility would generate; refusing to promote a hand-tampered manifest", relPath)
+		}
+	} else {
+		relBytes = alreadyAuthorized
 	}
 
 	branch := fmt.Sprintf(BranchPrefixFmt+"%s", in.Environment, version)
@@ -143,6 +156,20 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 			return nil, err
 		}
 		if pr != nil {
+			if pr.BaseRef != release.TrustedBranch {
+				return nil, fmt.Errorf("existing proposal %s (#%d) no longer targets %s; close it before proposing again", pr.URL, pr.Number, release.TrustedBranch)
+			}
+			headSHA, err := src.BranchHead(ctx, in.Repo, branch)
+			if err != nil {
+				return nil, err
+			}
+			outcome, err := Check(ctx, CheckInput{Repo: in.Repo, Base: baseSHA, Head: headSHA, RepoDir: in.RepoDir}, src, resolver, bundler)
+			if err != nil {
+				return nil, err
+			}
+			if !outcome.Passed {
+				return nil, fmt.Errorf("existing proposal %s (#%d) is stale or modified and no longer matches this transition: %s", pr.URL, pr.Number, strings.Join(outcome.Messages, "; "))
+			}
 			return &Proposal{Project: project, Environment: in.Environment, From: fromRef, To: toRef, BaseSHA: baseSHA, Branch: branch, PR: pr, Unchanged: true}, nil
 		}
 		for i := 2; ; i++ {
@@ -173,9 +200,9 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 	}
 	oldRel := oldReleaseSummary(ctx, src, in.Repo, baseSHA, fromRef)
 
-	entries := []TreeEntry{
-		{Path: toRef, Content: relBytes},
-		{Path: envPath, Content: newEnv},
+	entries := []TreeEntry{{Path: envPath, Content: newEnv}}
+	if isNewRelease {
+		entries = append([]TreeEntry{{Path: toRef, Content: relBytes}}, entries...)
 	}
 	baseTree, err := src.HeadTree(ctx, in.Repo, baseSHA)
 	if err != nil {
@@ -188,9 +215,9 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 	title := fmt.Sprintf("deploy: promote %s %s to %s", project, version, in.Environment)
 	body := RenderBody(BodyInput{
 		Project: project, Version: version, Environment: in.Environment,
-		BaseSHA: baseSHA, BranchHead: ev.BranchHead, Revision: rel.Source.Revision,
+		BaseSHA: baseSHA, BranchHead: baseSHA, Revision: rel.Source.Revision,
 		From: fromRef, To: toRef, OldRelease: oldRel,
-		Evaluation: ev, Migration: rel.Migration,
+		Evaluation: bodyEvidence(ev), Migration: rel.Migration,
 	})
 	commitSHA, err := src.CreateCommit(ctx, in.Repo, title, treeSHA, []string{baseSHA})
 	if err != nil {
@@ -203,15 +230,26 @@ func Propose(ctx context.Context, in ProposeInput, src Store, resolver release.R
 	if err != nil {
 		return nil, err
 	}
-	return &Proposal{
+	proposal := &Proposal{
 		Project: project, Environment: in.Environment, From: fromRef, To: toRef,
-		BaseSHA: baseSHA, Branch: branch, PR: pr,
-		Report: &release.Report{
+		BaseSHA: baseSHA, CommitSHA: commitSHA, Branch: branch, PR: pr,
+		IsNewRelease: isNewRelease,
+	}
+	if ev != nil {
+		proposal.Report = &release.Report{
 			Project: project, SourceRevision: rel.Source.Revision, BranchHead: ev.BranchHead,
 			Checks: ev.Checks, Artifacts: ev.Artifacts,
 			BundleDigest: ev.BundleDigest, ContractDigest: ev.ContractDigest, BundleFiles: ev.BundleFiles,
-		},
-	}, nil
+		}
+	}
+	return proposal, nil
+}
+
+func bodyEvidence(ev *release.Evaluation) *release.Evaluation {
+	if ev == nil {
+		return &release.Evaluation{}
+	}
+	return ev
 }
 
 func oldReleaseSummary(ctx context.Context, src Store, repo, ref, releaseRef string) *manifest.Release {

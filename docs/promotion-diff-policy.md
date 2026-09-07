@@ -47,9 +47,47 @@ it. Stale proposals are regenerated deliberately — never quietly re-based.
 
 The check must run from code the PR cannot influence: the toolkit's reusable
 workflow, pinned by full commit SHA, executing `deployctl promotion check
---repo <repo> --base <base-sha> --head <head-sha>` against base/head trees via
-the GitHub API. It never executes PR-controlled code and needs no production
-secrets.
+--repo <repo> --base <base-sha> --head <head-sha> [--repo-dir <checkout>]`
+against the Git data API. It never executes PR-controlled code and needs no
+production secrets.
+
+## Freshness is enforced inside the checker
+
+The checker does not trust its inputs to be current:
+
+- it resolves the **live trusted-branch head** itself and requires the
+  supplied base to equal it — a green result against an old base is
+  impossible;
+- it requires the promotion head to be **exactly one commit whose single
+  parent is that head** — the proposal is a compare-and-swap:
+
+```
+ONLY change:  production = OLD → NEW
+IF:           main is still BASE and the proposal sits directly on it
+```
+
+- the changed-file set is computed from **complete Git trees** (walked through
+  the Git data API, failing closed on truncated enumerations), never from
+  GitHub's compare endpoint, which caps its file list at 300 entries. "Nothing
+  else changed" must mean *nothing else*, not *nothing else in the first
+  page*.
+
+## Two promotion classes, two evidence rules
+
+**New release (not yet on trusted main):**
+the checker performs the same deterministic evidence verification as
+`release create`/`promotion propose` — fresh `Evaluate` (ancestry, required
+checks, artifact digests, bundle and contract digests from the exact Git tree)
+plus byte-comparison against the manifest on the branch. A modified proposal
+branch cannot smuggle in evidence that differs from eligibility. This requires
+a checkout of the release's source revision (`--repo-dir`); without it the
+check **fails closed**.
+
+**Already-immutable release (file exists unchanged on trusted main):**
+the checker reads the release from the trusted base, validates it, and binds
+it to the trusted project (name and source repository). Its pinned
+`repo@sha256:...` digests are the identity — promotion/rollback to it never
+depends on the disposable `<source-sha>` discovery tag still existing.
 
 ## What propose guarantees at creation
 
@@ -63,9 +101,11 @@ secrets.
   evidence fields cannot drift between `release create` and promotion;
 - the commit contains exactly the two entries above, created through the Git
   data API as **one atomic commit**;
-- proposal creation is idempotent: an existing open proposal for the same
-  environment → same target returns the existing PR; a different open
-  promotion for the same environment fails with the conflict named.
+- proposal creation is idempotent in a strict sense: an existing open proposal
+  is returned only if it is still based on the current trusted main, its head
+  is a single commit on that base, and its tree satisfies the full Promotion
+  Diff Policy (including evidence verification) right now. Otherwise it is
+  refused as stale or modified — idempotency never means "trust the old PR".
 
 What propose deliberately does **not** guarantee: the `version` and
 `migration.*` fields are explicit human claims, not derived evidence — they

@@ -178,26 +178,6 @@ func (s *Source) CreatePR(ctx context.Context, repo, base, head, title, body str
 	return toPR(pr), nil
 }
 
-func (s *Source) CompareFiles(ctx context.Context, repo, base, head string) ([]promotion.ChangedFile, error) {
-	owner, name, err := splitRepo(repo)
-	if err != nil {
-		return nil, err
-	}
-	cmp, _, err := s.client.Repositories.CompareCommits(ctx, owner, name, base, head, nil)
-	if err != nil {
-		return nil, fmt.Errorf("compare %s...%s in %s: %w", base, head, repo, err)
-	}
-	var out []promotion.ChangedFile
-	for _, f := range cmp.Files {
-		out = append(out, promotion.ChangedFile{
-			Path:    f.GetFilename(),
-			Status:  f.GetStatus(),
-			BlobSHA: f.GetSHA(),
-		})
-	}
-	return out, nil
-}
-
 func (s *Source) BlobAt(ctx context.Context, repo, blobSHA string) ([]byte, error) {
 	owner, name, err := splitRepo(repo)
 	if err != nil {
@@ -219,5 +199,77 @@ func toPR(pr *github.PullRequest) *promotion.PullRequest {
 		Number:  pr.GetNumber(),
 		URL:     pr.GetHTMLURL(),
 		HeadRef: pr.GetHead().GetRef(),
+		BaseRef: pr.GetBase().GetRef(),
+		HeadSHA: pr.GetHead().GetSHA(),
 	}
+}
+
+func (s *Source) CommitParents(ctx context.Context, repo, sha string) ([]string, error) {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return nil, err
+	}
+	c, _, err := s.client.Git.GetCommit(ctx, owner, name, sha)
+	if err != nil {
+		return nil, fmt.Errorf("read commit %s in %s: %w", sha, repo, err)
+	}
+	parents := make([]string, 0, len(c.Parents))
+	for _, p := range c.Parents {
+		parents = append(parents, p.GetSHA())
+	}
+	return parents, nil
+}
+
+func (s *Source) CommitTreePaths(ctx context.Context, repo, sha string) (map[string]string, error) {
+	owner, name, err := splitRepo(repo)
+	if err != nil {
+		return nil, err
+	}
+	c, _, err := s.client.Git.GetCommit(ctx, owner, name, sha)
+	if err != nil {
+		return nil, fmt.Errorf("read commit %s in %s: %w", sha, repo, err)
+	}
+	out := make(map[string]string)
+	if err := s.walkTree(ctx, owner, name, c.GetTree().GetSHA(), "", out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Source) walkTree(ctx context.Context, owner, name, treeSHA, prefix string, out map[string]string) error {
+	t, _, err := s.client.Git.GetTree(ctx, owner, name, treeSHA, true)
+	if err != nil {
+		return fmt.Errorf("read tree %s: %w", treeSHA, err)
+	}
+	if !t.GetTruncated() {
+		for _, e := range t.Entries {
+			p := e.GetPath()
+			if prefix != "" {
+				p = prefix + "/" + p
+			}
+			if e.GetType() == "blob" {
+				out[p] = e.GetSHA()
+			}
+		}
+		return nil
+	}
+	t, _, err = s.client.Git.GetTree(ctx, owner, name, treeSHA, false)
+	if err != nil {
+		return fmt.Errorf("read tree %s: %w", treeSHA, err)
+	}
+	for _, e := range t.Entries {
+		p := e.GetPath()
+		if prefix != "" {
+			p = prefix + "/" + p
+		}
+		switch e.GetType() {
+		case "blob":
+			out[p] = e.GetSHA()
+		case "tree":
+			if err := s.walkTree(ctx, owner, name, e.GetSHA(), p, out); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
