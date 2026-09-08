@@ -134,20 +134,25 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 	return StageNew, nil
 }
 
-// readMarker reads and parses a staged marker. Any failure — missing,
-// unreadable, malformed — is an error; callers treat the directory as an
-// incomplete stage and fail closed.
+// readMarker reads and parses a staged marker. All toolkit-owned target
+// metadata follows one parsing discipline: exactly one JSON value, unknown
+// fields rejected. Any failure — missing, unreadable, malformed, extra
+// fields, unparseable timestamp — is an error; callers treat the directory
+// as an incomplete stage and fail closed.
 func (t *Target) readMarker(ctx context.Context, markerPath string) (StagedMarker, error) {
 	var m StagedMarker
 	raw, err := t.readFile(ctx, markerPath)
 	if err != nil {
 		return m, err
 	}
-	if err := json.Unmarshal(raw, &m); err != nil {
+	if err := decodeStrictJSON(raw, &m); err != nil {
 		return m, fmt.Errorf("%s: %w", markerPath, err)
 	}
 	if m.Schema != stagedSchemaV1 {
 		return m, fmt.Errorf("%s: schema %q, want %q", markerPath, m.Schema, stagedSchemaV1)
+	}
+	if _, err := time.Parse(time.RFC3339, m.StagedAt); err != nil {
+		return m, fmt.Errorf("%s: stagedAt %q: %w", markerPath, m.StagedAt, err)
 	}
 	return m, nil
 }

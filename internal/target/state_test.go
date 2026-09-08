@@ -179,6 +179,31 @@ func TestReadStateRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestReadStateRejectsTrailingJSON(t *testing.T) {
+	tgt := newLocalTarget(t)
+	if err := tgt.WriteState(t.Context(), State{
+		Project:     "my-app",
+		Environment: "production",
+		UpdatedAt:   fixedTime(1700000100),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tgt.layout.Root(), "my-app/state/production.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A second, complete JSON value after the valid state object — the
+	// first Decode succeeds and must not mask it.
+	trailing := string(raw) + "\n{\"desired\":{\"release\":\"evil\"}}\n"
+	if err := os.WriteFile(path, []byte(trailing), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.ReadState(t.Context(), "my-app", "production"); err == nil {
+		t.Fatal("trailing JSON after the state object must be rejected")
+	}
+}
+
 func TestWriteStateValidation(t *testing.T) {
 	tgt := newLocalTarget(t)
 	cases := []State{

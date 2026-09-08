@@ -144,15 +144,23 @@ promotion check (see [trust-model.md](trust-model.md)).
 ## Deployment state machine
 
 ```
-VALIDATE → PREFLIGHT → STAGE → MIGRATE → APPLY → VERIFY → COMMIT STATE
+VALIDATE → STAGE → PREFLIGHT → MIGRATE → APPLY → VERIFY → COMMIT STATE
 ```
+
+Staging comes first because the lifecycle contract itself comes from the
+staged release: hooks execute inside
+`<deployRoot>/<project>/releases/<version>/`, which only exists as a
+complete, usable release after `Stage` succeeds. Staging is non-impacting
+preparation; preflight decides whether that staged release may begin
+consequential execution.
 
 The toolkit owns the state machine; the project's hooks supply the commands
 (see [consumer-contract-v1.md](consumer-contract-v1.md)).
 
-Every stage's output is recorded in the deployment history
+Structured stage outcomes are recorded in the deployment history
 (`history.jsonl` on the target) and reported as a GitHub Deployment status —
-an audit/UI projection, never the source of truth.
+an audit/UI projection, never the source of truth. Raw hook stdout/stderr
+is returned to the caller for diagnosis but never persisted into history.
 
 ### Failure handling
 

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/magtheo/deploy-toolkit/internal/transport"
@@ -31,10 +32,14 @@ var ErrHistoryAbsent = errors.New("history: no records")
 //     still a perfectly valid chain);
 //   - deliberate whole-chain rewrite with recomputed hashes.
 //
-// Detecting those requires an external anchor for the expected terminal
-// (seq, hash) — e.g. a checkpoint recorded in GitHub deployment evidence.
-// That anchor is future work; until it exists, callers must treat history
-// as a verifiable local record, not as tamper-proof evidence.
+// The guarantee is semantic integrity of the defined Record schema:
+// unrecognized fields and trailing content are decode errors, and hashing
+// is canonical (key order and whitespace are irrelevant). Detecting suffix
+// deletion or full rewrite requires an external anchor for the expected
+// terminal (seq, hash) — e.g. a checkpoint recorded in GitHub deployment
+// evidence. That anchor is future work; until it exists, callers must
+// treat history as a verifiable local record, not as tamper-proof
+// evidence.
 //
 // Records are operator-visible evidence. They must never contain
 // application secrets or raw hook output; they carry release identities,
@@ -97,8 +102,27 @@ func parseHistory(path string, raw []byte) ([]Record, error) {
 			continue
 		}
 		var rec Record
-		if err := json.Unmarshal(line, &rec); err != nil {
+		// Strict per-line decode: unknown fields are an error, not silent
+		// drops. Without this, a record could gain unrecognized top-level
+		// fields (which never enter recordHash) while its hash still
+		// verifies — mutation without detection. UseNumber preserves
+		// numeric literals so re-hashing matches the hash computed at
+		// append time regardless of the original Go numeric type. The
+		// guarantee this provides is semantic integrity of the defined
+		// Record schema: whitespace and object-key ordering stay
+		// irrelevant because hashing is canonical, not byte-for-byte.
+		dec := json.NewDecoder(bytes.NewReader(line))
+		dec.DisallowUnknownFields()
+		dec.UseNumber()
+		if err := dec.Decode(&rec); err != nil {
 			return nil, fmt.Errorf("%s line %d: %w", path, i+1, err)
+		}
+		var extra any
+		if err := dec.Decode(&extra); err != io.EOF {
+			if err != nil {
+				return nil, fmt.Errorf("%s line %d: %w", path, i+1, err)
+			}
+			return nil, fmt.Errorf("%s line %d: trailing JSON after record", path, i+1)
 		}
 		records = append(records, rec)
 	}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"time"
 
@@ -76,10 +77,29 @@ func validateState(st State, project, env string) error {
 	return nil
 }
 
+// decodeStrictJSON decodes exactly one JSON value into v, rejecting
+// unknown fields and any trailing content after the first value. A state
+// file of "{valid}{smuggled}" must not pass as "{valid}".
+func decodeStrictJSON(data []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return errors.New("trailing JSON after the first value")
+	}
+	return nil
+}
+
 // ReadState returns the observed state snapshot for project/env. The file
 // must pass the same strict validation as a fresh write — unknown fields
-// are rejected, not silently dropped — because the snapshot is input to
-// lifecycle decisions.
+// and trailing content are rejected, not silently dropped — because the
+// snapshot is input to lifecycle decisions.
 func (t *Target) ReadState(ctx context.Context, project, env string) (State, error) {
 	path, err := t.layout.StatePath(project, env)
 	if err != nil {
@@ -97,9 +117,7 @@ func (t *Target) ReadState(ctx context.Context, project, env string) (State, err
 		return State{}, err
 	}
 	var st State
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&st); err != nil {
+	if err := decodeStrictJSON(raw, &st); err != nil {
 		return State{}, fmt.Errorf("%s: %w", path, err)
 	}
 	if err := validateState(st, project, env); err != nil {

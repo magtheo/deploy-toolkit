@@ -92,6 +92,31 @@ func TestHistoryTamperDetected(t *testing.T) {
 	}
 }
 
+func TestHistoryUnknownFieldDetected(t *testing.T) {
+	// A record that gains an unrecognized top-level field is a mutation
+	// the hash cannot see (hashing covers only defined Record fields), so
+	// the strict decoder must reject it outright — otherwise the file
+	// could be modified while the chain still verifies.
+	tgt := newLocalTarget(t)
+	if err := tgt.AppendHistory(t.Context(), "my-app", "production",
+		Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{}}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tgt.layout.Root(), "my-app/history/production.jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := strings.TrimRight(string(raw), "\n")
+	injected := line[:len(line)-1] + `,"extra":"modified without rehashing"}` + "\n"
+	if err := os.WriteFile(path, []byte(injected), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.ReadHistory(t.Context(), "my-app", "production"); err == nil {
+		t.Fatal("unknown top-level record field must be rejected")
+	}
+}
+
 func TestHistoryBrokenLinkDetected(t *testing.T) {
 	tgt := newLocalTarget(t)
 	if err := tgt.AppendHistory(t.Context(), "my-app", "production",

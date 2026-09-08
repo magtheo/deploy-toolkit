@@ -166,11 +166,26 @@ func TestStageCorruptMarkerRefused(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, stagedMarkerName), []byte("{not json"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	bundle, digest := buildBundle(t, stageEntries)
-	if _, err := tgt.Stage(t.Context(), testRelease("my-app", "1.0.0", digest), bundle, time.Now()); err == nil {
-		t.Fatal("corrupt marker must fail closed")
+	rel := testRelease("my-app", "1.0.0", digest)
+
+	valid := `{"schema":"toolkit.staged/v1","project":"my-app","version":"1.0.0","bundleDigest":"` + digest + `","stagedAt":"2023-11-14T22:13:20Z"}`
+	hostile := []struct {
+		name   string
+		marker string
+	}{
+		{"not json", "{not json"},
+		{"wrong schema", strings.Replace(valid, "toolkit.staged/v1", "toolkit.staged/v2", 1)},
+		{"bad timestamp", strings.Replace(valid, "2023-11-14T22:13:20Z", "yesterday", 1)},
+		{"unknown field", strings.Replace(valid, "}", `,"extra":1}`, 1)},
+		{"trailing json", valid + "\n{\"schema\":\"toolkit.staged/v1\"}"},
+	}
+	for _, c := range hostile {
+		if err := os.WriteFile(filepath.Join(dir, stagedMarkerName), []byte(c.marker), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tgt.Stage(t.Context(), rel, bundle, time.Now()); err == nil {
+			t.Errorf("%s: hostile marker must fail closed", c.name)
+		}
 	}
 }

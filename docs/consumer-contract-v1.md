@@ -177,11 +177,13 @@ Rules (v1 promise):
 Deploy Toolkit owns the state machine; the project supplies the commands.
 
 ```
-VALIDATE → PREFLIGHT → STAGE → MIGRATE → APPLY → VERIFY → COMMIT STATE
+VALIDATE → STAGE → PREFLIGHT → MIGRATE → APPLY → VERIFY → COMMIT STATE
 ```
 
-On failure: rollback if safe and permitted (see below), else stop and fail
-loudly.
+Staging precedes preflight because hooks execute from the staged release
+directory — the deployment contract that runs is the one staged, verified
+byte-for-byte against `deploymentContract.digest`. On failure: rollback if
+safe and permitted (see below), else stop and fail loudly.
 
 ## Migration contract
 
