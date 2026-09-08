@@ -103,6 +103,14 @@ func gitFixture(t *testing.T) (bundler Bundler, rev string) {
 	run := func(args ...string) {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir
+		// Deterministic commit timestamps: identical fixtures must
+		// produce identical SHAs (or at least never collide by luck
+		// across second boundaries), so a test's input revision and its
+		// fake source can never drift apart.
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_DATE=2023-01-01T00:00:00+00:00",
+			"GIT_COMMITTER_DATE=2023-01-01T00:00:00+00:00",
+		)
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
 		}
@@ -208,9 +216,14 @@ func TestCreateRejections(t *testing.T) {
 		{Name: "Tests", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 10},
 		{Name: "CVE scan", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 11},
 	}
-	try := func(t *testing.T, runs []CheckRun, ancestor bool, mutatePolicy, mutateMaterial func() []byte, in CreateInput) error {
+	try := func(t *testing.T, bundler Bundler, rev string, runs []CheckRun, ancestor bool, mutatePolicy, mutateMaterial func() []byte, in CreateInput) error {
 		t.Helper()
-		bundler, rev := gitFixture(t)
+		// Callers must derive BOTH in.Revision and the fake source from
+		// the SAME fixture (rev): two independent fixtures can produce
+		// different SHAs, and a fake source that does not recognize
+		// in.Revision turns the rejection under test into an unrelated
+		// "not found". try deliberately never touches in.Revision so a
+		// subtest can override it (short-revision input).
 		policy, material := policyDoc(), policyDoc()
 		if mutatePolicy != nil {
 			policy = mutatePolicy()
@@ -227,27 +240,27 @@ func TestCreateRejections(t *testing.T) {
 
 	t.Run("not ancestor", func(t *testing.T) {
 		in := std
-		_, rev := gitFixture(t)
+		bundler, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, okRuns, false, nil, nil, in)
+		err := try(t, bundler, rev, okRuns, false, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "not reachable") {
 			t.Errorf("err = %v", err)
 		}
 	})
 	t.Run("missing check", func(t *testing.T) {
 		in := std
-		_, rev := gitFixture(t)
+		bundler, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, okRuns[:1], true, nil, nil, in)
+		err := try(t, bundler, rev, okRuns[:1], true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "not found") {
 			t.Errorf("err = %v", err)
 		}
 	})
 	t.Run("failed check", func(t *testing.T) {
 		in := std
-		_, rev := gitFixture(t)
+		bundler, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, []CheckRun{
+		err := try(t, bundler, rev, []CheckRun{
 			{Name: "Tests", Status: "completed", Conclusion: "failure", AppID: 1, SuiteID: 10},
 			{Name: "CVE scan", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 11},
 		}, true, nil, nil, in)
@@ -257,9 +270,9 @@ func TestCreateRejections(t *testing.T) {
 	})
 	t.Run("ambiguous check", func(t *testing.T) {
 		in := std
-		_, rev := gitFixture(t)
+		bundler, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, []CheckRun{
+		err := try(t, bundler, rev, []CheckRun{
 			{Name: "Tests", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 10},
 			{Name: "Tests", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 99},
 			{Name: "CVE scan", Status: "completed", Conclusion: "success", AppID: 1, SuiteID: 11},
@@ -270,9 +283,9 @@ func TestCreateRejections(t *testing.T) {
 	})
 	t.Run("identity mismatch", func(t *testing.T) {
 		in := std
-		_, rev := gitFixture(t)
+		bundler, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, okRuns, true, nil, func() []byte {
+		err := try(t, bundler, rev, okRuns, true, nil, func() []byte {
 			return []byte(strings.Replace(string(policyDoc()), "name: my-app", "name: other-app", 1))
 		}, in)
 		if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
@@ -281,19 +294,19 @@ func TestCreateRejections(t *testing.T) {
 	})
 	t.Run("policy declares foreign repository", func(t *testing.T) {
 		in := std
-		_, rev := gitFixture(t)
+		bundler, rev := gitFixture(t)
 		in.Revision = rev
 		in.Repo = "other/my-app"
-		err := try(t, okRuns, true, nil, nil, in)
+		err := try(t, bundler, rev, okRuns, true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "declares source repository") {
 			t.Errorf("err = %v", err)
 		}
 	})
 	t.Run("policy declares non-trusted branch", func(t *testing.T) {
 		in := std
-		_, rev := gitFixture(t)
+		bundler, rev := gitFixture(t)
 		in.Revision = rev
-		err := try(t, okRuns, true, func() []byte {
+		err := try(t, bundler, rev, okRuns, true, func() []byte {
 			return []byte(strings.Replace(string(policyDoc()), "branch: main", "branch: develop", 1))
 		}, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "trusted integration branch") {
@@ -302,19 +315,20 @@ func TestCreateRejections(t *testing.T) {
 	})
 	t.Run("irreversible with rollback safe input", func(t *testing.T) {
 		in := std
-		_, rev := gitFixture(t)
+		bundler, rev := gitFixture(t)
 		in.Revision = rev
 		in.MigrationMode = "irreversible"
 		in.RollbackSafe = true
-		err := try(t, okRuns, true, nil, nil, in)
+		err := try(t, bundler, rev, okRuns, true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "rollback-safe") {
 			t.Errorf("err = %v", err)
 		}
 	})
 	t.Run("short revision input", func(t *testing.T) {
 		in := std
+		bundler, rev := gitFixture(t)
 		in.Revision = "abc"
-		err := try(t, okRuns, true, nil, nil, in)
+		err := try(t, bundler, rev, okRuns, true, nil, nil, in)
 		if err == nil || !strings.Contains(err.Error(), "full commit SHA") {
 			t.Errorf("err = %v", err)
 		}

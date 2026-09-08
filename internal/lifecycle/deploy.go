@@ -138,12 +138,16 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 
 	failDeployment := func(reason string) (*Report, error) {
 		rep.FailureReason = reason
-		// A determined refusal is a trusted terminal: the attempt marker
-		// (if any) must go. Failure to clear keeps the environment in
-		// recovery-required — conservative and loud.
-		if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
-			return rep, fmt.Errorf("%s (and the attempt marker could not be cleared: %w — the environment stays in recovery-required)", reason, cerr)
-		}
+		// The attempt marker is deliberately NOT cleared here. Once it
+		// exists, a failure — even a determined hook exit — means a
+		// consequential deployment has not been reconciled to trusted
+		// observed state: a migration can partially apply and then exit 1,
+		// so "known failure" is not "safe to repeat consequential work".
+		// The marker survives until explicit recovery (step 10) resolves
+		// it, or until committed observed state proves the attempt
+		// finished (the self-heal below). Failures before the marker is
+		// written — validate, stage, contract, preflight — leave no
+		// marker and remain retryable.
 		if herr := recordOutcome(ctx, in, now, rep, "deploy.failed"); herr != nil {
 			return rep, errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("history outcome not recorded: %w", herr))
 		}
@@ -177,7 +181,17 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		return rep, fmt.Errorf("read attempt marker: %w", aerr)
 	}
 	if aerr == nil {
-		if observed.Current != nil && observed.Current.Release == rep.Version && observed.Current.BundleDigest == rel.Bundle.Digest {
+		// Self-heal requires the FULL identity match: the marker must
+		// describe an attempt to exactly the requested release with
+		// exactly the requested bundle digest, AND committed observed
+		// state must show that same release with that same digest. Only
+		// then does observed state prove that THIS attempt reached its
+		// trusted terminal. A marker for a different target release (e.g.
+		// an unresolved 2.0.0 attempt while 1.0.0 is observed) is never
+		// erased by deploying the currently observed release.
+		if observed.Current != nil &&
+			attempt.ToRelease == rep.Version && attempt.BundleDigest == rel.Bundle.Digest &&
+			observed.Current.Release == rep.Version && observed.Current.BundleDigest == rel.Bundle.Digest {
 			// The attempt reached its trusted terminal; the marker is a
 			// leftover from a crash between commit and cleanup.
 			if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {

@@ -149,14 +149,25 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 	return StageNew, nil
 }
 
-// VerifyStage proves that an existing release directory still contains
-// exactly the canonical bundle it claims: marker identity and digest, every
-// expected file present with byte-identical content, and executable /
-// non-executable semantics intact. Rollback and any reuse of staged
-// material must pass here before executing anything from the directory.
-// Detection of *extra* files (runtime material added after staging) is
-// future work; expected-file integrity is complete.
+// VerifyStage proves that a staged release directory is the exact
+// immutable Release bundle: the supplied bytes must hash to the release's
+// pinned bundle digest, the marker must record that same identity and
+// digest, every expected file must be present with byte-identical content,
+// and executable / non-executable semantics must be intact. Rollback and
+// any reuse of staged material must pass here before executing anything
+// from the directory. Detection of *extra* files (runtime material added
+// after staging) is future work; expected-file integrity is complete, and
+// lifecycle hooks must not depend on undeclared release-directory files.
 func (t *Target) VerifyStage(ctx context.Context, rel *manifest.Release, bundle []byte) error {
+	if rel.Bundle.Digest == "" {
+		return fmt.Errorf("release %s %s pins no bundle digest", rel.Metadata.Project, rel.Metadata.Version)
+	}
+	if actual := digestOf(bundle); actual != rel.Bundle.Digest {
+		// The supplied bytes are not the pinned bundle — even if every
+		// extracted file happened to match the staged tree, this is not
+		// the immutable Release the digest vouches for.
+		return fmt.Errorf("supplied bundle hashes to %s but the release pins %s", actual, rel.Bundle.Digest)
+	}
 	releaseDir, err := t.layout.ReleaseDir(rel.Metadata.Project, rel.Metadata.Version)
 	if err != nil {
 		return err

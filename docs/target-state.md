@@ -131,18 +131,25 @@ Two facts are deliberately kept apart:
   is unresolved* — a recovery fact.
 
 The lifecycle layer writes the marker before the first consequential stage
-(migrate) and removes it only at a trusted terminal: observed state
-committed, or a determined hook failure. If a deployment dies after
-consequential work but before observed state commits — a transport loss
-during migrate/apply/verify, a failed state commit — the marker survives,
-and the next normal deployment **refuses** with a recovery-required outcome
-instead of re-running migrate/apply into a target whose state is unknown.
+(migrate) and removes it only when the attempt is **reconciled to trusted
+observed state**: observed state committed, or explicit recovery (step 10).
+Everything else keeps the marker — including *determined* hook failures.
+That is deliberate: a migration can partially mutate state and then exit 1,
+so "known failure" is not "safe to repeat consequential work". Failures
+before the marker exists (validate, stage, contract verification,
+preflight) involve no consequential work and remain retryable. If a
+deployment dies after consequential work but before observed state
+commits — a transport loss during migrate/apply/verify, a failed state
+commit — the marker survives, and the next normal deployment **refuses**
+with a recovery-required outcome instead of re-running migrate/apply into
+a target whose state is unknown.
 
-Recovery is explicit: an operator (or step 10's rollback/recovery
-machinery) resolves the attempt. One self-healing case is recognized: if
-committed observed state already matches the desired release and digest,
-the attempt demonstrably reached its terminal and the leftover marker is
-cleared automatically.
+Resolution is explicit — recovery/rollback (step 10) — with one
+self-healing case: if the marker describes exactly the requested release
+and digest AND committed observed state shows that same release with that
+same digest, the attempt demonstrably reached its terminal and the
+leftover marker is cleared. A marker for a *different* target release is
+never erased by deploying the currently observed release.
 
 The marker is strict metadata — one JSON value, schema-validated
 (`toolkit.attempt/v1`): attempt id, from/to release, bundle digest,
@@ -151,15 +158,19 @@ absent.
 
 ## Reused staged material is verified, not trusted
 
-`StageAlreadyStaged` is only returned after the existing release directory
-has been proven to still contain exactly the canonical bundle: every
-expected file byte-identical, executable semantics intact, marker identity
-and digest matching. A `.staged.json` assertion from yesterday is not
-evidence that yesterday's bytes are still there — altered staged material
-is never executed or reused. `Target.VerifyStage` exposes the same proof
-for any consumer of an old release directory (rollback candidates above
-all). Detection of *extra* files added after staging is future work;
-expected-file integrity is complete.
+`StageAlreadyStaged` is only returned after the staged directory has been
+proven intact: the incoming bundle must hash to the release's pinned
+digest, the marker must record that identity and digest, every canonical
+file must be present byte-identical, and executable semantics must be
+intact. A `.staged.json` assertion from yesterday is not evidence that
+yesterday's bytes are still there — altered staged material is never
+executed or reused. `Target.VerifyStage` exposes the same proof for any
+consumer of an old release directory (rollback candidates above all).
+
+Scope note: this proves **all canonical files are intact** — it is not yet
+full tree equality, because files *added* after staging are not detected.
+Until that closes, lifecycle hooks must not depend on undeclared
+release-directory files.
 
 ## Concurrency constraint on the lifecycle layer
 

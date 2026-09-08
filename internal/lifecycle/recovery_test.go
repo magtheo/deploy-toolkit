@@ -82,21 +82,29 @@ func TestDeployUncertainCommitRetryIsRefused(t *testing.T) {
 	firstRun := order(t, f.marker)
 
 	// Retry with a healthy transport: normal retry is REFUSED.
-	rep2, err := deploy(t, f, "my-app", "1.0.0", nil)
-	if err != nil {
-		t.Fatal(err)
+	refuse := func(t *testing.T, attemptNo int) {
+		t.Helper()
+		rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !rep.RecoveryRequired || rep.AlreadyCurrent || rep.Committed {
+			t.Fatalf("retry #%d rep = %+v, want recovery-required refusal", attemptNo, rep)
+		}
+		if !strings.Contains(rep.FailureReason, "unresolved deployment attempt") {
+			t.Errorf("retry #%d failure reason = %q", attemptNo, rep.FailureReason)
+		}
+		if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(firstRun, ",") {
+			t.Errorf("refused retry #%d re-ran hooks: first %v, retry %v", attemptNo, firstRun, got)
+		}
+		if !attemptPresent(t, f) {
+			t.Fatalf("retry #%d deleted the recovery marker — retries must never erase the evidence they are refused by", attemptNo)
+		}
 	}
-	if !rep2.RecoveryRequired || rep2.AlreadyCurrent || rep2.Committed {
-		t.Errorf("retry rep = %+v, want recovery-required refusal", rep2)
-	}
-	if !strings.Contains(rep2.FailureReason, "unresolved deployment attempt") {
-		t.Errorf("failure reason = %q", rep2.FailureReason)
-	}
-	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(firstRun, ",") {
-		t.Errorf("refused retry re-ran hooks: first %v, retry %v", firstRun, got)
-	}
+	refuse(t, 1)
+	refuse(t, 2)
 	records := history(t, f)
-	if len(records) != 2 || records[1].Type != "deploy.failed" || records[1].Data["recoveryRequired"] != true {
+	if len(records) != 3 || records[1].Type != "deploy.failed" || records[1].Data["recoveryRequired"] != true || records[2].Type != "deploy.failed" {
 		t.Fatalf("history = %+v", records)
 	}
 	requireNoLock(t, f)
@@ -145,10 +153,16 @@ func TestDeployTransportLossDuringApplyLeavesUnresolvedAttempt(t *testing.T) {
 
 func TestDeployAlreadyCurrentSelfHealsStaleMarker(t *testing.T) {
 	// Crash window: observed state committed, attempt marker not yet
-	// cleared. The next deployment recognizes the trusted terminal and
-	// heals the leftover instead of demanding recovery.
+	// cleared. The next deployment recognizes the trusted terminal —
+	// the marker must describe EXACTLY this attempt (toRelease and
+	// bundleDigest matching the requested release) — and heals the
+	// leftover instead of demanding recovery.
 	f := newFixture(t, "my-app", nil)
-	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "1.0.0"), Release: rel, Bundle: bundleBytes, Owner: "test",
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.target.WriteAttempt(t.Context(), target.AttemptMarker{
@@ -156,7 +170,7 @@ func TestDeployAlreadyCurrentSelfHealsStaleMarker(t *testing.T) {
 		Project:      "my-app",
 		Environment:  "production",
 		ToRelease:    "1.0.0",
-		BundleDigest: "sha256:" + strings.Repeat("aa", 32),
+		BundleDigest: rel.Bundle.Digest,
 		StartedAt:    time.Unix(1700000000, 0).UTC().Format(time.RFC3339),
 	}); err != nil {
 		t.Fatal(err)
@@ -173,14 +187,48 @@ func TestDeployAlreadyCurrentSelfHealsStaleMarker(t *testing.T) {
 	}
 }
 
+func TestDeployUnrelatedAttemptMarkerIsNeverHealed(t *testing.T) {
+	// Observed current is 1.0.0, but the unresolved marker records an
+	// attempt TO 2.0.0. Deploying the currently observed 1.0.0 must not
+	// conclude "that attempt finished" — the marker survives and normal
+	// retries stay refused until explicit recovery.
+	f := newFixture(t, "my-app", nil)
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.target.WriteAttempt(t.Context(), target.AttemptMarker{
+		AttemptID:    "fedcba9876543210",
+		Project:      "my-app",
+		Environment:  "production",
+		FromRelease:  "1.0.0",
+		ToRelease:    "2.0.0",
+		BundleDigest: "sha256:" + strings.Repeat("cc", 32),
+		StartedAt:    time.Unix(1700000500, 0).UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.RecoveryRequired || rep.AlreadyCurrent {
+		t.Errorf("rep = %+v, want refusal: the marker describes a different attempt", rep)
+	}
+	if !attemptPresent(t, f) {
+		t.Fatal("an unrelated unresolved attempt was erased by deploying the observed release")
+	}
+	requireNoLock(t, f)
+}
+
 func TestVerifyStageDetectsMutatedHookBytes(t *testing.T) {
 	// A staged release whose bytes were altered after staging must never
-	// be executed from. First attempt: verify fails (determined outcome,
-	// marker cleared, no commit). Then the staged verify.sh is mutated.
-	// The retry's Stage hits the already-staged path — which now proves
-	// the directory still matches the canonical bundle and refuses.
+	// be executed from. First attempt: preflight fails — the release is
+	// staged but no consequential work ran and no attempt marker exists,
+	// so a retry legitimately reaches the already-staged path. That path
+	// now proves the directory still matches the canonical bundle and
+	// refuses because the staged verify.sh was mutated in between.
 	f := newFixture(t, "my-app", func(marker, envFile, script string) string {
-		if script == "verify" {
+		if script == "preflight" {
 			return "#!/bin/sh\nexit 1\n"
 		}
 		return fmt.Sprintf("#!/bin/sh\necho %s >> %s\n", script, marker)
@@ -189,7 +237,7 @@ func TestVerifyStageDetectsMutatedHookBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.FailureReason != "verify failed" || rep.Committed {
+	if rep.FailureReason != "preflight failed" || rep.Committed {
 		t.Fatalf("first attempt rep = %+v", rep)
 	}
 

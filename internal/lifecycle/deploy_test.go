@@ -272,6 +272,9 @@ func TestDeployHappyPath(t *testing.T) {
 		t.Errorf("history seq = %d", rep.HistorySeq)
 	}
 	requireNoLock(t, f)
+	if attemptPresent(t, f) {
+		t.Error("trusted terminal did not clear the attempt marker")
+	}
 }
 
 func TestDeployMigrateSkippedWhenModeNone(t *testing.T) {
@@ -348,6 +351,13 @@ func TestDeployHookFailureDoesNotCommit(t *testing.T) {
 		t.Errorf("history reason = %#v", records[0].Data["reason"])
 	}
 	requireNoLock(t, f)
+	// Conservative recovery policy: a post-consequential hook failure is
+	// determined, but "known failure" is not "safe to repeat" — migrate
+	// may have partially applied. The attempt marker survives until
+	// explicit recovery resolves it.
+	if !attemptPresent(t, f) {
+		t.Error("post-consequential hook failure must keep the attempt marker")
+	}
 }
 
 func TestDeployPreflightFailureStops(t *testing.T) {
@@ -372,6 +382,11 @@ func TestDeployPreflightFailureStops(t *testing.T) {
 		t.Errorf("preflight result = %+v", rep.Stages[0])
 	}
 	requireNoLock(t, f)
+	// Preflight runs BEFORE the attempt marker: a determined preflight
+	// failure involved no consequential work and stays retryable.
+	if attemptPresent(t, f) {
+		t.Error("preflight failure must not leave an attempt marker")
+	}
 }
 
 func TestDeployContractDigestMismatchFails(t *testing.T) {
