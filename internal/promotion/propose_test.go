@@ -50,6 +50,8 @@ bundle:
 lifecycle:
   apply:
     argv: ["./deploy/apply.sh"]
+  verify:
+    argv: ["./deploy/verify.sh"]
 `)
 }
 

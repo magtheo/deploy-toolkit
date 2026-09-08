@@ -158,8 +158,10 @@ Rules (v1 promise):
 
 - Hooks are executed with deterministic argument boundaries; YAML strings are
   **never** evaluated as shell programs.
-- `apply` is the only mandatory hook; every other step is optional and skipped
-  when absent.
+- `apply` and `verify` are mandatory; `preflight` and `migrate` are optional
+  and skipped when absent. `verify` is mandatory because observed state means
+  "what Deploy Toolkit last **verified** as running" — state never advances
+  on a skipped verification.
 - Hooks run on the target, inside the staged release directory
   (`<deployRoot>/<project>/releases/<version>/` — releases are
   environment-independent; state and history are environment-scoped). See
@@ -251,9 +253,21 @@ the derived layout and the staging/state/history disciplines.
 
 ### Target-side utilities (both transports)
 
-The substrate uses only POSIX utilities resolved via the account's PATH:
-`test`, `cat` (state reads and staged-marker reads). Nothing else is
-required of an SSH or local target in V1.
+The substrate and lifecycle layers use only POSIX utilities resolved via
+the account's PATH: `test`, `cat` (state reads and staged-marker reads),
+and `mkdir`, `rm`, `rmdir` (environment lock acquisition and release).
+Nothing else is required of an SSH or local target in V1.
+
+### Prepare/deploy trust split
+
+The deployment operation consumes **prepared canonical bundle bytes** —
+the product of the prepare side, which owns Git and the source checkout.
+The deploy side holds only the target credential: it never checks out
+application source, never touches the repository, and re-verifies every
+digest (bundle bytes against `bundle.digest` before staging; the staged
+`.deploy/project.yaml` against `deploymentContract.digest` before any
+hook runs). `BuildFromRevision` — deriving the include list from the
+revision's own manifest — belongs to the prepare side.
 
 ### SSH target prerequisites (V1)
 

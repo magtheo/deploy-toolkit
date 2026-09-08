@@ -192,12 +192,21 @@ func requireNoLock(t *testing.T, f *fixture) {
 	}
 }
 
+// preparedBytes is the prepare side: Git + bundler live here, and only the
+// canonical bytes cross into the deployment operation.
+func (f *fixture) preparedBytes(t *testing.T, project, version string) (*manifest.Release, []byte) {
+	t.Helper()
+	res, err := f.bundler.BuildFromRevision(t.Context(), f.revision)
+	if err != nil {
+		t.Fatalf("prepare: build bundle: %v", err)
+	}
+	rel := f.release(project, version)
+	return rel, res.Bytes
+}
+
 func deploy(t *testing.T, f *fixture, project, version string, mutate func(*manifest.Release)) (*Report, error) {
 	t.Helper()
-	rel := f.release(project, version)
-	if rel == nil {
-		t.Fatal("bundle build failed")
-	}
+	rel, bundleBytes := f.preparedBytes(t, project, version)
 	if mutate != nil {
 		mutate(rel)
 	}
@@ -206,7 +215,7 @@ func deploy(t *testing.T, f *fixture, project, version string, mutate func(*mani
 		TargetManifest: f.targetManifest(),
 		Environment:    f.environment(project, version),
 		Release:        rel,
-		Bundler:        f.bundler,
+		Bundle:         bundleBytes,
 		Owner:          "test",
 	})
 }
@@ -423,26 +432,71 @@ func TestDeployLockHeldFailsClosed(t *testing.T) {
 	}
 }
 
-func TestDeploySecondAttemptIsIdempotent(t *testing.T) {
-	// Staging the same release twice: first attempt commits, second
-	// attempt re-stages (already-staged), re-runs hooks, re-commits.
+func TestDeployAlreadyCurrentNeverReapplies(t *testing.T) {
+	// Deploy 1.0.0 successfully, then deploy it again: observed state is
+	// a real idempotency guard. migrate/apply are not guaranteed to be
+	// idempotent, and a retry after a lost history write must never
+	// repeat consequential work.
 	f := newFixture(t, "my-app", nil)
 	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
 		t.Fatal(err)
 	}
+	firstRun := order(t, f.marker)
 	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.Staged != target.StageAlreadyStaged {
-		t.Errorf("second stage status = %s, want already-staged", rep.Staged)
+	if !rep.AlreadyCurrent || rep.Committed {
+		t.Errorf("rep = alreadyCurrent:%v committed:%v, want already-current without a new commit", rep.AlreadyCurrent, rep.Committed)
+	}
+	if rep.FailureReason != "" {
+		t.Errorf("failure reason = %q", rep.FailureReason)
+	}
+	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(firstRun, ",") {
+		t.Errorf("consequential hooks re-ran: first %v, second %v", firstRun, got)
 	}
 	records := history(t, f)
-	if len(records) != 2 || records[1].Type != "deploy.succeeded" {
+	if len(records) != 2 || records[0].Type != "deploy.succeeded" || records[1].Type != "deploy.already-current" {
 		t.Fatalf("history = %+v", records)
 	}
-	if rep.HistorySeq != 2 {
-		t.Errorf("history seq = %d", rep.HistorySeq)
+	requireNoLock(t, f)
+}
+
+func TestDeploySameVersionDifferentDigestRefused(t *testing.T) {
+	// Observed 1.0.0 with digest A; desired 1.0.0 with digest B: state
+	// and release identity have drifted. Fail closed — never redeploy
+	// over drifted state.
+	f := newFixture(t, "my-app", nil)
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	firstRun := order(t, f.marker)
+	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+	rel.Bundle.Digest = "sha256:" + strings.Repeat("bb", 32)
+	rep, err := Deploy(t.Context(), DeployInput{
+		Target:         f.target,
+		TargetManifest: f.targetManifest(),
+		Environment:    f.environment("my-app", "1.0.0"),
+		Release:        rel,
+		Bundle:         bundleBytes,
+		Owner:          "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.AlreadyCurrent || rep.Committed {
+		t.Errorf("rep = %+v, want refusal", rep)
+	}
+	if !strings.Contains(rep.FailureReason, "state drift") {
+		t.Errorf("failure reason = %q, want drift refusal", rep.FailureReason)
+	}
+	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(firstRun, ",") {
+		t.Errorf("hooks ran on drifted state: %v", got)
+	}
+	// The refusal is recorded as a fact.
+	records := history(t, f)
+	if len(records) != 2 || records[1].Type != "deploy.failed" {
+		t.Fatalf("history = %+v", records)
 	}
 	requireNoLock(t, f)
 }
@@ -490,9 +544,10 @@ func TestValidateDesiredRejectsWrongTargetAndRelease(t *testing.T) {
 		t.Fatal("bundle build failed")
 	}
 
+	_, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
 	env.Spec.Target = "some-other-target"
 	if _, err := Deploy(t.Context(), DeployInput{
-		Target: f.target, TargetManifest: f.targetManifest(), Environment: env, Release: rel, Bundler: f.bundler,
+		Target: f.target, TargetManifest: f.targetManifest(), Environment: env, Release: rel, Bundle: bundleBytes,
 	}); err == nil || !strings.Contains(err.Error(), "targets") {
 		t.Errorf("wrong target accepted: %v", err)
 	}
@@ -500,8 +555,85 @@ func TestValidateDesiredRejectsWrongTargetAndRelease(t *testing.T) {
 	env = f.environment("my-app", "1.0.0")
 	env.Spec.Release = ".deploy/releases/my-app-9.9.9.yaml"
 	if _, err := Deploy(t.Context(), DeployInput{
-		Target: f.target, TargetManifest: f.targetManifest(), Environment: env, Release: rel, Bundler: f.bundler,
+		Target: f.target, TargetManifest: f.targetManifest(), Environment: env, Release: rel, Bundle: bundleBytes,
 	}); err == nil || !strings.Contains(err.Error(), "pins release") {
 		t.Errorf("wrong release ref accepted: %v", err)
+	}
+}
+
+func TestDeployMissingVerifyFailsClosed(t *testing.T) {
+	// state.current means "what Deploy Toolkit last VERIFIED as running".
+	// A contract without verify must therefore never reach a state
+	// commit. The candidate schema requires verify, so the pipeline
+	// rejects it at the earliest layer: the prepare-side bundle build
+	// parses the revision's project.yaml and refuses the manifest before
+	// any bytes reach a target. (The engine additionally refuses a nil
+	// verify hook as defense in depth, unreachable while the schema
+	// enforces it.)
+	f := newFixture(t, "my-app", nil)
+	p := filepath.Join(f.repoDir, ".deploy/project.yaml")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trimmed := strings.Replace(string(raw), `  verify:
+    argv: ["./deploy/verify.sh"]
+`, "", 1)
+	if trimmed == string(raw) {
+		t.Fatal("fixture setup failed: verify block not found")
+	}
+	if err := os.WriteFile(p, []byte(trimmed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, f.repoDir, "add", "-A")
+	git(t, f.repoDir, "commit", "-q", "-m", "drop verify")
+	f.revision = git(t, f.repoDir, "rev-parse", "HEAD")
+
+	_, err = f.bundler.BuildFromRevision(t.Context(), f.revision)
+	if err == nil || !strings.Contains(err.Error(), "verify") {
+		t.Fatalf("prepare-side bundle build err = %v, want a verify requirement violation", err)
+	}
+	// Nothing reached the target.
+	if _, err := f.target.ReadState(t.Context(), "my-app", "production"); !errors.Is(err, target.ErrStateAbsent) {
+		t.Errorf("state err = %v, want ErrStateAbsent", err)
+	}
+	if _, err := os.Stat(f.lockDir()); !os.IsNotExist(err) {
+		t.Errorf("lock created (stat err = %v)", err)
+	}
+	if len(history(t, f)) != 0 {
+		t.Error("history written for a prepare-side rejection")
+	}
+}
+
+func TestDeployIncompleteInputFailsClosed(t *testing.T) {
+	f := newFixture(t, "my-app", nil)
+	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+	tgt := f.target
+	tm := f.targetManifest()
+	env := f.environment("my-app", "1.0.0")
+
+	cases := []struct {
+		name string
+		in   DeployInput
+		want string
+	}{
+		{"nil target", DeployInput{TargetManifest: tm, Environment: env, Release: rel, Bundle: bundleBytes}, "Target is required"},
+		{"nil target manifest", DeployInput{Target: tgt, Environment: env, Release: rel, Bundle: bundleBytes}, "TargetManifest is required"},
+		{"nil environment", DeployInput{Target: tgt, TargetManifest: tm, Release: rel, Bundle: bundleBytes}, "Environment is required"},
+		{"nil release", DeployInput{Target: tgt, TargetManifest: tm, Environment: env, Bundle: bundleBytes}, "Release is required"},
+		{"nil bundle", DeployInput{Target: tgt, TargetManifest: tm, Environment: env, Release: rel}, "Bundle is required"},
+	}
+	for _, c := range cases {
+		rep, err := Deploy(t.Context(), c.in)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v, want %q", c.name, err, c.want)
+		}
+		if rep != nil {
+			t.Errorf("%s: report returned for incomplete input: %+v", c.name, rep)
+		}
+	}
+	// The lock must never have been created for incomplete input.
+	if _, err := os.Stat(f.lockDir()); !os.IsNotExist(err) {
+		t.Errorf("lock created despite incomplete input (stat err = %v)", err)
 	}
 }

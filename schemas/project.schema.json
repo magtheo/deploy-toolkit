@@ -75,7 +75,7 @@
     },
     "lifecycle": {
       "type": "object",
-      "required": ["apply"],
+      "required": ["apply", "verify"],
       "additionalProperties": false,
       "properties": {
         "preflight": { "$ref": "#/$defs/lifecycleStep" },

@@ -6,27 +6,20 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/magtheo/deploy-toolkit/internal/bundle"
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
-	"github.com/magtheo/deploy-toolkit/internal/release"
 	"github.com/magtheo/deploy-toolkit/internal/target"
 	"github.com/magtheo/deploy-toolkit/internal/transport"
 )
-
-// Bundler builds the canonical bundle for a release revision, deriving the
-// include list from the revision's own project manifest — the deploy-time
-// half of "the deployment contract comes from the promoted release".
-// *bundle.Builder implements it.
-type Bundler interface {
-	BuildFromRevision(ctx context.Context, revision string) (bundle.Result, error)
-}
-
-var _ Bundler = (*bundle.Builder)(nil)
 
 // StageResult is one lifecycle hook's outcome. Stdout/Stderr are returned
 // to the caller for CI-console diagnosis; they are deliberately NOT part
 // of anything persisted on the target — raw hook output can contain
 // application secrets, and history must not.
+//
+// A non-zero exit code is a hook failure (the command ran and reported
+// failure). A transport failure — unreachable target, StartError,
+// cancellation — is NOT a hook outcome and never becomes one; it is
+// returned as an infrastructure error by Deploy.
 type StageResult struct {
 	Name     string
 	Skipped  bool
@@ -37,8 +30,9 @@ type StageResult struct {
 }
 
 // Report describes one deployment attempt. A completed attempt with a
-// failed hook is reported, not returned as an error: the outcome is a
-// fact, and it is in the history log.
+// failed hook or a refused condition is reported, not returned as an
+// error: the outcome is a fact, and it is in the history log.
+// Infrastructure failures are returned as errors.
 type Report struct {
 	Project          string
 	Environment      string
@@ -49,27 +43,47 @@ type Report struct {
 	ContractVerified bool
 	Stages           []StageResult
 	Committed        bool // observed state advanced (verify succeeded)
+	AlreadyCurrent   bool // desired release+digest already observed; nothing consequential ran
 	HistorySeq       int64
 	FailureReason    string
 }
 
 // DeployInput carries the desired state (parsed through the manifest
 // pipeline by the caller) and the substrate bindings.
+//
+// The bundle arrives as prepared canonical bytes — the product of the
+// PREPARE side, which owns Git and the source checkout. This is the
+// prepare/deploy trust split: the deployment operation holds only the
+// target credential, never the source repository. Stage verifies the
+// bytes against Release.bundle.digest before anything is written.
 type DeployInput struct {
 	Target         *target.Target
-	TargetManifest *manifest.Target      // for cross-checking the Environment's target reference
-	Environment    *manifest.Environment // desired, from promoted main
-	Release        *manifest.Release     // desired, from promoted main
-	Bundler        Bundler
+	TargetManifest *manifest.Target // required: cross-checked against the Environment
+	Environment    *manifest.Environment
+	Release        *manifest.Release
+	Bundle         []byte // prepared canonical bundle bytes (prepare side)
 	Owner          string // lock owner identity, e.g. "runner:x/y@id"
 	Now            func() time.Time
 }
 
 // Deploy executes the full sequence. The returned error covers
-// infrastructure failures (lock, transport, bundle build); deployment
-// outcomes — failed hooks, contract mismatches — come back as a Report
-// with FailureReason set and Committed false.
+// infrastructure failures (incomplete input, lock, transport, cancellation);
+// deployment outcomes — failed hooks, contract mismatches, drift refusals —
+// come back as a Report with FailureReason set and Committed false.
 func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
+	// Fail closed on incomplete input instead of dereferencing nils.
+	switch {
+	case in.Target == nil:
+		return nil, fmt.Errorf("DeployInput.Target is required")
+	case in.TargetManifest == nil:
+		return nil, fmt.Errorf("DeployInput.TargetManifest is required")
+	case in.Environment == nil:
+		return nil, fmt.Errorf("DeployInput.Environment is required")
+	case in.Release == nil:
+		return nil, fmt.Errorf("DeployInput.Release is required")
+	case len(in.Bundle) == 0:
+		return nil, fmt.Errorf("DeployInput.Bundle is required (prepared canonical bundle bytes from the prepare side)")
+	}
 	now := in.Now
 	if now == nil {
 		now = time.Now
@@ -77,9 +91,10 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	rel := in.Release
 	env := in.Environment
 	rep = &Report{
-		Project:     rel.Metadata.Project,
-		Environment: env.Metadata.Name,
-		Version:     rel.Metadata.Version,
+		Project:      rel.Metadata.Project,
+		Environment:  env.Metadata.Name,
+		Version:      rel.Metadata.Version,
+		BundleDigest: rel.Bundle.Digest,
 	}
 	if err := validateDesired(in); err != nil {
 		return rep, err
@@ -101,25 +116,31 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		return rep, err
 	}
 	defer func() {
-		// Release with a live context even when the deploy was cancelled:
-		// a stuck lock blocks the environment far worse than a rmdir on a
-		// cancelled context does.
-		if relErr := lock.Release(context.WithoutCancel(ctx)); relErr != nil && err == nil {
-			err = fmt.Errorf("deployment of %s %s succeeded, but the environment lock could not be released (manual cleanup of %s required): %w", rep.Project, rep.Version, lockDir, relErr)
+		// Cleanup must survive a cancelled deploy context but must not run
+		// unbounded: a fresh, bounded context. Lock-release failure is a
+		// hard failure — the environment is blocked until an operator
+		// cleans up — so it is joined with any existing error, never
+		// swallowed by it.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
+		defer cancel()
+		if relErr := lock.Release(cleanupCtx); relErr != nil {
+			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w", lockDir, relErr))
 		}
 	}()
 
-	fail := func(reason string) (*Report, error) {
+	failDeployment := func(reason string) (*Report, error) {
 		rep.FailureReason = reason
-		_, herr := in.Target.AppendHistory(ctx, rep.Project, rep.Environment, target.Entry{
-			Time: now().UTC().Format(time.RFC3339),
-			Type: "deploy.failed",
-			Data: outcomeData(rep, in),
-		})
-		if herr != nil {
-			return rep, fmt.Errorf("%s (history outcome not recorded: %w)", reason, herr)
+		if herr := recordOutcome(ctx, in, now, rep, "deploy.failed"); herr != nil {
+			return rep, errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("history outcome not recorded: %w", herr))
 		}
 		return rep, nil
+	}
+	failInfra := func(what string, cause error) (*Report, error) {
+		rep.FailureReason = what + " (infrastructure failure)"
+		if herr := recordOutcome(ctx, in, now, rep, "deploy.failed"); herr != nil {
+			cause = errors.Join(cause, fmt.Errorf("history outcome not recorded: %w", herr))
+		}
+		return rep, fmt.Errorf("%s: %w", what, cause)
 	}
 
 	// Observed state: a fresh target has none — that is normal, not fatal.
@@ -131,14 +152,38 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		observed = target.State{Project: rep.Project, Environment: rep.Environment}
 	}
 
+	// Idempotency guard: observed state is a decision input, not a log.
+	if observed.Current != nil {
+		switch {
+		case observed.Current.Release == rep.Version && observed.Current.BundleDigest == rel.Bundle.Digest:
+			// Already current: the environment is running exactly the
+			// desired release. Re-running migrate/apply is not idempotent
+			// in general — and a retry after a lost history write must
+			// never repeat consequential work. Record the fact and stop.
+			staged, serr := in.Target.Stage(ctx, rel, in.Bundle, now())
+			if serr != nil {
+				return rep, fmt.Errorf("stage release: %w", serr)
+			}
+			rep.Staged = staged
+			rep.AlreadyCurrent = true
+			if herr := recordOutcome(ctx, in, now, rep, "deploy.already-current"); herr != nil {
+				return rep, fmt.Errorf("record history outcome: %w", herr)
+			}
+			return rep, nil
+		case observed.Current.Release == rep.Version:
+			// Same release identity, different observed digest: the state
+			// and the release have drifted apart. Refuse — this is not a
+			// deployment condition anyone asked for.
+			return failDeployment(fmt.Sprintf(
+				"state drift: observed release %s carries bundle digest %s, but the release pins %s — refusing to redeploy over drifted state",
+				rep.Version, observed.Current.BundleDigest, rel.Bundle.Digest))
+		}
+		// A different release is current: proceed with the upgrade.
+	}
+
 	// Stage: digest-verified, marker-last, idempotent. Nothing here can
 	// affect the running service.
-	bres, err := in.Bundler.BuildFromRevision(ctx, rel.Source.Revision)
-	if err != nil {
-		return rep, fmt.Errorf("build bundle for %s: %w", rel.Source.Revision, err)
-	}
-	rep.BundleDigest = bres.Digest
-	staged, err := in.Target.Stage(ctx, rel, bres.Bytes, now())
+	staged, err := in.Target.Stage(ctx, rel, in.Bundle, now())
 	if err != nil {
 		return rep, fmt.Errorf("stage release: %w", err)
 	}
@@ -153,64 +198,63 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}
 	contractBytes, err := in.Target.ReadFile(ctx, releaseDir+"/.deploy/project.yaml")
 	if err != nil {
-		return fail(fmt.Sprintf("staged deployment contract unreadable: %v", err))
+		return failInfra("staged deployment contract unreadable", err)
 	}
 	if digestOf(contractBytes) != rel.DeploymentContract.Digest {
-		return fail(fmt.Sprintf("staged deployment contract digest %s does not match the release pin %s", digestOf(contractBytes), rel.DeploymentContract.Digest))
+		return failDeployment(fmt.Sprintf("staged deployment contract digest %s does not match the release pin %s", digestOf(contractBytes), rel.DeploymentContract.Digest))
 	}
 	parsed, err := manifest.Parse(contractBytes, manifest.KindProject)
 	if err != nil {
-		return fail(fmt.Sprintf("staged deployment contract is not a valid project manifest: %v", err))
+		return failDeployment(fmt.Sprintf("staged deployment contract is not a valid project manifest: %v", err))
 	}
 	stagedProject := parsed.Project
 	if stagedProject.Metadata.Name != rep.Project {
-		return fail(fmt.Sprintf("staged deployment contract is for project %q, deploying %q", stagedProject.Metadata.Name, rep.Project))
+		return failDeployment(fmt.Sprintf("staged deployment contract is for project %q, deploying %q", stagedProject.Metadata.Name, rep.Project))
 	}
 	rep.ContractVerified = true
+	if stagedProject.Lifecycle.Verify == nil {
+		// Defense in depth: the schema already requires verify. State
+		// must never advance on a skipped verification.
+		return failDeployment("staged deployment contract declares no verify hook; verify is mandatory")
+	}
 
 	henv, err := hookEnv(rel, rep.Environment)
 	if err != nil {
 		return rep, fmt.Errorf("hook environment: %w", err)
 	}
 
-	if stagedProject.Lifecycle.Apply == nil {
-		// apply is the only mandatory hook (Consumer Contract v1).
-		return fail("staged deployment contract declares no apply hook; apply is mandatory")
-	}
-
-	runStage := func(name string, step *manifest.LifecycleStep) bool {
+	// runStage preserves the transport contract: exit codes are hook
+	// outcomes, Run errors are infrastructure errors.
+	runStage := func(name string, step *manifest.LifecycleStep) (StageResult, error) {
 		if step == nil {
-			rep.Stages = append(rep.Stages, StageResult{Name: name, Skipped: true})
-			return true
+			return StageResult{Name: name, Skipped: true}, nil
 		}
 		res, err := in.Target.Transport().Run(ctx, transport.RunRequest{
 			Argv: step.Argv,
 			Dir:  releaseDir,
 			Env:  henv,
 		})
-		sr := StageResult{Name: name}
-		if res.Stdout != nil {
-			sr.Stdout = res.Stdout
-		}
-		if res.Stderr != nil {
-			sr.Stderr = res.Stderr
-		}
 		if err != nil {
-			sr.Failed = true
-			sr.Stderr = append(sr.Stderr, []byte("\n"+err.Error())...)
-			rep.Stages = append(rep.Stages, sr)
-			return false
+			return StageResult{Name: name, Failed: true}, err
 		}
-		sr.ExitCode = res.ExitCode
-		sr.Failed = res.ExitCode != 0
-		rep.Stages = append(rep.Stages, sr)
-		return !sr.Failed
+		return StageResult{
+			Name:     name,
+			ExitCode: res.ExitCode,
+			Failed:   res.ExitCode != 0,
+			Stdout:   res.Stdout,
+			Stderr:   res.Stderr,
+		}, nil
 	}
 
 	// Staging is non-impacting; preflight decides whether the staged
 	// release may begin consequential execution.
-	if !runStage("preflight", stagedProject.Lifecycle.Preflight) {
-		return fail("preflight failed")
+	sr, ierr := runStage("preflight", stagedProject.Lifecycle.Preflight)
+	rep.Stages = append(rep.Stages, sr)
+	if ierr != nil {
+		return failInfra("preflight could not be executed", ierr)
+	}
+	if sr.Failed {
+		return failDeployment("preflight failed")
 	}
 
 	// Migration hooks follow the release's declared migration semantics:
@@ -219,14 +263,31 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	if rel.Migration.Mode != manifest.MigrationNone {
 		migrateStep = stagedProject.Lifecycle.Migrate
 	}
-	if !runStage("migrate", migrateStep) {
-		return fail("migrate failed")
+	sr, ierr = runStage("migrate", migrateStep)
+	rep.Stages = append(rep.Stages, sr)
+	if ierr != nil {
+		return failInfra("migrate could not be executed", ierr)
 	}
-	if !runStage("apply", stagedProject.Lifecycle.Apply) {
-		return fail("apply failed")
+	if sr.Failed {
+		return failDeployment("migrate failed")
 	}
-	if !runStage("verify", stagedProject.Lifecycle.Verify) {
-		return fail("verify failed")
+
+	sr, ierr = runStage("apply", stagedProject.Lifecycle.Apply)
+	rep.Stages = append(rep.Stages, sr)
+	if ierr != nil {
+		return failInfra("apply could not be executed", ierr)
+	}
+	if sr.Failed {
+		return failDeployment("apply failed")
+	}
+
+	sr, ierr = runStage("verify", stagedProject.Lifecycle.Verify)
+	rep.Stages = append(rep.Stages, sr)
+	if ierr != nil {
+		return failInfra("verify could not be executed", ierr)
+	}
+	if sr.Failed {
+		return failDeployment("verify failed")
 	}
 
 	// Verify succeeded — and only verify success — lets observed state
@@ -242,16 +303,28 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}
 	rep.Committed = true
 
-	seq, err := in.Target.AppendHistory(ctx, rep.Project, rep.Environment, target.Entry{
-		Time: now().UTC().Format(time.RFC3339),
-		Type: "deploy.succeeded",
-		Data: outcomeData(rep, in),
-	})
-	if err != nil {
+	if err := recordOutcome(ctx, in, now, rep, "deploy.succeeded"); err != nil {
 		return rep, fmt.Errorf("record history outcome: %w", err)
 	}
-	rep.HistorySeq = seq
 	return rep, nil
+}
+
+func recordOutcome(ctx context.Context, in DeployInput, now func() time.Time, rep *Report, kind string) error {
+	data := outcomeData(rep, in)
+	if kind == "deploy.succeeded" {
+		// The state commit is part of the success fact.
+		data["committed"] = true
+	}
+	seq, err := in.Target.AppendHistory(ctx, rep.Project, rep.Environment, target.Entry{
+		Time: now().UTC().Format(time.RFC3339),
+		Type: kind,
+		Data: data,
+	})
+	if err != nil {
+		return err
+	}
+	rep.HistorySeq = seq
+	return nil
 }
 
 // validateDesired cross-checks the desired manifests against each other
@@ -263,10 +336,10 @@ func validateDesired(in DeployInput) error {
 	if env.Spec.Target == "" {
 		return fmt.Errorf("environment %q declares no target", env.Metadata.Name)
 	}
-	if in.TargetManifest != nil && env.Spec.Target != in.TargetManifest.Metadata.Name {
+	if env.Spec.Target != in.TargetManifest.Metadata.Name {
 		return fmt.Errorf("environment %q targets %q, but the deployment targets %q", env.Metadata.Name, env.Spec.Target, in.TargetManifest.Metadata.Name)
 	}
-	wantRef := ".deploy/releases/" + release.ReleaseFileName(rel.Metadata.Project, rel.Metadata.Version)
+	wantRef := fmt.Sprintf(".deploy/releases/%s-%s.yaml", rel.Metadata.Project, rel.Metadata.Version)
 	if env.Spec.Release != wantRef {
 		return fmt.Errorf("environment %q pins release %q, but the deployment is for %q", env.Metadata.Name, env.Spec.Release, wantRef)
 	}
@@ -301,6 +374,9 @@ func outcomeData(rep *Report, in DeployInput) map[string]any {
 		"contractVerified": rep.ContractVerified,
 		"stages":           stages,
 		"actor":            in.Owner,
+	}
+	if rep.AlreadyCurrent {
+		data["alreadyCurrent"] = true
 	}
 	if rep.Committed {
 		data["committed"] = true

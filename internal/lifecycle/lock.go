@@ -50,6 +50,10 @@ type LockOwner struct {
 	Release     string `json:"release"`
 }
 
+// lockCleanupTimeout bounds lock-release attempts so a stuck target cannot
+// hang finalization forever. Var for test overriding.
+var lockCleanupTimeout = 30 * time.Second
+
 // AcquireEnvLock creates the lock directory atomically. Callers must
 // Release it; Release failure is a hard error because a stuck lock blocks
 // every future deployment of the environment.
@@ -83,7 +87,13 @@ func AcquireEnvLock(ctx context.Context, tr transport.Transport, lockDir string,
 	}
 	lk := &EnvLock{tr: tr, dir: lockDir}
 	if err := lk.writeOwner(ctx, owner); err != nil {
-		_ = lk.Release(context.Background())
+		// Cleanup must not hang and must not be silently ignored: a failed
+		// cleanup means an orphan lock that blocks the environment.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
+		defer cancel()
+		if cleanupErr := lk.Release(cleanupCtx); cleanupErr != nil {
+			return nil, fmt.Errorf("lock: record owner in %s: %w (cleanup also failed: %v — an orphan lock may remain and requires manual removal)", lockDir, err, cleanupErr)
+		}
 		return nil, fmt.Errorf("lock: record owner in %s: %w", lockDir, err)
 	}
 	return lk, nil
