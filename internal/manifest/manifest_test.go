@@ -153,6 +153,8 @@ func TestParseRejectionsSingleFault(t *testing.T) {
 		{name: "release ref outside releases", doc: fault(t, validEnvironment(), ".deploy/releases/my-app-0.1.0.yaml", ".deploy/environments/my-app-0.1.0.yaml"), want: "/spec/release"},
 		{name: "release ref nested", doc: fault(t, validEnvironment(), ".deploy/releases/my-app-0.1.0.yaml", ".deploy/releases/sub/my-app-0.1.0.yaml"), want: "/spec/release"},
 		{name: "missing environment target", doc: fault(t, validEnvironment(), "  target: production-primary\n", ""), want: "'target'"},
+		{name: "removed autoRollback always", doc: fault(t, validEnvironment(), "  target: production-primary\n", "  target: production-primary\n  failurePolicy:\n    autoRollback: always\n"), want: "autoRollback"},
+		{name: "unknown autoRollback", doc: fault(t, validEnvironment(), "  target: production-primary\n", "  target: production-primary\n  failurePolicy:\n    autoRollback: if-in-doubt\n"), want: "autoRollback"},
 		{name: "provider leak", doc: fault(t, validTarget(), "    credentialFrom: DEPLOY_SSH_KEY\n", "    credentialFrom: DEPLOY_SSH_KEY\n    provider: netcup\n"), want: "provider"},
 		{name: "unpinned host key", doc: fault(t, validTarget(), "    hostKeyFrom: DEPLOY_HOST_KEY\n", ""), want: "hostKeyFrom"},
 	}

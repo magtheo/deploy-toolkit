@@ -132,8 +132,8 @@ Two facts are deliberately kept apart:
 
 The lifecycle layer writes the marker before the first consequential stage
 (migrate) and removes it only when the attempt is **reconciled to trusted
-observed state**: observed state committed, or explicit recovery (step 10).
-Everything else keeps the marker — including *determined* hook failures.
+observed state**: observed state committed, or explicit recovery (the
+rollback operation). Everything else keeps the marker — including *determined* hook failures.
 That is deliberate: a migration can partially mutate state and then exit 1,
 so "known failure" is not "safe to repeat consequential work". Failures
 before the marker exists (validate, stage, contract verification,
@@ -144,8 +144,8 @@ commit — the marker survives, and the next normal deployment **refuses**
 with a recovery-required outcome instead of re-running migrate/apply into
 a target whose state is unknown.
 
-Resolution is explicit — recovery/rollback (step 10) — with one
-self-healing case: if the marker describes exactly the requested release
+Resolution is explicit — the rollback operation, bound to the recorded
+attempt's identities — with one self-healing case: if the marker describes exactly the requested release
 and digest AND committed observed state shows that same release with that
 same digest, the attempt demonstrably reached its terminal and the
 leftover marker is cleared. A marker for a *different* target release is

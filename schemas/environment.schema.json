@@ -32,7 +32,11 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "autoRollback": { "enum": ["off", "safe-only", "always"], "default": "safe-only" }
+            "autoRollback": {
+              "enum": ["off", "safe-only"],
+              "default": "safe-only",
+              "$comment": "off: never roll back automatically. safe-only: automatic rollback only when the failed release's migration.rollbackSafe is true. Emergency/manual recovery is a separate explicit authority path and is deliberately not overloaded into this policy."
+            }
           }
         }
       }

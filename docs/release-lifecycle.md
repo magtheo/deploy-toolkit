@@ -175,8 +175,8 @@ partially apply and then exit 1: known failure is not safe-to-repeat. A
 deployment that ends while the marker exists cannot be retried normally:
 the next `Deploy` **refuses** with a recovery-required outcome instead of
 re-running migrations or applies into a target whose state is unknown.
-Resolution is explicit — recovery/rollback (step 10) — with one
-self-healing case: committed observed state matching exactly the
+Resolution is explicit — the rollback operation, bound to the recorded
+attempt's identities — with one self-healing case: committed observed state matching exactly the
 requested release and digest proves the attempt finished, and the leftover
 marker is cleared. Failures before the marker exists (validate, stage,
 contract verification, preflight) involved no consequential work and stay
@@ -190,22 +190,63 @@ history never manufactures facts.
 ### Failure handling
 
 ```
-failure
+failure (post-consequence: attempt marker exists)
    │
-   ├── rollbackSafe = true  and env policy permits
-   │       → rollback
-   │       → verify previous release
+   ├── auto policy permits (env safe-only + failed release rollbackSafe)
+   │       → automatic recovery rollback of the failed release
+   │       → verify restored release → commit observed state
    │
    └── otherwise
-           → STOP + FAIL LOUDLY
+           → STOP + FAIL LOUDLY (environment stays recovery-required)
 ```
 
 `migration.rollbackSafe: false` or `failurePolicy.autoRollback: off` always
-wins: no silent undo of an unsafe state.
+wins: no silent undo of an unsafe state. `migration.mode: irreversible`
+refuses rollback for every authorization path. Failures before the attempt
+marker exists (validate, stage, contract verification, preflight) did no
+consequential work and stay retryable.
 
-## Rollback
+## Rollback and recovery
 
-**Normal** rollback is the same promotion machinery with a reverse diff:
+Rollback is a **distinct lifecycle operation**, not a call to normal
+Deploy. After a failed `A → B`, observed state may still say `A` while
+production partly or fully runs `B`; normal Deploy's idempotency guard
+would answer "already-current" and never restore `A`. Rollback forces the
+known previous release back and verifies it, holding the same environment
+lock for the whole recovery.
+
+Three authorization paths share one engine (recorded as evidence):
+
+- **Recovery** — resolving a recorded unresolved attempt. The failed
+  release must equal `attempt.toRelease` (+ pinned bundle digest); the
+  restored release must equal `attempt.fromRelease` and committed observed
+  state.
+- **Auto** — pre-authorized by `failurePolicy.autoRollback: safe-only`
+  plus `rollbackSafe: true` on the failed release; also requires an
+  unresolved attempt (nothing to undo otherwise). `off` and
+  `rollbackSafe: false` always win; `irreversible` is refused for every
+  path.
+- **Manual/emergency** — explicit operator invocation; may act without an
+  unresolved attempt (e.g. production healthy on B but must return to A).
+  A recovery marker is created before the first consequential stage, so
+  the emergency rollback itself is crash-safe.
+
+Hook ownership follows responsibility: the failed release's staged
+contract supplies its optional `rollback` hook (run only when its
+migration mode is not `none`) and the rollback-safety claims; the restored
+release's staged contract supplies `preflight`, `apply`, and the mandatory
+`verify`. The restored release's forward `migrate` is never run as an undo
+mechanism.
+
+The attempt marker survives any rollback failure — a rollback's own
+outcome can be unresolved too — and is cleared only after the restored
+release verifies and observed state commits. Auto/manual rollbacks that
+leave Git desired state pointing at the failed release produce structured
+evidence (`rollback.succeeded` with from/to identities); the reconciliation
+PR is step 11 (GitHub wiring), not the lifecycle engine.
+
+**Normal** rollback of a *healthy* deployment remains ordinary promotion
+with a reverse diff:
 
 ```diff
  spec:
@@ -241,9 +282,10 @@ GitHub Deployments         audit / UI projection
 2. ~~Contract hardening: single parse pipeline, source identity, untagged OCI names, semantic invariants, CI~~ **done**
 3. ~~Release eligibility + immutable artifact resolution (`release create`)~~ **done**
 4. ~~Generated promotion PR flow (`promotion propose` + Promotion Diff Policy)~~ **done**
-5. `local` transport (deterministic integration tests)
-6. SSH transport (strict host verification)
-7. Server-side staging, observed state, history
-8. Lifecycle execution + verification
-9. Rollback (normal + emergency + reconcile)
+5. ~~`local` transport (deterministic integration tests)~~ **done**
+6. ~~SSH transport (strict host verification)~~ **done**
+7. ~~Server-side staging, observed state, history~~ **done**
+8. ~~Lifecycle execution + verification~~ **done**
+9. ~~Rollback/recovery engine (recovery + auto + manual authorization paths)~~ **done**
 10. `platform-core` integration, then `examples/static-site`
+11. GitHub wiring: reconcile PRs after auto/emergency rollback, workflow + CLI surfacing

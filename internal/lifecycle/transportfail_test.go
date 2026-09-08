@@ -58,7 +58,8 @@ func TestDeployTransportFailureIsInfraError(t *testing.T) {
 	// apply.sh exits non-zero is a hook failure (nil error, report).
 	// The SSH connection dying during apply is NOT a hook failure — it
 	// must surface as an infrastructure error so that rollback policy
-	// (step 10) never reads "server unreachable" as "apply failed".
+	// (the rollback operation) never reads "server unreachable" as
+	// "apply failed".
 	f := newFixture(t, "my-app", nil)
 	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
 	tr := &failingRunTransport{

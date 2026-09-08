@@ -10,7 +10,6 @@ import (
 
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
 	"github.com/magtheo/deploy-toolkit/internal/target"
-	"github.com/magtheo/deploy-toolkit/internal/transport"
 )
 
 // StageResult is one lifecycle hook's outcome. Stdout/Stderr are returned
@@ -143,9 +142,9 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		// consequential deployment has not been reconciled to trusted
 		// observed state: a migration can partially apply and then exit 1,
 		// so "known failure" is not "safe to repeat consequential work".
-		// The marker survives until explicit recovery (step 10) resolves
-		// it, or until committed observed state proves the attempt
-		// finished (the self-heal below). Failures before the marker is
+		// The marker survives until explicit recovery (the rollback
+		// operation) resolves it, or until committed observed state proves
+		// the attempt finished (the self-heal below). Failures before the marker is
 		// written — validate, stage, contract, preflight — leave no
 		// marker and remain retryable.
 		if herr := recordOutcome(ctx, in, now, rep, "deploy.failed"); herr != nil {
@@ -175,7 +174,7 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	// trusted facts resolve it: committed observed state for this exact
 	// release (the attempt did finish — heal the leftover marker), or
 	// nothing — in which case normal retry is refused until explicit
-	// recovery (step 10) resolves the attempt.
+	// recovery (the rollback operation) resolves the attempt.
 	attempt, aerr := in.Target.ReadAttempt(ctx, rep.Project, rep.Environment)
 	if aerr != nil && !errors.Is(aerr, target.ErrAttemptAbsent) {
 		return rep, fmt.Errorf("read attempt marker: %w", aerr)
@@ -249,24 +248,12 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	// The lifecycle contract comes from the STAGED release, byte for byte:
 	// read what actually landed on the target, hash it, match it against
 	// the release's pinned digest, and parse THAT manifest for hooks.
-	releaseDir, err := layout.ReleaseDir(rep.Project, rep.Version)
+	stagedProject, err := verifyStagedContract(ctx, in.Target, rel)
 	if err != nil {
-		return rep, err
-	}
-	contractBytes, err := in.Target.ReadFile(ctx, releaseDir+"/.deploy/project.yaml")
-	if err != nil {
+		if errors.Is(err, errContractRefused) {
+			return failDeployment(err.Error())
+		}
 		return failInfra("staged deployment contract unreadable", err)
-	}
-	if digestOf(contractBytes) != rel.DeploymentContract.Digest {
-		return failDeployment(fmt.Sprintf("staged deployment contract digest %s does not match the release pin %s", digestOf(contractBytes), rel.DeploymentContract.Digest))
-	}
-	parsed, err := manifest.Parse(contractBytes, manifest.KindProject)
-	if err != nil {
-		return failDeployment(fmt.Sprintf("staged deployment contract is not a valid project manifest: %v", err))
-	}
-	stagedProject := parsed.Project
-	if stagedProject.Metadata.Name != rep.Project {
-		return failDeployment(fmt.Sprintf("staged deployment contract is for project %q, deploying %q", stagedProject.Metadata.Name, rep.Project))
 	}
 	rep.ContractVerified = true
 	if stagedProject.Lifecycle.Verify == nil {
@@ -274,33 +261,19 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		// must never advance on a skipped verification.
 		return failDeployment("staged deployment contract declares no verify hook; verify is mandatory")
 	}
+	releaseDir, err := layout.ReleaseDir(rep.Project, rep.Version)
+	if err != nil {
+		return rep, err
+	}
 
 	henv, err := hookEnv(rel, rep.Environment)
 	if err != nil {
 		return rep, fmt.Errorf("hook environment: %w", err)
 	}
 
-	// runStage preserves the transport contract: exit codes are hook
-	// outcomes, Run errors are infrastructure errors.
+	// Exit codes are hook outcomes; Run errors are infrastructure errors.
 	runStage := func(name string, step *manifest.LifecycleStep) (StageResult, error) {
-		if step == nil {
-			return StageResult{Name: name, Skipped: true}, nil
-		}
-		res, err := in.Target.Transport().Run(ctx, transport.RunRequest{
-			Argv: step.Argv,
-			Dir:  releaseDir,
-			Env:  henv,
-		})
-		if err != nil {
-			return StageResult{Name: name, Failed: true, InfraError: true}, err
-		}
-		return StageResult{
-			Name:     name,
-			ExitCode: res.ExitCode,
-			Failed:   res.ExitCode != 0,
-			Stdout:   res.Stdout,
-			Stderr:   res.Stderr,
-		}, nil
+		return runStageStep(ctx, in.Target.Transport(), name, releaseDir, henv, step)
 	}
 
 	// Staging is non-impacting; preflight decides whether the staged

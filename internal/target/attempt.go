@@ -19,17 +19,21 @@ var ErrAttemptAbsent = errors.New("attempt: no unresolved attempt")
 
 // AttemptMarker is a durable, environment-scoped recovery fact. It is
 // written by the lifecycle layer BEFORE the first consequential stage and
-// removed only when the attempt reaches a trusted terminal: observed state
-// committed, or a determined hook failure. Its presence therefore means:
+// removed only when the attempt has been reconciled to trusted observed
+// state: observed state committed (by the attempt itself or by an
+// explicit recovery rollback), or explicit recovery resolving it. A
+// determined hook failure does NOT remove it — a migration can partially
+// apply and then exit 1, so "known failure" is not "safe to repeat
+// consequential work". Its presence therefore means:
 //
-//	the previous deployment may have performed consequential work
-//	(migrations, applies) and its outcome is UNRESOLVED.
+//	a consequential deployment has NOT been reconciled to
+//	trusted observed state; its outcome is UNRESOLVED.
 //
 // This is deliberately a different fact from the environment lock: the
 // lock means "someone may be executing now"; the attempt marker means
 // "the previous result is unresolved, recovery is required". Normal
-// deployments refuse while it exists; explicit recovery (step 10) resolves
-// it.
+// deployments refuse while it exists; explicit recovery (rollback)
+// resolves it.
 type AttemptMarker struct {
 	Schema       string `json:"schema"`
 	AttemptID    string `json:"attemptId"` // random 16-hex attempt identity

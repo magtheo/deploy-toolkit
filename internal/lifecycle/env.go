@@ -2,12 +2,16 @@ package lifecycle
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
+	"github.com/magtheo/deploy-toolkit/internal/target"
+	"github.com/magtheo/deploy-toolkit/internal/transport"
 )
 
 // hookDefaultPATH is the complete PATH hooks receive. The hook environment
@@ -75,6 +79,62 @@ func marshalJSON(v any) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// runStageStep executes one lifecycle hook and preserves the transport
+// contract shared by Deploy and Rollback: a non-zero exit code is a hook
+// outcome (reported, nil error); a Transport.Run error is an
+// infrastructure error (the command may or may not have executed, and no
+// exit code exists — never manufacture one).
+func runStageStep(ctx context.Context, tr transport.Transport, name, dir string, henv map[string]string, step *manifest.LifecycleStep) (StageResult, error) {
+	if step == nil {
+		return StageResult{Name: name, Skipped: true}, nil
+	}
+	res, err := tr.Run(ctx, transport.RunRequest{Argv: step.Argv, Dir: dir, Env: henv})
+	if err != nil {
+		return StageResult{Name: name, Failed: true, InfraError: true}, err
+	}
+	return StageResult{
+		Name:     name,
+		ExitCode: res.ExitCode,
+		Failed:   res.ExitCode != 0,
+		Stdout:   res.Stdout,
+		Stderr:   res.Stderr,
+	}, nil
+}
+
+// errContractRefused marks a staged-contract violation: an outcome of the
+// operation (recorded, no hooks run), not an infrastructure failure.
+var errContractRefused = errors.New("staged deployment contract refused")
+
+// verifyStagedContract proves that the staged release directory still
+// carries exactly the release's pinned deployment contract — read from the
+// TARGET, hashed, matched against Release.deploymentContract.digest, then
+// parsed through the one manifest pipeline — and returns the parsed
+// contract. The lifecycle that runs is the one staged at this revision,
+// never main's current state. Unreadable contract bytes are an
+// infrastructure failure; any mismatch or invalid manifest is
+// errContractRefused.
+func verifyStagedContract(ctx context.Context, tgt *target.Target, rel *manifest.Release) (*manifest.Project, error) {
+	releaseDir, err := tgt.Layout().ReleaseDir(rel.Metadata.Project, rel.Metadata.Version)
+	if err != nil {
+		return nil, err
+	}
+	contractBytes, err := tgt.ReadFile(ctx, releaseDir+"/.deploy/project.yaml")
+	if err != nil {
+		return nil, fmt.Errorf("staged deployment contract unreadable: %w", err)
+	}
+	if digestOf(contractBytes) != rel.DeploymentContract.Digest {
+		return nil, fmt.Errorf("%w: digest %s does not match the release pin %s", errContractRefused, digestOf(contractBytes), rel.DeploymentContract.Digest)
+	}
+	parsed, err := manifest.Parse(contractBytes, manifest.KindProject)
+	if err != nil {
+		return nil, fmt.Errorf("%w: not a valid project manifest: %v", errContractRefused, err)
+	}
+	if parsed.Project.Metadata.Name != rel.Metadata.Project {
+		return nil, fmt.Errorf("%w: contract is for project %q, operating on %q", errContractRefused, parsed.Project.Metadata.Name, rel.Metadata.Project)
+	}
+	return parsed.Project, nil
 }
 
 func digestOf(b []byte) string {

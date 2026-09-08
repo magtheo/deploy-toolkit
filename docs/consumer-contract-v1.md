@@ -178,7 +178,11 @@ Rules (v1 promise):
     artifact name uppercased with `-`→`_`, value `<image>@<digest>`. Hooks
     are pinned to the exact Release artifacts without copying the Release
     manifest into the bundle;
-  - for `rollback` (step 10): the release being rolled back to.
+  - every hook sees the identity of the release whose staged directory it
+    executes in: during a rollback, the failed release's `rollback` hook
+    sees the failed release's identity (it is that release's undo), while
+    the restored release's `preflight`/`apply`/`verify` see the restored
+    release's identity.
 - Lifecycle execution holds a **cross-process, target-scoped environment
   lock** for the whole sequence (atomic `mkdir` on the target; a held lock
   fails closed; no stale-lock breaking — a crashed runner leaves the lock
@@ -225,6 +229,59 @@ rollbackSafe: true` cannot validate.
 Migration semantics are declared by the project/release, never inferred.
 `forward-compatible` vs `irreversible` is a semantic claim about the
 application's database; deployctl must not guess it.
+
+## Failure policy (automatic rollback)
+
+The Environment's `failurePolicy.autoRollback` pre-authorizes exactly one
+thing: an automatic recovery rollback after a failed deployment. v1 has
+two values — `always` was removed from the candidate contract before any
+consumer depended on it, because `safe-only` + `rollbackSafe: false` and
+`always` had no distinguishable, safety-preserving meaning:
+
+| Value        | Meaning                                                                    |
+| ------------ | -------------------------------------------------------------------------- |
+| `off`        | Never roll back automatically. Stop and fail loudly.                       |
+| `safe-only`  | Automatic rollback only when the failed release's `migration.rollbackSafe` is `true`. |
+
+Default: `safe-only`. Neither value overrides the release's own claims:
+`rollbackSafe: false` disables automatic rollback, and `irreversible`
+refuses rollback for **every** authorization path — the toolkit will not
+pretend an irreversible migration can be undone. Manual/emergency recovery
+is a separate explicit authority path and is deliberately not overloaded
+into this policy.
+
+## Rollback contract
+
+Rollback is a distinct lifecycle operation, not a call to normal Deploy:
+after a failed `A → B` attempt, observed state may still say `A` while
+production partly or fully runs `B` — normal Deploy's idempotency guard
+would answer "already-current" and never restore `A`. Rollback forces the
+known previous release back into place and verifies it.
+
+Three authorization paths share one deterministic engine; the authority is
+recorded in history evidence:
+
+| Path         | Authority                                          | Unresolved attempt required |
+| ------------ | -------------------------------------------------- | --------------------------- |
+| `recovery`   | explicit recovery of a recorded attempt            | yes                         |
+| `auto`       | `failurePolicy.autoRollback: safe-only` + `rollbackSafe: true` | yes             |
+| `manual`     | explicit operator/emergency invocation             | no (one is created)         |
+
+Semantic ownership of hooks: the **failed** release's staged contract
+supplies its optional `rollback` hook (B knows how to undo B's own
+consequences, above all its migration — run only when
+`migration.mode ≠ none`) and its `rollbackSafe`/`irreversible` claims. The
+**restored** release's staged contract supplies `preflight`, `apply` and
+the mandatory `verify` (A knows how to install and verify A). The restored
+release's forward `migrate` hook is never run as an undo mechanism.
+
+Bindings are evidential, not advisory: with an unresolved attempt, the
+rollback source must equal `attempt.toRelease` + its pinned bundle digest,
+and the restore target must equal `attempt.fromRelease` and committed
+observed state. Without one (manual), observed state must equal the
+release being undone. The attempt marker survives every failure — a
+rollback's own outcome can be unresolved too — and is cleared only after
+the restored release verifies and observed state commits.
 
 ## Target contract
 

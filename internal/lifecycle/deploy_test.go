@@ -81,6 +81,7 @@ func newFixture(t *testing.T, project string, hooks func(marker, envFile, script
 	mustWrite("deploy/migrate.sh", hookBody("migrate"))
 	mustWrite("deploy/apply.sh", hookBody("apply"))
 	mustWrite("deploy/verify.sh", hookBody("verify"))
+	mustWrite("deploy/rollback.sh", hookBody("rollback"))
 	mustWrite(".deploy/project.yaml", fmt.Sprintf(`apiVersion: deploy.toolkit/v1
 kind: Project
 metadata:
@@ -108,6 +109,8 @@ lifecycle:
     argv: ["./deploy/apply.sh"]
   verify:
     argv: ["./deploy/verify.sh"]
+  rollback:
+    argv: ["./deploy/rollback.sh"]
 `, project, project))
 	git(t, repoDir, "add", "-A")
 	git(t, repoDir, "commit", "-q", "-m", "fixture")
@@ -130,7 +133,14 @@ lifecycle:
 }
 
 func (f *fixture) release(project, version string) *manifest.Release {
-	res, err := f.bundler.BuildFromRevision(context.Background(), f.revision)
+	return f.releaseAt(f.revision, project, version)
+}
+
+// releaseAt builds a Release for a specific revision — two revisions of
+// the same project produce different bundle bytes and therefore different
+// digests, which is how tests create a second genuine release identity.
+func (f *fixture) releaseAt(rev, project, version string) *manifest.Release {
+	res, err := f.bundler.BuildFromRevision(context.Background(), rev)
 	if err != nil {
 		return nil
 	}
@@ -138,7 +148,7 @@ func (f *fixture) release(project, version string) *manifest.Release {
 		APIVersion: manifest.APIVersion,
 		Kind:       manifest.KindRelease,
 		Metadata:   manifest.ReleaseMetadata{Project: project, Version: version},
-		Source:     manifest.ReleaseSource{Type: manifest.SourceGitHub, Repository: "example/" + project, Revision: f.revision},
+		Source:     manifest.ReleaseSource{Type: manifest.SourceGitHub, Repository: "example/" + project, Revision: rev},
 		Artifacts: map[string]manifest.BuiltArtifact{
 			"app": {Type: "oci", Image: "ghcr.io/example/app", Digest: "sha256:" + strings.Repeat("aa", 32)},
 		},
@@ -196,11 +206,16 @@ func requireNoLock(t *testing.T, f *fixture) {
 // canonical bytes cross into the deployment operation.
 func (f *fixture) preparedBytes(t *testing.T, project, version string) (*manifest.Release, []byte) {
 	t.Helper()
-	res, err := f.bundler.BuildFromRevision(t.Context(), f.revision)
+	return f.preparedBytesAt(t, f.revision, project, version)
+}
+
+func (f *fixture) preparedBytesAt(t *testing.T, rev, project, version string) (*manifest.Release, []byte) {
+	t.Helper()
+	res, err := f.bundler.BuildFromRevision(t.Context(), rev)
 	if err != nil {
 		t.Fatalf("prepare: build bundle: %v", err)
 	}
-	rel := f.release(project, version)
+	rel := f.releaseAt(rev, project, version)
 	return rel, res.Bytes
 }
 

@@ -10,6 +10,14 @@ type EnvironmentMetadata struct {
 	Name string `yaml:"name" json:"name"`
 }
 
+// Automatic-rollback policy values (failurePolicy.autoRollback). Manual and
+// promotion-driven recovery are separate explicit authority paths and are
+// deliberately not represented here.
+const (
+	AutoRollbackOff      = "off"
+	AutoRollbackSafeOnly = "safe-only"
+)
+
 type FailurePolicy struct {
 	AutoRollback string `yaml:"autoRollback" json:"autoRollback"`
 }
@@ -29,7 +37,7 @@ type Environment struct {
 
 func (e *Environment) AutoRollback() string {
 	if e.Spec.FailurePolicy == nil || e.Spec.FailurePolicy.AutoRollback == "" {
-		return "safe-only"
+		return AutoRollbackSafeOnly
 	}
 	return e.Spec.FailurePolicy.AutoRollback
 }
@@ -37,6 +45,15 @@ func (e *Environment) AutoRollback() string {
 func (e *Environment) check() error {
 	if err := checkReleaseRef(e.Spec.Release); err != nil {
 		return fmt.Errorf("spec.release: %w", err)
+	}
+	// Defense in depth: the schema already restricts the enum, but the
+	// policy gates rollback authorization, so the parsed value is
+	// validated here too. Anything unrecognized fails validation — never
+	// silently treated as a permissive default.
+	switch e.AutoRollback() {
+	case AutoRollbackOff, AutoRollbackSafeOnly:
+	default:
+		return fmt.Errorf("spec.failurePolicy.autoRollback %q is not one of [%s, %s]", e.AutoRollback(), AutoRollbackOff, AutoRollbackSafeOnly)
 	}
 	return nil
 }

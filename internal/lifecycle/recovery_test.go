@@ -109,7 +109,7 @@ func TestDeployUncertainCommitRetryIsRefused(t *testing.T) {
 	}
 	requireNoLock(t, f)
 
-	// Explicit recovery (operator/step 10) resolves the attempt.
+	// Explicit recovery (the rollback operation) resolves the attempt.
 	if err := f.target.ClearAttempt(t.Context(), "my-app", "production"); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,9 @@ func TestDeployTransportLossDuringApplyLeavesUnresolvedAttempt(t *testing.T) {
 	if !attemptPresent(t, f) {
 		t.Fatal("uncertain apply outcome must leave the attempt marker behind")
 	}
-	// Determined hook failures clear the marker; transport loss must not.
+	// Like any failure after the marker exists, the transport loss keeps
+	// the marker; only committed observed state or explicit recovery
+	// removes it. A normal retry therefore refuses.
 	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
 	if err != nil {
 		t.Fatal(err)

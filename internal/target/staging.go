@@ -149,15 +149,16 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 	return StageNew, nil
 }
 
-// VerifyStage proves that a staged release directory is the exact
-// immutable Release bundle: the supplied bytes must hash to the release's
-// pinned bundle digest, the marker must record that same identity and
-// digest, every expected file must be present with byte-identical content,
-// and executable / non-executable semantics must be intact. Rollback and
-// any reuse of staged material must pass here before executing anything
-// from the directory. Detection of *extra* files (runtime material added
-// after staging) is future work; expected-file integrity is complete, and
-// lifecycle hooks must not depend on undeclared release-directory files.
+// VerifyStage proves that a staged release directory may be trusted as
+// the release it claims to be: the supplied bytes must hash to the
+// release's pinned bundle digest, the marker must record that same
+// identity and digest, all canonical files must be present with
+// byte-identical content, and executable / non-executable semantics must
+// be intact. Rollback and any reuse of staged material must pass here
+// before executing anything from the directory. Scope: this proves all
+// canonical files are intact — it is not full tree equality, because
+// files ADDED after staging are not yet detected; lifecycle hooks must
+// not depend on undeclared release-directory files.
 func (t *Target) VerifyStage(ctx context.Context, rel *manifest.Release, bundle []byte) error {
 	if rel.Bundle.Digest == "" {
 		return fmt.Errorf("release %s %s pins no bundle digest", rel.Metadata.Project, rel.Metadata.Version)

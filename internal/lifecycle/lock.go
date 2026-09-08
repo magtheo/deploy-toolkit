@@ -2,7 +2,7 @@
 // target substrate and turns a promoted, human-authorized release into the
 // observed state of an environment.
 //
-// The sequence is fixed:
+// Deploy executes the forward sequence:
 //
 //	ACQUIRE cross-process environment lock
 //	  → VALIDATE desired Environment + Release
@@ -13,6 +13,14 @@
 //	  → WRITE observed state.current (only after verify succeeds)
 //	  → APPEND structured final history outcome
 //	  → RELEASE lock
+//
+// Rollback is the distinct recovery operation: it does not reuse Deploy
+// (after a failed A→B, observed state may still say A while production
+// partly runs B — Deploy's idempotency guard would never restore A). It
+// holds the same lock, binds both releases to the recorded attempt marker
+// and observed state, runs the failed release's rollback hook plus the
+// restored release's preflight/apply/verify, and clears the marker only
+// after the restored release verifies and observed state commits.
 //
 // Invariants carried from earlier phases: staged ≠ deployed, apply success
 // ≠ verified, verify success is what allows observed state to advance. The
