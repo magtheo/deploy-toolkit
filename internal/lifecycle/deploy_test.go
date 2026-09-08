@@ -493,10 +493,14 @@ func TestDeploySameVersionDifferentDigestRefused(t *testing.T) {
 	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(firstRun, ",") {
 		t.Errorf("hooks ran on drifted state: %v", got)
 	}
-	// The refusal is recorded as a fact.
+	// The refusal is recorded as a fact — with truthful staging evidence:
+	// nothing was staged for this attempt.
 	records := history(t, f)
 	if len(records) != 2 || records[1].Type != "deploy.failed" {
 		t.Fatalf("history = %+v", records)
+	}
+	if records[1].Data["staged"] != "not-attempted" {
+		t.Errorf("staged evidence = %#v, want not-attempted", records[1].Data["staged"])
 	}
 	requireNoLock(t, f)
 }

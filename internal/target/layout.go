@@ -73,6 +73,20 @@ func (l Layout) StatePath(project, env string) (string, error) {
 	return l.root + "/" + project + "/state/" + env + ".json", nil
 }
 
+// AttemptPath is the durable unresolved-attempt marker: evidence that the
+// previous deployment may have performed consequential work with an
+// unresolved outcome. Presence requires explicit recovery before any new
+// deployment of the environment.
+func (l Layout) AttemptPath(project, env string) (string, error) {
+	if err := checkSlug("project", project); err != nil {
+		return "", err
+	}
+	if err := checkSlug("environment", env); err != nil {
+		return "", err
+	}
+	return l.root + "/" + project + "/attempts/" + env + ".json", nil
+}
+
 // LockPath is the environment lock directory: acquired atomically with
 // mkdir (which wins exactly once on POSIX), released with rmdir. Locks
 // have no staleness semantics — a crashed runner leaves the lock for

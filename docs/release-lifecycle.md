@@ -162,6 +162,26 @@ Structured stage outcomes are recorded in the deployment history
 an audit/UI projection, never the source of truth. Raw hook stdout/stderr
 is returned to the caller for diagnosis but never persisted into history.
 
+### Uncertain outcomes: the attempt marker
+
+A transport loss during `migrate`/`apply`/`verify` — or a failed
+observed-state commit — leaves the attempt's outcome **unknown**: the
+service may already run the new release. Before the first consequential
+stage the lifecycle layer persists an environment-scoped attempt marker;
+it is removed only at a trusted terminal (state committed, or a determined
+hook failure). A deployment that dies while the marker exists cannot be
+retried normally: the next `Deploy` **refuses** with a recovery-required
+outcome instead of re-running migrations or applies into a target whose
+state is unknown. Resolution is explicit — recovery/rollback (step 10) —
+with one self-healing case: committed observed state matching the desired
+release proves the attempt finished, and the leftover marker is cleared.
+See `docs/target-state.md`.
+
+Evidence truthfulness is part of this contract: a stage that produced no
+hook outcome is recorded as an infrastructure error without an exit code,
+and staging that was never attempted is recorded as `not-attempted` —
+history never manufactures facts.
+
 ### Failure handling
 
 ```

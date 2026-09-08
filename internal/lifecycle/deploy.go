@@ -2,6 +2,8 @@ package lifecycle
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -25,8 +27,13 @@ type StageResult struct {
 	Skipped  bool
 	ExitCode int
 	Failed   bool
-	Stdout   []byte
-	Stderr   []byte
+	// InfraError marks a stage that produced NO hook outcome because the
+	// transport failed: the command may or may not have executed on the
+	// target, and no exit code exists. Evidence renders this as an
+	// infrastructure error, never as an exit code.
+	InfraError bool
+	Stdout     []byte
+	Stderr     []byte
 }
 
 // Report describes one deployment attempt. A completed attempt with a
@@ -44,6 +51,7 @@ type Report struct {
 	Stages           []StageResult
 	Committed        bool // observed state advanced (verify succeeded)
 	AlreadyCurrent   bool // desired release+digest already observed; nothing consequential ran
+	RecoveryRequired bool // an unresolved attempt marker exists; explicit recovery is needed
 	HistorySeq       int64
 	FailureReason    string
 }
@@ -130,6 +138,12 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 
 	failDeployment := func(reason string) (*Report, error) {
 		rep.FailureReason = reason
+		// A determined refusal is a trusted terminal: the attempt marker
+		// (if any) must go. Failure to clear keeps the environment in
+		// recovery-required — conservative and loud.
+		if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
+			return rep, fmt.Errorf("%s (and the attempt marker could not be cleared: %w — the environment stays in recovery-required)", reason, cerr)
+		}
 		if herr := recordOutcome(ctx, in, now, rep, "deploy.failed"); herr != nil {
 			return rep, errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("history outcome not recorded: %w", herr))
 		}
@@ -150,6 +164,35 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}
 	if errors.Is(err, target.ErrStateAbsent) {
 		observed = target.State{Project: rep.Project, Environment: rep.Environment}
+	}
+
+	// Unresolved-attempt check: a marker means the previous deployment may
+	// have performed consequential work with an unknown outcome. Two
+	// trusted facts resolve it: committed observed state for this exact
+	// release (the attempt did finish — heal the leftover marker), or
+	// nothing — in which case normal retry is refused until explicit
+	// recovery (step 10) resolves the attempt.
+	attempt, aerr := in.Target.ReadAttempt(ctx, rep.Project, rep.Environment)
+	if aerr != nil && !errors.Is(aerr, target.ErrAttemptAbsent) {
+		return rep, fmt.Errorf("read attempt marker: %w", aerr)
+	}
+	if aerr == nil {
+		if observed.Current != nil && observed.Current.Release == rep.Version && observed.Current.BundleDigest == rel.Bundle.Digest {
+			// The attempt reached its trusted terminal; the marker is a
+			// leftover from a crash between commit and cleanup.
+			if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
+				return rep, fmt.Errorf("clear stale attempt marker: %w", cerr)
+			}
+		} else {
+			rep.RecoveryRequired = true
+			cur := "none"
+			if observed.Current != nil {
+				cur = observed.Current.Release + "@" + observed.Current.BundleDigest
+			}
+			return failDeployment(fmt.Sprintf(
+				"unresolved deployment attempt %s (%s → %s, started %s) with observed state %s: consequential work may have executed and the outcome is unknown — explicit recovery is required before retrying",
+				attempt.AttemptID, attempt.FromRelease, attempt.ToRelease, attempt.StartedAt, cur))
+		}
 	}
 
 	// Idempotency guard: observed state is a decision input, not a log.
@@ -235,7 +278,7 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 			Env:  henv,
 		})
 		if err != nil {
-			return StageResult{Name: name, Failed: true}, err
+			return StageResult{Name: name, Failed: true, InfraError: true}, err
 		}
 		return StageResult{
 			Name:     name,
@@ -255,6 +298,30 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}
 	if sr.Failed {
 		return failDeployment("preflight failed")
+	}
+
+	// Durable attempt marker BEFORE the first consequential stage. From
+	// here until a trusted terminal, an interrupted attempt leaves this
+	// marker behind — and the next deployment refuses rather than
+	// re-running migrate/apply into an unknown target state.
+	attemptID, err := randomAttemptID()
+	if err != nil {
+		return rep, fmt.Errorf("generate attempt id: %w", err)
+	}
+	fromRelease := ""
+	if observed.Current != nil {
+		fromRelease = observed.Current.Release
+	}
+	if err := in.Target.WriteAttempt(ctx, target.AttemptMarker{
+		AttemptID:    attemptID,
+		Project:      rep.Project,
+		Environment:  rep.Environment,
+		FromRelease:  fromRelease,
+		ToRelease:    rep.Version,
+		BundleDigest: rel.Bundle.Digest,
+		StartedAt:    now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		return failInfra("attempt marker could not be persisted; refusing consequential work", err)
 	}
 
 	// Migration hooks follow the release's declared migration semantics:
@@ -299,14 +366,36 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}
 	observed.UpdatedAt = now().UTC().Format(time.RFC3339)
 	if err := in.Target.WriteState(ctx, observed); err != nil {
-		return rep, fmt.Errorf("commit observed state: %w", err)
+		// The state commit is the trusted terminal; failing here leaves
+		// the outcome uncertain (the service may be on the new release
+		// while observed state says otherwise). The attempt marker stays,
+		// so a retry is refused until recovery — never re-run blindly.
+		return failInfra("observed state commit failed", err)
 	}
 	rep.Committed = true
 
+	// Trusted terminal reached: clear the attempt marker. A failure here
+	// is loud but self-healing — the next deployment sees committed state
+	// matching desired and clears the leftover.
+	if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
+		err = errors.Join(fmt.Errorf("observed state committed, but the attempt marker could not be cleared: %w", cerr))
+		if herr := recordOutcome(ctx, in, now, rep, "deploy.succeeded"); herr != nil {
+			return rep, errors.Join(err, fmt.Errorf("history outcome not recorded: %w", herr))
+		}
+		return rep, err
+	}
 	if err := recordOutcome(ctx, in, now, rep, "deploy.succeeded"); err != nil {
 		return rep, fmt.Errorf("record history outcome: %w", err)
 	}
 	return rep, nil
+}
+
+func randomAttemptID() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
 func recordOutcome(ctx context.Context, in DeployInput, now func() time.Time, rep *Report, kind string) error {
@@ -354,15 +443,19 @@ func validateDesired(in DeployInput) error {
 func outcomeData(rep *Report, in DeployInput) map[string]any {
 	stages := make(map[string]any, len(rep.Stages))
 	for _, s := range rep.Stages {
-		if s.Skipped {
+		switch {
+		case s.Skipped:
 			stages[s.Name] = "skipped"
-			continue
+		case s.InfraError:
+			// No exit code exists — never manufacture one.
+			stages[s.Name] = map[string]any{"infrastructureError": true}
+		default:
+			entry := map[string]any{"exit": s.ExitCode}
+			if s.Failed {
+				entry["failed"] = true
+			}
+			stages[s.Name] = entry
 		}
-		entry := map[string]any{"exit": s.ExitCode}
-		if s.Failed {
-			entry["failed"] = true
-		}
-		stages[s.Name] = entry
 	}
 	data := map[string]any{
 		"project":          rep.Project,
@@ -377,6 +470,9 @@ func outcomeData(rep *Report, in DeployInput) map[string]any {
 	}
 	if rep.AlreadyCurrent {
 		data["alreadyCurrent"] = true
+	}
+	if rep.RecoveryRequired {
+		data["recoveryRequired"] = true
 	}
 	if rep.Committed {
 		data["committed"] = true

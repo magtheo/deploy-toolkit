@@ -15,6 +15,8 @@ configuration:
     <deployRoot>/<project>/releases/<version>/    staged release trees
     <deployRoot>/<project>/state/<env>.json       observed state snapshot
     <deployRoot>/<project>/history/<env>.jsonl    durable history log
+    <deployRoot>/<project>/attempts/<env>.json    unresolved-attempt marker
+    <deployRoot>/<project>/.locks/<env>/          environment lock
 
 ## Release staging
 
@@ -118,6 +120,46 @@ record, not tamper-proof evidence.
 The history log records facts ("stage completed", "deploy started",
 "verification failed") — it does not decide anything. Authorization remains
 where it has always been: the human merge of the promotion PR.
+
+## Attempt markers: recovery versus concurrency
+
+Two facts are deliberately kept apart:
+
+- the **environment lock** (`.locks/<env>/`) means *someone may be executing
+  right now* — active concurrency control;
+- the **attempt marker** (`attempts/<env>.json`) means *the previous result
+  is unresolved* — a recovery fact.
+
+The lifecycle layer writes the marker before the first consequential stage
+(migrate) and removes it only at a trusted terminal: observed state
+committed, or a determined hook failure. If a deployment dies after
+consequential work but before observed state commits — a transport loss
+during migrate/apply/verify, a failed state commit — the marker survives,
+and the next normal deployment **refuses** with a recovery-required outcome
+instead of re-running migrate/apply into a target whose state is unknown.
+
+Recovery is explicit: an operator (or step 10's rollback/recovery
+machinery) resolves the attempt. One self-healing case is recognized: if
+committed observed state already matches the desired release and digest,
+the attempt demonstrably reached its terminal and the leftover marker is
+cleared automatically.
+
+The marker is strict metadata — one JSON value, schema-validated
+(`toolkit.attempt/v1`): attempt id, from/to release, bundle digest,
+start time. A corrupt marker fails closed, never silently counts as
+absent.
+
+## Reused staged material is verified, not trusted
+
+`StageAlreadyStaged` is only returned after the existing release directory
+has been proven to still contain exactly the canonical bundle: every
+expected file byte-identical, executable semantics intact, marker identity
+and digest matching. A `.staged.json` assertion from yesterday is not
+evidence that yesterday's bytes are still there — altered staged material
+is never executed or reused. `Target.VerifyStage` exposes the same proof
+for any consumer of an old release directory (rollback candidates above
+all). Detection of *extra* files added after staging is future work;
+expected-file integrity is complete.
 
 ## Concurrency constraint on the lifecycle layer
 

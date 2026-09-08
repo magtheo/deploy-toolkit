@@ -15,20 +15,21 @@ import (
 // failingRunTransport fails Run for selected programs — the SSH-connection-
 // died shape. Put and every other Run pass through to the local transport.
 type failingRunTransport struct {
-	inner    transport.Transport
-	failWhen func(argv0 string) bool
-	failPut  bool
+	inner       transport.Transport
+	failWhen    func(argv0 string) bool
+	failPut     bool
+	failPutWhen func(path string) bool
 }
 
 func (t *failingRunTransport) Put(ctx context.Context, req transport.PutRequest) error {
-	if t.failPut {
+	if t.failPut || (t.failPutWhen != nil && t.failPutWhen(req.Path)) {
 		return fmt.Errorf("disk full")
 	}
 	return t.inner.Put(ctx, req)
 }
 
 func (t *failingRunTransport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
-	if t.failWhen(req.Argv[0]) {
+	if t.failWhen != nil && t.failWhen(req.Argv[0]) {
 		return transport.RunResult{}, fmt.Errorf("ssh connection died mid-deployment")
 	}
 	return t.inner.Run(ctx, req)
@@ -88,10 +89,23 @@ func TestDeployTransportFailureIsInfraError(t *testing.T) {
 	if rep == nil || rep.Committed {
 		t.Errorf("rep = %+v, want uncommitted report", rep)
 	}
-	// The infrastructure failure is still recorded as a fact.
+	// The infrastructure failure is still recorded as a fact — and the
+	// evidence model is truthful: apply produced NO exit code.
 	records := history(t, f)
 	if len(records) != 1 || records[0].Type != "deploy.failed" {
 		t.Fatalf("history = %+v", records)
+	}
+	stages, _ := records[0].Data["stages"].(map[string]any)
+	applyEntry, _ := stages["apply"].(map[string]any)
+	if applyEntry == nil || applyEntry["infrastructureError"] != true {
+		t.Fatalf("apply in history = %#v, want infrastructureError without an exit code", stages["apply"])
+	}
+	if _, hasExit := applyEntry["exit"]; hasExit {
+		t.Errorf("apply in history manufactures an exit code: %#v", applyEntry)
+	}
+	// Stages that did run report real exit codes.
+	if pf, _ := stages["preflight"].(map[string]any); pf == nil || fmt.Sprint(pf["exit"]) != "0" {
+		t.Errorf("preflight in history = %#v, want exit 0", stages["preflight"])
 	}
 	requireNoLock(t, f)
 }

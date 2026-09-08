@@ -1,6 +1,7 @@
 package target
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -21,16 +22,23 @@ const stagedSchemaV1 = "toolkit.staged/v1"
 type StageStatus int
 
 const (
+	// StageNotAttempted: no stage was attempted (e.g. the attempt was
+	// refused before staging). Explicit so evidence never renders a
+	// refusal as "new".
+	StageNotAttempted StageStatus = iota
 	// StageNew: the release was not staged before and is now staged.
-	StageNew StageStatus = iota
+	StageNew
 	// StageAlreadyStaged: the exact release (same bundle digest) was
-	// already staged; nothing was written. Staging the same release
+	// already staged AND the staged material still verifies against the
+	// canonical bundle; nothing was written. Staging the same release
 	// twice is idempotent.
 	StageAlreadyStaged
 )
 
 func (s StageStatus) String() string {
 	switch s {
+	case StageNotAttempted:
+		return "not-attempted"
 	case StageNew:
 		return "new"
 	case StageAlreadyStaged:
@@ -75,34 +83,41 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 	markerPath := releaseDir + "/" + stagedMarkerName
 
 	if rel.Bundle.Digest == "" {
-		return StageNew, fmt.Errorf("release %s %s pins no bundle digest", rel.Metadata.Project, rel.Metadata.Version)
+		return StageNotAttempted, fmt.Errorf("release %s %s pins no bundle digest", rel.Metadata.Project, rel.Metadata.Version)
 	}
 	actual := digestOf(bundle)
 	if actual != rel.Bundle.Digest {
-		return StageNew, fmt.Errorf("refusing to stage %s %s: bundle bytes hash to %s but the release pins %s", rel.Metadata.Project, rel.Metadata.Version, actual, rel.Bundle.Digest)
+		return StageNotAttempted, fmt.Errorf("refusing to stage %s %s: bundle bytes hash to %s but the release pins %s", rel.Metadata.Project, rel.Metadata.Version, actual, rel.Bundle.Digest)
 	}
 
 	present, err := t.exists(ctx, releaseDir)
 	if err != nil {
-		return StageNew, err
+		return StageNotAttempted, err
 	}
 	if present {
 		m, err := t.readMarker(ctx, markerPath)
 		if err != nil {
-			return StageNew, fmt.Errorf("release directory %s exists but is not a complete stage (interrupted stages must be removed manually): %w", releaseDir, err)
+			return StageNotAttempted, fmt.Errorf("release directory %s exists but is not a complete stage (interrupted stages must be removed manually): %w", releaseDir, err)
 		}
 		if m.Project != rel.Metadata.Project || m.Version != rel.Metadata.Version {
-			return StageNew, fmt.Errorf("staged marker %s records %s %s, refusing to treat it as %s %s", markerPath, m.Project, m.Version, rel.Metadata.Project, rel.Metadata.Version)
+			return StageNotAttempted, fmt.Errorf("staged marker %s records %s %s, refusing to treat it as %s %s", markerPath, m.Project, m.Version, rel.Metadata.Project, rel.Metadata.Version)
 		}
 		if m.BundleDigest != rel.Bundle.Digest {
-			return StageNew, fmt.Errorf("refusing to stage %s %s: already staged with bundle digest %s, this bundle is %s — release directories are immutable", rel.Metadata.Project, rel.Metadata.Version, m.BundleDigest, rel.Bundle.Digest)
+			return StageNotAttempted, fmt.Errorf("refusing to stage %s %s: already staged with bundle digest %s, this bundle is %s — release directories are immutable", rel.Metadata.Project, rel.Metadata.Version, m.BundleDigest, rel.Bundle.Digest)
+		}
+		// The marker's word is not proof: verify that the directory still
+		// contains exactly the canonical bundle before declaring the
+		// stage reusable. A yesterday's assertion does not protect
+		// against altered bytes on the target.
+		if verr := t.verifyStagedFiles(ctx, releaseDir, bundle); verr != nil {
+			return StageNotAttempted, fmt.Errorf("staged release %s no longer matches its marker (%w) — altered staged material is never executed or reused", releaseDir, verr)
 		}
 		return StageAlreadyStaged, nil
 	}
 
 	files, err := readBundleFiles(bundle)
 	if err != nil {
-		return StageNew, err
+		return StageNotAttempted, err
 	}
 	for _, f := range files {
 		if err := t.tr.Put(ctx, transport.PutRequest{
@@ -110,7 +125,7 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 			Content: f.content,
 			Mode:    f.mode,
 		}); err != nil {
-			return StageNew, fmt.Errorf("staging %s/%s: %w", rel.Metadata.Version, f.relPath, err)
+			return StageNotAttempted, fmt.Errorf("staging %s/%s: %w", rel.Metadata.Version, f.relPath, err)
 		}
 	}
 
@@ -123,15 +138,70 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 	}
 	markerJSON, err := json.MarshalIndent(marker, "", "  ")
 	if err != nil {
-		return StageNew, err
+		return StageNotAttempted, err
 	}
 	markerJSON = append(markerJSON, '\n')
 	// The marker goes last: before this Put the directory is an incomplete
 	// stage that every reader refuses; after it the release is complete.
 	if err := t.tr.Put(ctx, transport.PutRequest{Path: markerPath, Content: markerJSON, Mode: 0o644}); err != nil {
-		return StageNew, fmt.Errorf("writing staged marker %s: %w", markerPath, err)
+		return StageNotAttempted, fmt.Errorf("writing staged marker %s: %w", markerPath, err)
 	}
 	return StageNew, nil
+}
+
+// VerifyStage proves that an existing release directory still contains
+// exactly the canonical bundle it claims: marker identity and digest, every
+// expected file present with byte-identical content, and executable /
+// non-executable semantics intact. Rollback and any reuse of staged
+// material must pass here before executing anything from the directory.
+// Detection of *extra* files (runtime material added after staging) is
+// future work; expected-file integrity is complete.
+func (t *Target) VerifyStage(ctx context.Context, rel *manifest.Release, bundle []byte) error {
+	releaseDir, err := t.layout.ReleaseDir(rel.Metadata.Project, rel.Metadata.Version)
+	if err != nil {
+		return err
+	}
+	m, err := t.readMarker(ctx, releaseDir+"/"+stagedMarkerName)
+	if err != nil {
+		return fmt.Errorf("not a complete stage: %w", err)
+	}
+	if m.Project != rel.Metadata.Project || m.Version != rel.Metadata.Version {
+		return fmt.Errorf("marker records %s %s, want %s %s", m.Project, m.Version, rel.Metadata.Project, rel.Metadata.Version)
+	}
+	if m.BundleDigest != rel.Bundle.Digest {
+		return fmt.Errorf("marker digest %s, want %s", m.BundleDigest, rel.Bundle.Digest)
+	}
+	return t.verifyStagedFiles(ctx, releaseDir, bundle)
+}
+
+func (t *Target) verifyStagedFiles(ctx context.Context, releaseDir string, bundle []byte) error {
+	files, err := readBundleFiles(bundle)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		p := releaseDir + "/" + f.relPath
+		res, err := t.tr.Run(ctx, transport.RunRequest{Argv: []string{"cat", p}, Dir: "/"})
+		if err != nil {
+			return fmt.Errorf("%s: %w", f.relPath, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("%s: missing or unreadable on target (exit %d)", f.relPath, res.ExitCode)
+		}
+		if !bytes.Equal(res.Stdout, f.content) {
+			return fmt.Errorf("%s: content differs from the canonical bundle", f.relPath)
+		}
+		execWant := f.mode&0o100 != 0
+		res, err = t.tr.Run(ctx, transport.RunRequest{Argv: []string{"test", "-x", p}, Dir: "/"})
+		if err != nil {
+			return fmt.Errorf("%s: %w", f.relPath, err)
+		}
+		execGot := res.ExitCode == 0
+		if execWant != execGot {
+			return fmt.Errorf("%s: executable semantics differ (bundle mode %o)", f.relPath, f.mode)
+		}
+	}
+	return nil
 }
 
 // readMarker reads and parses a staged marker. All toolkit-owned target

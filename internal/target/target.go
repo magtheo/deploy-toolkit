@@ -9,7 +9,9 @@ package target
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
 	"github.com/magtheo/deploy-toolkit/internal/transport"
@@ -72,6 +74,22 @@ func (t *Target) Layout() Layout { return t.layout }
 // (environment lock acquisition, hook execution) that are outside the
 // substrate's own responsibilities.
 func (t *Target) Transport() transport.Transport { return t.tr }
+
+func marshalIndentJSON(v any) ([]byte, error) {
+	raw, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(raw, '\n'), nil
+}
+
+func putReq(path string, content []byte, mode os.FileMode) transport.PutRequest {
+	return transport.PutRequest{Path: path, Content: content, Mode: mode}
+}
+
+func runReq(argv ...string) transport.RunRequest {
+	return transport.RunRequest{Argv: argv, Dir: "/"}
+}
 
 func firstLine(b []byte) string {
 	for i, c := range b {
