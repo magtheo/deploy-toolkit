@@ -199,14 +199,14 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 		// may have half-undone the failed release. The environment stays
 		// recovery-required; a later rollback (whose bindings still
 		// hold) or operator action resolves it.
-		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.failed"); herr != nil {
+		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.failed", string(in.Authorization)); herr != nil {
 			return rep, errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("history outcome not recorded: %w", herr))
 		}
 		return rep, nil
 	}
 	failInfra := func(what string, cause error) (*RollbackReport, error) {
 		rep.FailureReason = what + " (infrastructure failure)"
-		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.failed"); herr != nil {
+		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.failed", string(in.Authorization)); herr != nil {
 			cause = errors.Join(cause, fmt.Errorf("history outcome not recorded: %w", herr))
 		}
 		return rep, fmt.Errorf("%s: %w", what, cause)
@@ -241,12 +241,16 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	// A leftover recovery marker admits exactly two resolutions:
 	//
 	//  1. PROVEN committed — observed state carries this recovery's
-	//     operationId (the state commit and marker cleanup are separated
-	//     by a crash window, and observed state may have said the To
-	//     release before the rollback ever ran, so release identity alone
-	//     cannot prove anything). Only the exact operationId is proof.
-	//     Then this invocation runs NO hooks and only completes the
-	//     cleanup. The request must describe the same transition.
+	//     operationId AND the release/digest it names. The operationId
+	//     binds the observation to this recovery; the release and digest
+	//     cross-check binds it to this recovery's transition, so a
+	//     structurally valid but semantically inconsistent state snapshot
+	//     can never talk the toolkit into deleting recovery evidence.
+	//     (The cross-check matters because observed state may have said
+	//     the To release before the rollback ever ran — release identity
+	//     alone proves nothing.) Then this invocation runs NO hooks and
+	//     only completes the cleanup; the request must describe the same
+	//     transition.
 	//  2. Anything else — an UNRESOLVED recovery: a previous rollback has
 	//     executed consequential work (a rollback hook, an apply) with an
 	//     unknown outcome. Repeating it is no safer than repeating a
@@ -255,7 +259,10 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	//     verifies the target, removes the markers, and starts a fresh
 	//     recovery.
 	if haveRecovery {
-		committed := observed.Current != nil && observed.Current.OperationID == "recovery:"+recovery.RecoveryID
+		committed := observed.Current != nil &&
+			observed.Current.OperationID == "recovery:"+recovery.RecoveryID &&
+			observed.Current.Release == recovery.ToRelease &&
+			observed.Current.BundleDigest == recovery.ToBundleDigest
 		sameTransition := recovery.FromRelease == rep.FromVersion && recovery.FromBundleDigest == rep.FromBundleDigest &&
 			recovery.ToRelease == rep.ToVersion && recovery.ToBundleDigest == rep.ToBundleDigest
 		if committed && sameTransition {
@@ -486,40 +493,46 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 
 	// Trusted terminal: the restored release verified and the state
 	// committed — signed recovery:<recoveryId> in observed state.
-	rep.RecoveryResolved = haveMarker
-	// Clearing order matters. The ATTEMPT marker goes first: a leftover
-	// attempt marker alone (recovery already cleared) would read as
-	// "recovery still needed" and invite a replay over committed state.
-	// A leftover RECOVERY marker alone, by contrast, is provably
-	// committed via the observed state's operationId and self-heals
-	// without executing anything.
+	// Clearing order matters, and so does evidence order. The ATTEMPT
+	// marker goes first: a leftover attempt marker alone (recovery
+	// already cleared) would read as "recovery still needed" and invite
+	// a replay over committed state. The success evidence is persisted
+	// WHILE the recovery marker still exists, because that marker is the
+	// breadcrumb the proven-committed cleanup path needs: if the history
+	// write or the recovery-marker removal fails, the next invocation
+	// self-heals without executing anything. The recovery marker is the
+	// LAST recovery fact removed.
 	if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
-		err = errors.Join(fmt.Errorf("observed state committed, but the attempt marker could not be cleared: %w", cerr))
-		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.succeeded"); herr != nil {
-			return rep, errors.Join(err, fmt.Errorf("history outcome not recorded: %w", herr))
+		// RecoveryResolved is not claimed — the attempt marker is still
+		// there. Evidence is still recorded while the recovery marker
+		// exists, so the next invocation completes the cleanup.
+		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.succeeded", string(in.Authorization)); herr != nil {
+			return rep, errors.Join(fmt.Errorf("observed state committed, but the attempt marker could not be cleared: %w", cerr), fmt.Errorf("history outcome not recorded: %w", herr))
 		}
-		return rep, err
+		return rep, fmt.Errorf("observed state committed, but the attempt marker could not be cleared: %w", cerr)
+	}
+	rep.RecoveryResolved = haveMarker
+	if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.succeeded", string(in.Authorization)); herr != nil {
+		// The attempt marker is cleared, but the recovery marker REMAINS:
+		// the next invocation for this transition enters the
+		// proven-committed cleanup path instead of rerunning hooks.
+		return rep, fmt.Errorf("history outcome not recorded: %w", herr)
 	}
 	if cerr := in.Target.ClearRecovery(ctx, rep.Project, rep.Environment); cerr != nil {
-		err = errors.Join(fmt.Errorf("observed state committed, but the recovery marker could not be cleared: %w", cerr))
-		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.succeeded"); herr != nil {
-			return rep, errors.Join(err, fmt.Errorf("history outcome not recorded: %w", herr))
-		}
-		return rep, err
-	}
-	if err := recordRollbackOutcome(ctx, in, now, rep, "rollback.succeeded"); err != nil {
-		return rep, fmt.Errorf("record history outcome: %w", err)
+		return rep, fmt.Errorf("observed state committed and rollback.succeeded recorded, but the recovery marker could not be cleared: %w", cerr)
 	}
 	return rep, nil
 }
 
 // resolveCommittedRecovery completes the bookkeeping of a recovery that
 // has demonstrably committed: observed state carries the recovery marker's
-// operationId, so no hook may run — only marker cleanup. The attempt
-// marker is cleared only when it is still exactly the one this recovery
-// was resolving; anything else is someone else's evidence and is left for
-// explicit resolution.
+// operationId and its exact to-release/digest, so no hook may run — only
+// marker cleanup. The historical identity and authority are the marker's,
+// not the cleanup invocation's: this path finishes bookkeeping, it must
+// not rewrite who authorized the operation that actually changed
+// production (Step 11 reconciliation decisions depend on that authority).
 func resolveCommittedRecovery(ctx context.Context, in RollbackInput, now func() time.Time, rep *RollbackReport, attempt target.AttemptMarker, haveAttempt bool, recovery target.RecoveryMarker) (*RollbackReport, error) {
+	rep.RecoveryID = recovery.RecoveryID
 	clearedAttempt := false
 	if haveAttempt && recovery.SourceAttemptID != "" && attempt.AttemptID == recovery.SourceAttemptID {
 		if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
@@ -527,13 +540,15 @@ func resolveCommittedRecovery(ctx context.Context, in RollbackInput, now func() 
 		}
 		clearedAttempt = true
 	}
-	if cerr := in.Target.ClearRecovery(ctx, rep.Project, rep.Environment); cerr != nil {
-		return rep, fmt.Errorf("observed state is committed (recovery %s), but the recovery marker could not be cleared: %w", recovery.RecoveryID, cerr)
-	}
 	rep.AlreadyRecovered = true
 	rep.RecoveryResolved = clearedAttempt
-	if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.already-recovered"); herr != nil {
-		return rep, fmt.Errorf("record history outcome: %w", herr)
+	// Evidence before the last breadcrumb: the recovery marker stays
+	// until rollback.already-recovered is durably recorded.
+	if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.already-recovered", recovery.Authorization); herr != nil {
+		return rep, fmt.Errorf("history outcome not recorded: %w", herr)
+	}
+	if cerr := in.Target.ClearRecovery(ctx, rep.Project, rep.Environment); cerr != nil {
+		return rep, fmt.Errorf("rollback.already-recovered recorded, but the recovery marker could not be cleared: %w", cerr)
 	}
 	return rep, nil
 }
@@ -596,8 +611,11 @@ func validateRollbackTransition(in RollbackInput) error {
 }
 
 // recordRollbackOutcome appends the structured, secret-free history record
-// for a rollback outcome.
-func recordRollbackOutcome(ctx context.Context, in RollbackInput, now func() time.Time, rep *RollbackReport, kind string) error {
+// for a rollback outcome. The authorization is an explicit parameter: a
+// cleanup-only invocation records the ORIGINAL recovery's authorization —
+// the durable marker, not the invocation finishing the bookkeeping, is
+// authoritative for who changed production.
+func recordRollbackOutcome(ctx context.Context, in RollbackInput, now func() time.Time, rep *RollbackReport, kind, authorization string) error {
 	stages := make(map[string]any, len(rep.Stages))
 	for _, s := range rep.Stages {
 		switch {
@@ -621,7 +639,7 @@ func recordRollbackOutcome(ctx context.Context, in RollbackInput, now func() tim
 		"toRelease":        rep.ToVersion,
 		"toBundleDigest":   rep.ToBundleDigest,
 		"target":           in.TargetManifest.Metadata.Name,
-		"authorization":    string(in.Authorization),
+		"authorization":    authorization,
 		"stagedFrom":       rep.StagedFrom.String(),
 		"stagedTo":         rep.StagedTo.String(),
 		"stages":           stages,

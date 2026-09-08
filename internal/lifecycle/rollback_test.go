@@ -33,6 +33,15 @@ func secondRevision(t *testing.T, f *fixture) string {
 // being rolled back as fromVer, toRev being restored as toVer. The
 // environment pins the FROM release (the auto/emergency situation before
 // Git is reconciled).
+
+// relA0Digest pins the restored release's bundle digest for forged-state
+// scenarios.
+func relA0Digest(t *testing.T, f *fixture) string {
+	t.Helper()
+	rel, _ := f.preparedBytes(t, "my-app", "1.0.0")
+	return rel.Bundle.Digest
+}
+
 func rollbackInput(t *testing.T, f *fixture, fromRev, fromVer, toRev, toVer string, auth RollbackAuthorization) RollbackInput {
 	t.Helper()
 	fromRel, fromBytes := f.preparedBytesAt(t, fromRev, "my-app", fromVer)
@@ -748,6 +757,222 @@ func TestDeployRefusesWhileRecoveryUnresolved(t *testing.T) {
 	if last.Type != "deploy.failed" || last.Data["recoveryRequired"] != true {
 		t.Fatalf("history tail = %+v", last)
 	}
+}
+
+func TestRollbackSelfHealRequiresWholeCommittedState(t *testing.T) {
+	// operationId alone must not be enough to delete recovery evidence:
+	// the observed release AND digest must also equal the recovery
+	// marker's toRelease/toBundleDigest. A structurally valid but
+	// semantically inconsistent state snapshot must never talk the
+	// toolkit into treating a recovery as committed.
+	f := newFixture(t, "my-app", versionTaggedHooks)
+	revA := f.revision
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB := secondRevision(t, f)
+	relB, bytesB := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "2.0.0"), Release: relB, Bundle: bytesB, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := order(t, f.marker)
+
+	forgeState := func(t *testing.T, release, digest string) {
+		t.Helper()
+		st, err := f.target.ReadState(t.Context(), "my-app", "production")
+		if err != nil {
+			t.Fatal(err)
+		}
+		st.Current = &target.CurrentDeployment{
+			Release:      release,
+			BundleDigest: digest,
+			Since:        st.Current.Since,
+			OperationID:  "recovery:0123456789abcdef",
+		}
+		st.UpdatedAt = "2026-09-08T01:00:00Z"
+		if err := f.target.WriteState(t.Context(), st); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.target.WriteRecovery(t.Context(), target.RecoveryMarker{
+			RecoveryID:       "0123456789abcdef",
+			SourceAttemptID:  "",
+			Project:          "my-app",
+			Environment:      "production",
+			FromRelease:      "2.0.0",
+			FromBundleDigest: relB.Bundle.Digest,
+			ToRelease:        "1.0.0",
+			ToBundleDigest:   relA0Digest(t, f),
+			Authorization:    "manual",
+			StartedAt:        "2026-09-08T00:30:00Z",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("right operationId, wrong release", func(t *testing.T) {
+		forgeState(t, "2.0.0", relB.Bundle.Digest)
+		rep, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.AlreadyRecovered || !rep.RecoveryRequired {
+			t.Fatalf("rep = %+v, want refusal: operationId alone is not proof", rep)
+		}
+	})
+	t.Run("right operationId, wrong digest", func(t *testing.T) {
+		forgeState(t, "1.0.0", relB.Bundle.Digest)
+		rep, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rep.AlreadyRecovered || !rep.RecoveryRequired {
+			t.Fatalf("rep = %+v, want refusal: digest must match too", rep)
+		}
+	})
+	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(before, ",") {
+		t.Errorf("hooks ran during forged-state recoveries: %v → %v", before, got)
+	}
+	if !recoveryPresent(t, f) {
+		t.Error("the forged-state refusals deleted the recovery marker")
+	}
+}
+
+func TestRollbackCleanupReportsOriginalAuthority(t *testing.T) {
+	// The cleanup invocation is bookkeeping; it must not rewrite the
+	// historical authority of the operation that changed production.
+	// Step 11 reconciliation decisions depend on reading the ORIGINAL
+	// authorization from rollback.already-recovered evidence.
+	f := newFixture(t, "my-app", versionTaggedHooks)
+	revA := f.revision
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB := secondRevision(t, f)
+	relB, bytesB := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "2.0.0"), Release: relB, Bundle: bytesB, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A MANUAL emergency recovery commits, then loses the recovery-marker
+	// cleanup (its success evidence was persisted first, so the marker
+	// remains as the healable breadcrumb).
+	tr := &failingRunTransport{
+		inner: local.New(),
+		failRunWhen: func(argv []string) bool {
+			return argv[0] == "rm" && strings.HasSuffix(argv[len(argv)-1], "/recoveries/production.json")
+		},
+	}
+	tgt, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackManual)
+	in.Target = tgt
+	rep1, err := Rollback(t.Context(), in)
+	if err == nil || !strings.Contains(err.Error(), "recovery marker could not be cleared") {
+		t.Fatalf("err = %v, want recovery-cleanup failure", err)
+	}
+	if !rep1.Committed {
+		t.Fatal("the state commit happened and must be reported")
+	}
+
+	// A RECOVERY-authorized invocation performs the cleanup: the evidence
+	// must carry the marker's original identity and authority.
+	rep2, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep2.AlreadyRecovered {
+		t.Fatalf("cleanup rep = %+v, want cleanup-only", rep2)
+	}
+	if rep2.RecoveryID != rep1.RecoveryID {
+		t.Errorf("cleanup reported recoveryId %q, want the original %q", rep2.RecoveryID, rep1.RecoveryID)
+	}
+	records := history(t, f)
+	last := records[len(records)-1]
+	if last.Type != "rollback.already-recovered" {
+		t.Fatalf("history tail = %+v", last)
+	}
+	if last.Data["authorization"] != "manual" {
+		t.Errorf("already-recovered authorization = %#v, want the original manual", last.Data["authorization"])
+	}
+	if last.Data["recoveryId"] != rep1.RecoveryID {
+		t.Errorf("already-recovered recoveryId = %#v, want %s", last.Data["recoveryId"], rep1.RecoveryID)
+	}
+	if recoveryPresent(t, f) {
+		t.Error("cleanup did not remove the recovery marker")
+	}
+}
+
+func TestRollbackHistoryFailureKeepsSelfHealAvailable(t *testing.T) {
+	// The recovery marker is the LAST durable fact removed: after the
+	// state commit and the attempt-marker clear, the success evidence is
+	// persisted while the marker still exists. If the history write
+	// fails, the marker remains and the next invocation self-heals
+	// without hooks — production is restored, and nothing is replayed.
+	f := newFixture(t, "my-app", versionTaggedHooks)
+	revA := f.revision
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB := secondRevision(t, f)
+	relB, bytesB := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "2.0.0"), Release: relB, Bundle: bytesB, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := &failingRunTransport{
+		inner: local.New(),
+		failRunWhen: func(argv []string) bool {
+			return argv[0] == "cat" && strings.HasSuffix(argv[len(argv)-1], "/history/production.jsonl")
+		},
+	}
+	tgt, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery)
+	in.Target = tgt
+	rep, err := Rollback(t.Context(), in)
+	if err == nil || !strings.Contains(err.Error(), "history outcome not recorded") {
+		t.Fatalf("err = %v, want the evidence-write failure", err)
+	}
+	if !rep.Committed {
+		t.Fatal("the state commit happened and must be reported")
+	}
+	if !recoveryPresent(t, f) {
+		t.Fatal("the recovery marker must survive the evidence-write failure — it is the self-heal breadcrumb")
+	}
+	if attemptPresent(t, f) {
+		t.Fatal("the attempt marker should be cleared before the evidence write (attempt-first order)")
+	}
+	before := order(t, f.marker)
+
+	// The next invocation recognizes the proven commit and finishes the
+	// bookkeeping without executing anything.
+	rep2, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep2.AlreadyRecovered || rep2.Committed {
+		t.Fatalf("self-heal rep = %+v, want cleanup-only", rep2)
+	}
+	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(before, ",") {
+		t.Fatalf("the self-heal executed hooks: %v → %v", before, got)
+	}
+	if recoveryPresent(t, f) {
+		t.Error("self-heal did not remove the recovery marker")
+	}
+	requireNoLock(t, f)
 }
 
 func TestRollbackFailsClosedOnIncompleteInput(t *testing.T) {

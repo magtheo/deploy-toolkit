@@ -177,13 +177,24 @@ committed it — `current.operationId` is `deploy:<attemptId>` or
 `recovery:<recoveryId>`. This is what resolves the crash window where a
 committed state is observationally identical to the pre-operation state
 (a rollback to A looks the same before and after, because observed already
-said A): when the leftover recovery marker's id appears verbatim in
-observed state, the recovery demonstrably committed, and the next recovery
-invocation for the same transition completes the cleanup without executing
-anything. Clearing order at the terminal follows the same logic — the
-attempt marker first (a leftover attempt marker alone would read as
-"recovery still needed" and invite a replay), the recovery marker second
-(a leftover recovery marker alone is provably committed and self-heals).
+said A). The proof binds the WHOLE committed state: the leftover recovery
+marker's id must appear verbatim in `current.operationId` AND
+`current.release`/`current.bundleDigest` must equal the marker's
+`toRelease`/`toBundleDigest` — a structurally valid but semantically
+inconsistent snapshot is never sufficient to delete recovery evidence.
+When the proof holds, the next recovery invocation for the same transition
+completes the cleanup without executing anything, and reports the ORIGINAL
+recovery's identity and authorization — the cleanup invocation is
+bookkeeping, not a re-authorization.
+
+**Evidence before the last breadcrumb.** Terminal ordering is: state
+commit → attempt-marker clear → success evidence persisted → recovery
+marker clear. The recovery marker is the last recovery fact removed,
+because it is the breadcrumb the self-heal needs: if the history write or
+the marker removal fails, the next invocation enters the proven-committed
+cleanup path instead of rerunning hooks. (A leftover attempt marker alone,
+by contrast, would read as "recovery still needed" and invite a replay —
+which is why it goes first.)
 
 ## Reused staged material is verified, not trusted
 
