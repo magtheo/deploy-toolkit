@@ -42,29 +42,40 @@ droppings, build leftovers) from deployments.
 - A declared include pattern that matches **zero tracked files** is an error:
   includes declare intent, and silent omission would be contract drift.
 
-## Symlinks
+## Regular files only
 
-Symlinks are **preserved, not dereferenced**: a symlink entry stores its
-target string. A symlink whose target resolves outside the bundle root is an
-error. Never follow symlinks when reading file content — a tracked symlink
-pointing at an untracked file (e.g. `.env`) must not pull that file into the
-bundle.
+Bundle Format v1 carries **regular files only** — no symlinks, no special
+entries. A path tracked as a symlink (or any other non-regular Git object)
+**fails bundle construction**; vendor the link's content instead.
+
+Rationale: the v1 transport contract has no symlink primitive, so the
+staging substrate cannot materialize symlinks on the target. A bundle the
+toolkit could build but never stage would be a cross-layer contradiction —
+a release that passes `release create`, survives promotion and a human
+merge, and then fails deterministically at staging. The contract is
+therefore tightened at the earliest possible point, while it is still
+candidate. If a real consumer requires symlinks, the alternative is a true
+symlink primitive in the transport/target substrate — not approximation by
+regular files with different semantics.
+
+Historical note: earlier candidate revisions preserved symlinks
+("preserved, not dereferenced"); this was reconciled with the staging
+substrate before the contract was frozen.
 
 ## Canonical tar rules
 
 - Format: ustar headers only (no GNU extensions, no PAX metadata).
 - Entry order: lexically sorted by path, byte-wise.
-- Entries: regular files (`typeflag 0`) and symlinks (`typeflag 2`) only;
-  directories are implicit.
+- Entries: regular files (`typeflag 0`) only; directories are implicit;
+  symlinks and special entries fail construction (see above).
 - `mtime = 0`, `uid = 0`, `gid = 0`, `uname = ""`, `gname = ""`.
 - Mode: `0644` for files, `0755` only for entries tracked with the Git
-  executable bit; `0755` for symlinks is irrelevant (header records the
-  target).
+  executable bit.
 - No devices, no sockets, no fifos — Git does not track them; fail closed if
   somehow present.
-- Any path or symlink target that cannot be represented in the chosen ustar
-  format **fails bundle construction**; Deploy Toolkit does not silently
-  switch to PAX/GNU extensions.
+- Any path that cannot be represented in the chosen ustar format **fails
+  bundle construction**; Deploy Toolkit does not silently switch to
+  PAX/GNU extensions.
 
 ## Digest definitions
 

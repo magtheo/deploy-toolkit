@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"path"
 	"sort"
 	"time"
 )
@@ -80,15 +79,14 @@ func (b *Builder) Build(ctx context.Context, revision string, include []string) 
 			} else {
 				hdr.Mode = 0o644
 			}
-		case "120000":
-			if err := checkSymlinkTarget(p, string(content)); err != nil {
-				return Result{}, err
-			}
-			hdr.Typeflag = tar.TypeSymlink
-			hdr.Linkname = string(content)
-			hdr.Mode = 0o755
 		default:
-			return Result{}, fmt.Errorf("unsupported git mode %s for %q", e.mode, p)
+			// Symlinks (120000) are not part of Bundle Format v1: the
+			// staging substrate cannot materialize them over the transport
+			// contract, and a bundle the toolkit can build but never stage
+			// is a cross-layer contradiction. Fail at construction, where
+			// the release is still mutable — not at staging, where it is
+			// already authorized. Vendor the link's content instead.
+			return Result{}, fmt.Errorf("%q is tracked as %s; Bundle Format v1 carries regular files only — vendor the content instead of linking", p, e.mode)
 		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return Result{}, fmt.Errorf("cannot represent %q in ustar: %w", p, err)
@@ -110,19 +108,4 @@ func (b *Builder) Build(ctx context.Context, revision string, include []string) 
 		ContractDigest: fmt.Sprintf("sha256:%064x", contractSum),
 		Files:          files,
 	}, nil
-}
-
-func checkSymlinkTarget(entryPath, target string) error {
-	if path.IsAbs(target) {
-		return fmt.Errorf("symlink %q has absolute target %q; escaping symlinks are rejected", entryPath, target)
-	}
-	resolved := path.Clean(path.Join(path.Dir(entryPath), target))
-	if resolved == ".." || hasTraversal(resolved) {
-		return fmt.Errorf("symlink %q target %q resolves outside the bundle root", entryPath, target)
-	}
-	return nil
-}
-
-func hasTraversal(cleaned string) bool {
-	return cleaned == ".." || len(cleaned) >= 3 && cleaned[:3] == "../"
 }

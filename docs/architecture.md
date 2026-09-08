@@ -227,19 +227,23 @@ target, outside the release.
 
 ## Server filesystem model
 
-```
-/opt/deploy-toolkit/<project>/<environment>/
-└── releases/
-    ├── 0.1.15/
-    ├── 0.1.16/
-    └── 0.1.17/          ← current -> releases/0.1.17
+Releases are environment-independent; state and history are
+environment-scoped. All paths live under the Target manifest's
+`spec.deployRoot` (see `docs/target-state.md`):
 
-/var/lib/deploy-toolkit/<project>/<environment>/
-├── state.json           observed state
-└── history.jsonl        deployment history
+```
+<deployRoot>/<project>/
+├── releases/
+│   ├── 0.1.15/
+│   ├── 0.1.16/
+│   └── 0.1.17/                ← .staged.json marks the complete stage
+├── state/
+│   └── <environment>.json     observed state ("current" advances only after verification)
+└── history/
+    └── <environment>.jsonl    append-only, integrity-checked hash chain
 
 /etc/<project>/
-└── production.env       application secrets (outside the release)
+└── production.env             application secrets (outside the release)
 ```
 
 ## Desired vs observed state

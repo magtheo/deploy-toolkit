@@ -48,10 +48,10 @@ Enforced in this order:
 
 4. **Defensive extraction.** The bundle is digest-verified, but staging
    still refuses anything a filesystem could misinterpret: absolute entry
-   paths, `.`/`..` segments, and entry types the transport cannot
-   materialize. V1 has no symlink primitive, so symlink entries are refused
-   explicitly rather than approximated by regular files with different
-   semantics.
+   paths, `.`/`..` segments, and any non-regular entry. Bundle Format v1 is
+   regular-files-only (the builder refuses symlinks at construction, when
+   the release is still mutable), so a non-file entry in a bundle means the
+   bytes were tampered with or built by something that ignored the format.
 
 5. **Concurrent stages of the same version** with identical bytes converge
    to the same outcome (idempotent). Stages with conflicting bytes for one
@@ -83,8 +83,8 @@ secrets never enter state files.
 
 ## Durable history
 
-`history/<env>.jsonl` is an append-only, tamper-evident log of deployment
-events. Each line is one record; records form a **hash chain**:
+`history/<env>.jsonl` is an append-only, **integrity-checked** log of
+deployment events. Each line is one record; records form a hash chain:
 
     { "seq": 1, "time": "RFC3339", "type": "stage.completed",
       "data": { ... }, "prev": "", "hash": "sha256:..." }
@@ -96,12 +96,38 @@ events. Each line is one record; records form a **hash chain**:
   chain (sequence continuity, link integrity, per-record hashes) before
   extending it. The log is republished atomically in full; recorded entries
   are carried over untouched.
-- **Reads never trust the file:** a tampered, truncated, or reordered log
-  fails verification and is an error — never silently accepted.
+- **Reads never trust the file:** a log that fails verification is an
+  error — never silently accepted.
 - Records are operator-visible evidence: release identities, digests,
-  decision outcomes, timestamps. Application secrets are forbidden in
-  history records.
+  structured stage outcomes, timestamps. Application secrets and raw hook
+  output are forbidden in history records.
+
+The chain's guarantee has precise limits, which are part of the contract:
+
+**Detected:** in-place mutation of any record without rehashing; removal of
+interior records; reordering; broken links; malformed records; sequence
+gaps.
+
+**Not detected:** deletion of a valid suffix (1→2→3→4 truncated to 1→2→3 is
+still a valid chain); deliberate whole-chain rewrite with recomputed
+hashes. Detecting those requires an external anchor for the expected
+terminal `(seq, hash)` — for example a checkpoint in GitHub deployment
+evidence. Until such an anchor exists, history is a verifiable local
+record, not tamper-proof evidence.
 
 The history log records facts ("stage completed", "deploy started",
 "verification failed") — it does not decide anything. Authorization remains
 where it has always been: the human merge of the promotion PR.
+
+## Concurrency constraint on the lifecycle layer
+
+This substrate provides no locking. Two actors mutating the same
+environment concurrently can interleave destructively: two `AppendHistory`
+calls can each read `N` records and each publish their own `N+1` (last
+writer silently wins), and two first-time stages of the same version can
+both observe the release directory absent and write into it before either
+marker exists. Lifecycle execution (the step-9 state machine) therefore
+MUST hold a **cross-process, target-scoped environment lock** for the full
+validate→stage→migrate→apply→verify→commit sequence. An in-process mutex
+is insufficient — correctness must not depend on which CI invocation
+happened to run `deployctl`.

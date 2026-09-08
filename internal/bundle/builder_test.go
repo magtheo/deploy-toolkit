@@ -99,9 +99,9 @@ func TestContractDigestIsExactBytes(t *testing.T) {
 	}
 }
 
-func TestBuildExecutableAndSymlinkPreserved(t *testing.T) {
+func TestBuildExecutableBitPreserved(t *testing.T) {
 	dir, rev := fixtureRepo(t)
-	res, err := NewBuilder(dir).Build(context.Background(), rev, []string{"deploy.sh", "current.yaml"})
+	res, err := NewBuilder(dir).Build(context.Background(), rev, []string{"deploy.sh"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,8 +109,8 @@ func TestBuildExecutableAndSymlinkPreserved(t *testing.T) {
 	for _, f := range res.Files {
 		found[f] = true
 	}
-	if !found["deploy.sh"] || !found["current.yaml"] || !found[".deploy/project.yaml"] {
-		t.Errorf("expected deploy.sh and current.yaml bundled, got %v", res.Files)
+	if !found["deploy.sh"] || !found[".deploy/project.yaml"] {
+		t.Errorf("expected deploy.sh bundled, got %v", res.Files)
 	}
 }
 
@@ -164,18 +164,19 @@ func TestBuildIgnoresReplaceRefs(t *testing.T) {
 	gitRun(t, dir, "replace", "-d", rev)
 }
 
-func TestSymlinkTargetValidation(t *testing.T) {
-	if err := checkSymlinkTarget("current.yaml", "/etc/passwd"); err == nil {
-		t.Error("absolute target accepted")
+func TestSymlinksRefusedAtConstruction(t *testing.T) {
+	// fixtureRepo tracks current.yaml -> config/app.yaml. Bundle Format v1
+	// carries regular files only: including a tracked symlink must fail
+	// construction — the earliest point a contradiction between "valid
+	// release" and "stageable release" can be caught.
+	dir, rev := fixtureRepo(t)
+	b := NewBuilder(dir)
+	_, err := b.Build(context.Background(), rev, []string{"docker-compose.yml", "config/**", "current.yaml"})
+	if err == nil {
+		t.Fatal("tracked symlink accepted into a v1 bundle")
 	}
-	if err := checkSymlinkTarget("a/b/link", "../../../outside"); err == nil {
-		t.Error("escaping target accepted")
-	}
-	if err := checkSymlinkTarget("a/b/link", "../../outside"); err != nil {
-		t.Errorf("target resolving inside the bundle root rejected: %v", err)
-	}
-	if err := checkSymlinkTarget("a/link", "../b/file"); err != nil {
-		t.Errorf("in-bundle relative target rejected: %v", err)
+	if !strings.Contains(err.Error(), "regular files only") {
+		t.Errorf("error should state the v1 restriction: %v", err)
 	}
 }
 

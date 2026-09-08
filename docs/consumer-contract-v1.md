@@ -161,13 +161,18 @@ Rules (v1 promise):
 - `apply` is the only mandatory hook; every other step is optional and skipped
   when absent.
 - Hooks run on the target, inside the staged release directory
-  (`/opt/deploy-toolkit/<project>/<environment>/releases/<version>/`).
+  (`<deployRoot>/<project>/releases/<version>/` — releases are
+  environment-independent; state and history are environment-scoped). See
+  `docs/target-state.md`.
 - Exit code `0` = success; any other code = failure of the current lifecycle
   stage.
 - The toolkit sets, at minimum: `DEPLOY_PROJECT`, `DEPLOY_ENVIRONMENT`,
   `DEPLOY_RELEASE_VERSION`, `DEPLOY_SOURCE_REVISION`, and for `rollback`, the
   release being rolled back to.
-- Stdout/stderr is captured into the deployment history record.
+- History records **structured stage outcomes** (stage name, exit code,
+  release identity, digests, timestamps) — never raw hook stdout/stderr,
+  which may contain application secrets. Raw output is not persisted by
+  v0.1; a separate attempt-log mechanism may be added later.
 
 Deploy Toolkit owns the state machine; the project supplies the commands.
 

@@ -114,6 +114,37 @@ func TestHistoryBrokenLinkDetected(t *testing.T) {
 	}
 }
 
+func TestHistorySuffixDeletionIsNotDetected(t *testing.T) {
+	// This pins the documented LIMIT of a self-contained hash chain:
+	// dropping a valid suffix leaves a perfectly valid chain. Detection
+	// requires an external anchor for the expected terminal (seq, hash);
+	// until that exists, the guarantee is "integrity-checked", not
+	// "tamper-evident". If this test starts failing, the guarantee has
+	// become stronger than the documentation claims — update both.
+	tgt := newLocalTarget(t)
+	if err := tgt.AppendHistory(t.Context(), "my-app", "production",
+		Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{}},
+		Entry{Time: fixedTime(1700000100), Type: "deploy.started", Data: map[string]any{}}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tgt.layout.Root(), "my-app/history/production.jsonl")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffixDropped := strings.SplitN(string(raw), "\n", 2)[0] + "\n"
+	if err := os.WriteFile(path, []byte(suffixDropped), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	records, err := tgt.ReadHistory(t.Context(), "my-app", "production")
+	if err != nil {
+		t.Fatalf("suffix deletion must verify as a valid chain per the documented guarantee: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want the remaining 1", len(records))
+	}
+}
+
 func TestHistoryHashIsDeterministic(t *testing.T) {
 	// Same entries appended to two independent targets must produce
 	// byte-identical logs, regardless of map insertion order.

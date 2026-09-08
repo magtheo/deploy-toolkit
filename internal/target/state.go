@@ -1,10 +1,12 @@
 package target
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/magtheo/deploy-toolkit/internal/transport"
@@ -12,6 +14,10 @@ import (
 
 // stateSchemaV1 identifies observed-state snapshots.
 const stateSchemaV1 = "toolkit.state/v1"
+
+// digestPattern pins the observed bundle digest shape: sha256, lowercase
+// hex, 64 digits — the same representation the bundle builder emits.
+var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // ErrStateAbsent reports that no deployment has ever been observed for a
 // project/environment pair. It is a normal condition for a fresh target,
@@ -39,7 +45,41 @@ type State struct {
 	UpdatedAt   string             `json:"updatedAt"` // RFC3339, UTC
 }
 
-// ReadState returns the observed state snapshot for project/env.
+// validateState is the single strict validator for observed-state
+// snapshots, applied identically to reads and writes. Step 9 makes
+// decisions from observed state, so a read must never trust fields the
+// write path would have rejected: schema, exact identity, strict SemVer
+// for the deployed release, well-formed digest, parseable timestamps.
+// Anything else fails closed.
+func validateState(st State, project, env string) error {
+	if st.Schema != stateSchemaV1 {
+		return fmt.Errorf("schema %q, want %q", st.Schema, stateSchemaV1)
+	}
+	if st.Project != project || st.Environment != env {
+		return fmt.Errorf("records %s/%s, refusing to serve it as %s/%s", st.Project, st.Environment, project, env)
+	}
+	if _, err := time.Parse(time.RFC3339, st.UpdatedAt); err != nil {
+		return fmt.Errorf("updatedAt %q: %w", st.UpdatedAt, err)
+	}
+	if st.Current == nil {
+		return nil
+	}
+	if err := CheckVersion(st.Current.Release); err != nil {
+		return fmt.Errorf("current.release: %w", err)
+	}
+	if !digestPattern.MatchString(st.Current.BundleDigest) {
+		return fmt.Errorf("current.bundleDigest %q is not a sha256 digest", st.Current.BundleDigest)
+	}
+	if _, err := time.Parse(time.RFC3339, st.Current.Since); err != nil {
+		return fmt.Errorf("current.since %q: %w", st.Current.Since, err)
+	}
+	return nil
+}
+
+// ReadState returns the observed state snapshot for project/env. The file
+// must pass the same strict validation as a fresh write — unknown fields
+// are rejected, not silently dropped — because the snapshot is input to
+// lifecycle decisions.
 func (t *Target) ReadState(ctx context.Context, project, env string) (State, error) {
 	path, err := t.layout.StatePath(project, env)
 	if err != nil {
@@ -57,41 +97,29 @@ func (t *Target) ReadState(ctx context.Context, project, env string) (State, err
 		return State{}, err
 	}
 	var st State
-	if err := json.Unmarshal(raw, &st); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&st); err != nil {
 		return State{}, fmt.Errorf("%s: %w", path, err)
 	}
-	if st.Schema != stateSchemaV1 {
-		return State{}, fmt.Errorf("%s: schema %q, want %q", path, st.Schema, stateSchemaV1)
-	}
-	if st.Project != project || st.Environment != env {
-		return State{}, fmt.Errorf("%s: records %s/%s, refusing to serve it as %s/%s", path, st.Project, st.Environment, project, env)
+	if err := validateState(st, project, env); err != nil {
+		return State{}, fmt.Errorf("%s: %w", path, err)
 	}
 	return st, nil
 }
 
-// WriteState atomically replaces the observed state snapshot. Validation
-// fails closed: identities must be well-formed and timestamps must parse,
-// so a garbage snapshot can never be laundered onto a target.
+// WriteState atomically replaces the observed state snapshot after strict
+// validation — the same validator reads apply. The schema field is owned
+// by the toolkit and set here.
 func (t *Target) WriteState(ctx context.Context, st State) error {
+	st.Schema = stateSchemaV1
+	if err := validateState(st, st.Project, st.Environment); err != nil {
+		return fmt.Errorf("state: %w", err)
+	}
 	path, err := t.layout.StatePath(st.Project, st.Environment)
 	if err != nil {
 		return err
 	}
-	if _, err := time.Parse(time.RFC3339, st.UpdatedAt); err != nil {
-		return fmt.Errorf("state updatedAt %q: %w", st.UpdatedAt, err)
-	}
-	if st.Current != nil {
-		if st.Current.Release == "" {
-			return fmt.Errorf("state current.release must not be empty")
-		}
-		if st.Current.BundleDigest == "" {
-			return fmt.Errorf("state current.bundleDigest must not be empty")
-		}
-		if _, err := time.Parse(time.RFC3339, st.Current.Since); err != nil {
-			return fmt.Errorf("state current.since %q: %w", st.Current.Since, err)
-		}
-	}
-	st.Schema = stateSchemaV1
 	raw, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err

@@ -18,13 +18,27 @@ var ErrHistoryAbsent = errors.New("history: no records")
 
 // Record is one immutable entry of the durable history log. Records form a
 // hash chain: Prev carries the previous record's Hash ("" for the genesis
-// record), and Hash covers the record's full content. Rewriting or removing
-// an earlier record breaks the chain and is detected on read — append-only
-// is enforced by verification, not by hope.
+// record), and Hash covers the record's full content. The chain is
+// **integrity-checked**, with limits that are documented, not hidden:
+//
+// Detected on read:
+//   - in-place mutation of any record without rehashing the chain;
+//   - removal of interior records, reordering, or broken links;
+//   - malformed individual records; sequence gaps.
+//
+// NOT detected by a self-contained chain:
+//   - deletion of a valid record suffix (1→2→3→4 truncated to 1→2→3 is
+//     still a perfectly valid chain);
+//   - deliberate whole-chain rewrite with recomputed hashes.
+//
+// Detecting those requires an external anchor for the expected terminal
+// (seq, hash) — e.g. a checkpoint recorded in GitHub deployment evidence.
+// That anchor is future work; until it exists, callers must treat history
+// as a verifiable local record, not as tamper-proof evidence.
 //
 // Records are operator-visible evidence. They must never contain
-// application secrets; they carry release identities, digests, decision
-// outcomes and timestamps only.
+// application secrets or raw hook output; they carry release identities,
+// digests, structured outcomes and timestamps only.
 type Record struct {
 	Seq  int64          `json:"seq"`
 	Time string         `json:"time"` // RFC3339, UTC
@@ -43,8 +57,11 @@ type Entry struct {
 }
 
 // ReadHistory returns the verified history chain for project/env. A
-// missing log yields ErrHistoryAbsent; a log that fails chain verification
-// (tampered, truncated, reordered) is an error — never silently accepted.
+// missing log yields ErrHistoryAbsent. Verification checks sequence
+// continuity, link integrity and per-record hashes: in-place mutation,
+// interior removal, reordering and malformed records are detected. A valid
+// suffix deletion is NOT detectable without an external anchor — see the
+// Record type documentation for the exact guarantees.
 func (t *Target) ReadHistory(ctx context.Context, project, env string) ([]Record, error) {
 	records, _, err := t.readHistoryVerified(ctx, project, env)
 	return records, err

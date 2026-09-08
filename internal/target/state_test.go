@@ -1,6 +1,7 @@
 package target
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -80,6 +81,101 @@ func TestStateIdentitySwapDetected(t *testing.T) {
 	}
 	if _, err := tgt.ReadState(t.Context(), "my-app", "production"); err == nil || !strings.Contains(err.Error(), "refusing") {
 		t.Fatalf("mismatched state identity must be refused: %v", err)
+	}
+}
+
+func TestReadStateRejectsFieldsWriteWouldReject(t *testing.T) {
+	tgt := newLocalTarget(t)
+	if err := tgt.WriteState(t.Context(), State{
+		Project:     "my-app",
+		Environment: "production",
+		Current: &CurrentDeployment{
+			Release:      "1.0.0",
+			BundleDigest: "sha256:" + strings.Repeat("ab", 32),
+			Since:        fixedTime(1700000000),
+		},
+		UpdatedAt: fixedTime(1700000100),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tgt.layout.Root(), "my-app/state/production.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hostile := []struct {
+		name    string
+		mutate  func(m map[string]any)
+		wantErr string
+	}{
+		{"traversal release", func(m map[string]any) {
+			m["current"].(map[string]any)["release"] = "../../nonsense"
+		}, "SemVer"},
+		{"garbage digest", func(m map[string]any) {
+			m["current"].(map[string]any)["bundleDigest"] = "garbage"
+		}, "sha256"},
+		{"broken since", func(m map[string]any) {
+			m["current"].(map[string]any)["since"] = "yesterday"
+		}, "since"},
+		{"broken updatedAt", func(m map[string]any) {
+			m["updatedAt"] = "broken"
+		}, "updatedAt"},
+		{"wrong schema", func(m map[string]any) {
+			m["schema"] = "toolkit.state/v2"
+		}, "schema"},
+	}
+	for _, c := range hostile {
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		c.mutate(m)
+		mutated, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, mutated, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tgt.ReadState(t.Context(), "my-app", "production"); err == nil || !strings.Contains(err.Error(), c.wantErr) {
+			t.Errorf("%s: err = %v, want it to mention %q", c.name, err, c.wantErr)
+		}
+		// restore for the next case
+		if err := os.WriteFile(path, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestReadStateRejectsUnknownFields(t *testing.T) {
+	tgt := newLocalTarget(t)
+	if err := tgt.WriteState(t.Context(), State{
+		Project:     "my-app",
+		Environment: "production",
+		UpdatedAt:   fixedTime(1700000100),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(tgt.layout.Root(), "my-app/state/production.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["desired"] = map[string]any{"release": "2.0.0"} // desired state must never masquerade as observed
+	mutated, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, mutated, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tgt.ReadState(t.Context(), "my-app", "production"); err == nil {
+		t.Fatal("unknown fields must be rejected, not silently dropped")
 	}
 }
 

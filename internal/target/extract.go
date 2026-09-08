@@ -14,12 +14,12 @@ type bundleFile struct {
 	content []byte
 }
 
-// readBundleFiles parses a canonical bundle tar defensively. The bundle is
-// digest-verified upstream, but staging refuses anything a filesystem could
-// misinterpret: absolute or traversing entry paths, and entry types the
-// transport cannot materialize (the v1 transport contract has no symlink
-// primitive, so symlink entries are refused rather than approximated by
-// regular files with different semantics).
+// readBundleFiles parses a canonical bundle tar defensively. Bundle Format
+// v1 carries regular files only — the builder refuses everything else — so
+// anything but regular entries here means the bytes were tampered with or
+// built by something that ignored the format: staging refuses rather than
+// misinterpret. Path checks (absolute, traversal segments) are defense in
+// depth for the same reason.
 func readBundleFiles(bundle []byte) ([]bundleFile, error) {
 	tr := tar.NewReader(bytes.NewReader(bundle))
 	var files []bundleFile
@@ -52,7 +52,7 @@ func readBundleFiles(bundle []byte) ([]bundleFile, error) {
 			}
 			files = append(files, bundleFile{relPath: name, mode: mode, content: content})
 		case tar.TypeSymlink:
-			return nil, fmt.Errorf("bundle: entry %q is a symlink; the v1 staging substrate cannot materialize symlinks and refuses instead of approximating it", name)
+			return nil, fmt.Errorf("bundle: entry %q is a symlink; Bundle Format v1 carries regular files only", name)
 		default:
 			return nil, fmt.Errorf("bundle: entry %q has unsupported type %q", name, string(hdr.Typeflag))
 		}
