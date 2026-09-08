@@ -22,12 +22,15 @@ func TestHistoryAbsent(t *testing.T) {
 
 func TestAppendAndVerifyChain(t *testing.T) {
 	tgt := newLocalTarget(t)
-	err := tgt.AppendHistory(t.Context(), "my-app", "production",
+	seq, err := tgt.AppendHistory(t.Context(), "my-app", "production",
 		Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{"release": "1.0.0"}},
 		Entry{Time: fixedTime(1700000100), Type: "deploy.started", Data: map[string]any{"release": "1.0.0", "actor": "deploy-bot"}},
 	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if seq != 2 {
+		t.Errorf("AppendHistory seq = %d, want 2", seq)
 	}
 	records, err := tgt.ReadHistory(t.Context(), "my-app", "production")
 	if err != nil {
@@ -49,11 +52,11 @@ func TestAppendAndVerifyChain(t *testing.T) {
 
 func TestAppendContinuesExistingChain(t *testing.T) {
 	tgt := newLocalTarget(t)
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production",
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production",
 		Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production",
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production",
 		Entry{Time: fixedTime(1700000500), Type: "deploy.completed", Data: map[string]any{}},
 		Entry{Time: fixedTime(1700000600), Type: "verify.completed", Data: map[string]any{}},
 	); err != nil {
@@ -70,7 +73,7 @@ func TestAppendContinuesExistingChain(t *testing.T) {
 
 func TestHistoryTamperDetected(t *testing.T) {
 	tgt := newLocalTarget(t)
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production",
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production",
 		Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{"release": "1.0.0"}},
 		Entry{Time: fixedTime(1700000100), Type: "deploy.started", Data: map[string]any{}}); err != nil {
 		t.Fatal(err)
@@ -98,7 +101,7 @@ func TestHistoryUnknownFieldDetected(t *testing.T) {
 	// the strict decoder must reject it outright — otherwise the file
 	// could be modified while the chain still verifies.
 	tgt := newLocalTarget(t)
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production",
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production",
 		Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{}}); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +122,7 @@ func TestHistoryUnknownFieldDetected(t *testing.T) {
 
 func TestHistoryBrokenLinkDetected(t *testing.T) {
 	tgt := newLocalTarget(t)
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production",
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production",
 		Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{}},
 		Entry{Time: fixedTime(1700000100), Type: "deploy.started", Data: map[string]any{}}); err != nil {
 		t.Fatal(err)
@@ -147,7 +150,7 @@ func TestHistorySuffixDeletionIsNotDetected(t *testing.T) {
 	// "tamper-evident". If this test starts failing, the guarantee has
 	// become stronger than the documentation claims — update both.
 	tgt := newLocalTarget(t)
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production",
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production",
 		Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{}},
 		Entry{Time: fixedTime(1700000100), Type: "deploy.started", Data: map[string]any{}}); err != nil {
 		t.Fatal(err)
@@ -176,10 +179,10 @@ func TestHistoryHashIsDeterministic(t *testing.T) {
 	entryA := Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{"alpha": 1, "beta": "x", "gamma": true}}
 	entryB := Entry{Time: fixedTime(1700000000), Type: "stage.completed", Data: map[string]any{"gamma": true, "beta": "x", "alpha": 1}}
 	t1, t2 := newLocalTarget(t), newLocalTarget(t)
-	if err := t1.AppendHistory(t.Context(), "my-app", "production", entryA); err != nil {
+	if _, err := t1.AppendHistory(t.Context(), "my-app", "production", entryA); err != nil {
 		t.Fatal(err)
 	}
-	if err := t2.AppendHistory(t.Context(), "my-app", "production", entryB); err != nil {
+	if _, err := t2.AppendHistory(t.Context(), "my-app", "production", entryB); err != nil {
 		t.Fatal(err)
 	}
 	raw1, err := os.ReadFile(filepath.Join(t1.layout.Root(), "my-app/history/production.jsonl"))
@@ -197,13 +200,13 @@ func TestHistoryHashIsDeterministic(t *testing.T) {
 
 func TestAppendValidation(t *testing.T) {
 	tgt := newLocalTarget(t)
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production"); err == nil {
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production"); err == nil {
 		t.Error("empty append must be rejected")
 	}
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production", Entry{Type: ""}); err == nil {
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production", Entry{Type: ""}); err == nil {
 		t.Error("typeless entry must be rejected")
 	}
-	if err := tgt.AppendHistory(t.Context(), "my-app", "production", Entry{Type: "x", Time: "not-a-time"}); err == nil {
+	if _, err := tgt.AppendHistory(t.Context(), "my-app", "production", Entry{Type: "x", Time: "not-a-time"}); err == nil {
 		t.Error("invalid time must be rejected")
 	}
 }

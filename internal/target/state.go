@@ -112,7 +112,7 @@ func (t *Target) ReadState(ctx context.Context, project, env string) (State, err
 	if !present {
 		return State{}, fmt.Errorf("%s/%s: %w", project, env, ErrStateAbsent)
 	}
-	raw, err := t.readFile(ctx, path)
+	raw, err := t.ReadFile(ctx, path)
 	if err != nil {
 		return State{}, err
 	}

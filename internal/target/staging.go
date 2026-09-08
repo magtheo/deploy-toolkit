@@ -141,7 +141,7 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 // as an incomplete stage and fail closed.
 func (t *Target) readMarker(ctx context.Context, markerPath string) (StagedMarker, error) {
 	var m StagedMarker
-	raw, err := t.readFile(ctx, markerPath)
+	raw, err := t.ReadFile(ctx, markerPath)
 	if err != nil {
 		return m, err
 	}

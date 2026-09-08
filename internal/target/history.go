@@ -84,7 +84,7 @@ func (t *Target) readHistoryVerified(ctx context.Context, project, env string) (
 	if !present {
 		return nil, "", fmt.Errorf("%s/%s: %w", project, env, ErrHistoryAbsent)
 	}
-	raw, err := t.readFile(ctx, path)
+	raw, err := t.ReadFile(ctx, path)
 	if err != nil {
 		return nil, "", err
 	}
@@ -150,27 +150,28 @@ func parseHistory(path string, raw []byte) ([]Record, error) {
 }
 
 // AppendHistory appends entries to the durable history log, extending and
-// re-verifying the hash chain. The log is rewritten in full through the
-// transport's atomic file publication; entries already recorded stay
-// bit-identical in meaning (their chain hashes are carried over untouched).
-func (t *Target) AppendHistory(ctx context.Context, project, env string, entries ...Entry) error {
+// re-verifying the hash chain. It returns the sequence number of the last
+// appended record. The log is rewritten in full through the transport's
+// atomic file publication; entries already recorded stay bit-identical in
+// meaning (their chain hashes are carried over untouched).
+func (t *Target) AppendHistory(ctx context.Context, project, env string, entries ...Entry) (int64, error) {
 	if len(entries) == 0 {
-		return fmt.Errorf("history: AppendHistory requires at least one entry")
+		return 0, fmt.Errorf("history: AppendHistory requires at least one entry")
 	}
 	for _, e := range entries {
 		if e.Type == "" {
-			return fmt.Errorf("history: entry type must not be empty")
+			return 0, fmt.Errorf("history: entry type must not be empty")
 		}
 		if e.Time != "" {
 			if _, err := time.Parse(time.RFC3339, e.Time); err != nil {
-				return fmt.Errorf("history: entry time %q: %w", e.Time, err)
+				return 0, fmt.Errorf("history: entry time %q: %w", e.Time, err)
 			}
 		}
 	}
 
 	existing, _, err := t.readHistoryVerified(ctx, project, env)
 	if err != nil && !errors.Is(err, ErrHistoryAbsent) {
-		return err
+		return 0, err
 	}
 
 	records := existing
@@ -191,7 +192,7 @@ func (t *Target) AppendHistory(ctx context.Context, project, env string, entries
 		}
 		h, err := recordHash(rec)
 		if err != nil {
-			return fmt.Errorf("history: record %d: %w", rec.Seq, err)
+			return 0, fmt.Errorf("history: record %d: %w", rec.Seq, err)
 		}
 		rec.Hash = h
 		records = append(records, rec)
@@ -199,19 +200,19 @@ func (t *Target) AppendHistory(ctx context.Context, project, env string, entries
 
 	path, err := t.layout.HistoryPath(project, env)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	for _, rec := range records {
 		if err := enc.Encode(rec); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	if err := t.tr.Put(ctx, transport.PutRequest{Path: path, Content: buf.Bytes(), Mode: 0o644}); err != nil {
-		return fmt.Errorf("writing history %s: %w", path, err)
+		return 0, fmt.Errorf("writing history %s: %w", path, err)
 	}
-	return nil
+	return records[len(records)-1].Seq, nil
 }
 
 // recordHash covers every field except Hash itself. json.Marshal sorts map

@@ -166,9 +166,21 @@ Rules (v1 promise):
   `docs/target-state.md`.
 - Exit code `0` = success; any other code = failure of the current lifecycle
   stage.
-- The toolkit sets, at minimum: `DEPLOY_PROJECT`, `DEPLOY_ENVIRONMENT`,
-  `DEPLOY_RELEASE_VERSION`, `DEPLOY_SOURCE_REVISION`, and for `rollback`, the
-  release being rolled back to.
+- The hook environment is **exact and deterministic** — ambient runner or
+  login environment is never inherited:
+  - `PATH` — a fixed toolkit default
+    (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`);
+  - `DEPLOY_PROJECT`, `DEPLOY_ENVIRONMENT`, `DEPLOY_RELEASE_VERSION`,
+    `DEPLOY_SOURCE_REVISION` (the pinned full SHA);
+  - `DEPLOY_ARTIFACT_<NAME>` — one per release artifact, `<NAME>` being the
+    artifact name uppercased with `-`→`_`, value `<image>@<digest>`. Hooks
+    are pinned to the exact Release artifacts without copying the Release
+    manifest into the bundle;
+  - for `rollback` (step 10): the release being rolled back to.
+- Lifecycle execution holds a **cross-process, target-scoped environment
+  lock** for the whole sequence (atomic `mkdir` on the target; a held lock
+  fails closed; no stale-lock breaking — a crashed runner leaves the lock
+  for explicit operator removal).
 - History records **structured stage outcomes** (stage name, exit code,
   release identity, digests, timestamps) — never raw hook stdout/stderr,
   which may contain application secrets. Raw output is not persisted by

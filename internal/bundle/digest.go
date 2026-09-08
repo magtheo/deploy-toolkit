@@ -8,12 +8,18 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"github.com/magtheo/deploy-toolkit/internal/manifest"
 )
 
 type Result struct {
 	Digest         string
 	ContractDigest string
 	Files          []string
+	// Bytes carries the canonical tar itself so the deploy stage can
+	// stage exactly what was digested — no rebuild between verification
+	// and upload.
+	Bytes []byte
 }
 
 func (b *Builder) Build(ctx context.Context, revision string, include []string) (Result, error) {
@@ -107,5 +113,24 @@ func (b *Builder) Build(ctx context.Context, revision string, include []string) 
 		Digest:         fmt.Sprintf("sha256:%064x", sum),
 		ContractDigest: fmt.Sprintf("sha256:%064x", contractSum),
 		Files:          files,
+		Bytes:          buf.Bytes(),
 	}, nil
+}
+
+// BuildFromRevision builds the bundle for a release revision the way the
+// deployment stage must: the bundle.include list is read from the
+// revision's OWN .deploy/project.yaml — never from the current state of
+// main, which may have drifted since the release was promoted. This is the
+// deploy-time half of "the deployment contract comes from the promoted
+// release".
+func (b *Builder) BuildFromRevision(ctx context.Context, revision string) (Result, error) {
+	out, err := b.git(ctx, "cat-file", "blob", revision+":"+contractPath)
+	if err != nil {
+		return Result{}, fmt.Errorf("read deployment contract at %s: %w", revision, err)
+	}
+	parsed, err := manifest.Parse(out, manifest.KindProject)
+	if err != nil {
+		return Result{}, fmt.Errorf("deployment contract at %s is not a valid project manifest: %w", revision, err)
+	}
+	return b.Build(ctx, revision, parsed.Project.Bundle.Include)
 }

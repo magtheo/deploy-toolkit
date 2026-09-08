@@ -48,11 +48,12 @@ func (t *Target) exists(ctx context.Context, path string) (bool, error) {
 	}
 }
 
-// readFile reads a toolkit-owned file from the target. Callers must gate it
-// behind exists() when absence is meaningful: cat reports both absence and
+// ReadFile reads a toolkit-owned file from the target — staged contract
+// bytes, state snapshots, history logs. Callers must gate it behind
+// exists() when absence is meaningful: cat reports both absence and
 // unreadability as a non-zero exit and the two cannot be distinguished
 // through the transport contract.
-func (t *Target) readFile(ctx context.Context, path string) ([]byte, error) {
+func (t *Target) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	res, err := t.tr.Run(ctx, transport.RunRequest{Argv: []string{"cat", path}, Dir: "/"})
 	if err != nil {
 		return nil, fmt.Errorf("target: read %s: %w", path, err)
@@ -62,6 +63,15 @@ func (t *Target) readFile(ctx context.Context, path string) ([]byte, error) {
 	}
 	return res.Stdout, nil
 }
+
+// Layout exposes the derived path layout (lock paths, release dirs) for
+// the lifecycle layer.
+func (t *Target) Layout() Layout { return t.layout }
+
+// Transport exposes the underlying transport for lifecycle operations
+// (environment lock acquisition, hook execution) that are outside the
+// substrate's own responsibilities.
+func (t *Target) Transport() transport.Transport { return t.tr }
 
 func firstLine(b []byte) string {
 	for i, c := range b {

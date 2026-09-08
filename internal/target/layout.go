@@ -73,6 +73,20 @@ func (l Layout) StatePath(project, env string) (string, error) {
 	return l.root + "/" + project + "/state/" + env + ".json", nil
 }
 
+// LockPath is the environment lock directory: acquired atomically with
+// mkdir (which wins exactly once on POSIX), released with rmdir. Locks
+// have no staleness semantics — a crashed runner leaves the lock for
+// explicit operator removal.
+func (l Layout) LockPath(project, env string) (string, error) {
+	if err := checkSlug("project", project); err != nil {
+		return "", err
+	}
+	if err := checkSlug("environment", env); err != nil {
+		return "", err
+	}
+	return l.root + "/" + project + "/.locks/" + env, nil
+}
+
 func (l Layout) HistoryPath(project, env string) (string, error) {
 	if err := checkSlug("project", project); err != nil {
 		return "", err
