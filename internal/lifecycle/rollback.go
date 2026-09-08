@@ -73,14 +73,25 @@ type RollbackReport struct {
 	StagedTo         target.StageStatus
 	Stages           []StageResult
 	Committed        bool // observed state advanced to the To release
-	// RecoveryResolved: a pre-existing unresolved attempt marker was
-	// cleared at the trusted terminal.
+	// RecoveryID is the id of the recovery marker this invocation wrote
+	// ("" when it only resolved an existing situation).
+	RecoveryID string
+	// RecoveryResolved: the deployment attempt marker being recovered was
+	// cleared at the trusted terminal (or by the self-heal path).
 	RecoveryResolved bool
-	// MarkerCreated: the rollback created its own recovery marker (the
-	// emergency path — no unresolved attempt existed beforehand).
-	MarkerCreated bool
-	HistorySeq    int64
-	FailureReason string
+	// RecoveryMarkerCreated: the rollback created its own recovery marker
+	// (the emergency path — no unresolved recovery existed beforehand).
+	RecoveryMarkerCreated bool
+	// AlreadyRecovered: a leftover recovery marker was PROVEN committed
+	// (observed state carries its operationId), so this invocation only
+	// performed safe cleanup and executed no hooks.
+	AlreadyRecovered bool
+	// RecoveryRequired: the invocation was refused because an unresolved
+	// recovery marker exists and repeating consequential rollback work is
+	// not known-safe.
+	RecoveryRequired bool
+	HistorySeq       int64
+	FailureReason    string
 }
 
 // Rollback is the explicit recovery operation. It is deliberately NOT a
@@ -93,24 +104,31 @@ type RollbackReport struct {
 // The sequence:
 //
 //	ACQUIRE the same environment lock
-//	  → READ observed state + unresolved attempt marker
+//	  → READ observed state, deployment attempt marker, recovery marker
+//	  → RESOLVE any leftover recovery marker (self-heal ONLY with
+//	    operationId proof; otherwise refuse — never replay)
 //	  → VALIDATE the recovery transition (exact identity bindings)
 //	  → VERIFY rollback policy (authorization path + migration semantics)
 //	  → STAGE + verify staged contracts for BOTH releases
-//	  → To-release PREFLIGHT
-//	  → marker: reuse, or create before the first consequential stage
+//	  → To-release PREFLIGHT (non-impacting)
+//	  → WRITE the recovery marker (from/to, authorization, recoveryId)
 //	  → From-release ROLLBACK hook (if its migration ran and hook declared)
 //	  → To-release APPLY → VERIFY (mandatory)
-//	  → COMMIT observed state = To release
-//	  → CLEAR the attempt marker (trusted terminal)
+//	  → COMMIT observed state = To release, signed recovery:<recoveryId>
+//	  → CLEAR attempt marker, then recovery marker (trusted terminal)
 //	  → APPEND structured rollback outcome
 //	  → RELEASE lock
 //
 // Failure semantics mirror Deploy's, one notch stricter: everything before
-// the marker write (stage, contracts, To-preflight) is retryable; once the
-// marker exists, ANY failure — hook, transport, state commit — keeps the
-// environment recovery-required. The marker is cleared only after the To
-// release verified and observed state committed.
+// the recovery marker write (stage, contracts, To-preflight) is retryable;
+// once the marker exists, ANY failure — hook, transport, state commit —
+// keeps BOTH markers, and the next ordinary recovery REFUSES rather than
+// repeating B's rollback hook or A's apply. v0.1 assumes no hook
+// idempotency contract; resolution is explicit (a fresh recovery after an
+// operator has verified the target, removing the markers). The one
+// automatic path is the self-heal: a leftover recovery marker whose
+// operationId is recorded in observed state is PROVEN committed, so its
+// cleanup may run without executing anything.
 func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err error) {
 	switch {
 	case in.Target == nil:
@@ -212,6 +230,48 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	}
 	haveMarker := aerr == nil
 
+	// The recovery marker is the OTHER durable fact: WHAT recovery is
+	// already in flight (the attempt marker says WHY recovery is needed).
+	recovery, rerr := in.Target.ReadRecovery(ctx, rep.Project, rep.Environment)
+	if rerr != nil && !errors.Is(rerr, target.ErrRecoveryAbsent) {
+		return rep, fmt.Errorf("read recovery marker: %w", rerr)
+	}
+	haveRecovery := rerr == nil
+
+	// A leftover recovery marker admits exactly two resolutions:
+	//
+	//  1. PROVEN committed — observed state carries this recovery's
+	//     operationId (the state commit and marker cleanup are separated
+	//     by a crash window, and observed state may have said the To
+	//     release before the rollback ever ran, so release identity alone
+	//     cannot prove anything). Only the exact operationId is proof.
+	//     Then this invocation runs NO hooks and only completes the
+	//     cleanup. The request must describe the same transition.
+	//  2. Anything else — an UNRESOLVED recovery: a previous rollback has
+	//     executed consequential work (a rollback hook, an apply) with an
+	//     unknown outcome. Repeating it is no safer than repeating a
+	//     failed migration, so ordinary recovery refuses, no matter which
+	//     authorization asks. Resolution is explicit: an operator
+	//     verifies the target, removes the markers, and starts a fresh
+	//     recovery.
+	if haveRecovery {
+		committed := observed.Current != nil && observed.Current.OperationID == "recovery:"+recovery.RecoveryID
+		sameTransition := recovery.FromRelease == rep.FromVersion && recovery.FromBundleDigest == rep.FromBundleDigest &&
+			recovery.ToRelease == rep.ToVersion && recovery.ToBundleDigest == rep.ToBundleDigest
+		if committed && sameTransition {
+			return resolveCommittedRecovery(ctx, in, now, rep, attempt, haveMarker, recovery)
+		}
+		rep.RecoveryRequired = true
+		if committed {
+			return failRollback(fmt.Sprintf(
+				"recovery marker %s (%s → %s) is proven committed by observed state but this request describes a different transition (%s → %s): rerun that exact recovery to complete its cleanup, or resolve it explicitly",
+				recovery.RecoveryID, recovery.FromRelease, recovery.ToRelease, rep.FromVersion, rep.ToVersion))
+		}
+		return failRollback(fmt.Sprintf(
+			"unresolved recovery marker %s (%s → %s, started %s): a previous rollback has executed consequential work with an unknown outcome — repeating a rollback hook or an apply is not known-safe. Verify the target, resolve the markers explicitly, then start a fresh recovery",
+			recovery.RecoveryID, recovery.FromRelease, recovery.ToRelease, recovery.StartedAt))
+	}
+
 	// VALIDATE the recovery transition: bind both releases to durable
 	// facts, not to the caller's word.
 	switch {
@@ -245,8 +305,8 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	case observed.Current != nil &&
 		observed.Current.Release == rep.FromVersion && observed.Current.BundleDigest == rep.FromBundleDigest:
 		// Emergency rollback of a resolved, healthy deployment: the
-		// observed release is exactly the one being undone. A recovery
-		// marker is created below, before the first consequential stage.
+		// observed release is exactly the one being undone. The recovery
+		// marker is written below, before the first consequential stage.
 		if in.Authorization != RollbackManual {
 			return failRollback(fmt.Sprintf(
 				"no unresolved attempt marker exists and observed state is %s@%s: automatic and recovery rollbacks require an unresolved attempt — use explicit manual authorization for an emergency rollback",
@@ -341,28 +401,36 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 		return failRollback("preflight failed")
 	}
 
-	// Durable marker BEFORE the first consequential stage. On the
-	// emergency path no marker exists yet; the recovery marker describes
-	// the transition being performed (From = what runs now, To = what is
-	// restored). An existing marker is reused untouched.
-	if !haveMarker {
-		attemptID, err := randomAttemptID()
-		if err != nil {
-			return rep, fmt.Errorf("generate attempt id: %w", err)
-		}
-		if werr := in.Target.WriteAttempt(ctx, target.AttemptMarker{
-			AttemptID:    attemptID,
-			Project:      rep.Project,
-			Environment:  rep.Environment,
-			FromRelease:  rep.FromVersion,
-			ToRelease:    rep.ToVersion,
-			BundleDigest: rep.ToBundleDigest,
-			StartedAt:    now().UTC().Format(time.RFC3339),
-		}); werr != nil {
-			return failInfra("recovery marker could not be persisted; refusing consequential work", werr)
-		}
-		rep.MarkerCreated = true
+	// Durable recovery marker BEFORE the first consequential stage. The
+	// deployment attempt marker says WHY recovery is needed and is never
+	// rewritten; this marker says WHAT recovery was started: which
+	// transition, which authorization, which attempt it resolves. From
+	// here until a trusted terminal, ANY failure keeps it — and the next
+	// ordinary recovery refuses rather than replaying hooks.
+	recoveryID, err := randomHexID()
+	if err != nil {
+		return rep, fmt.Errorf("generate recovery id: %w", err)
 	}
+	sourceAttempt := ""
+	if haveMarker {
+		sourceAttempt = attempt.AttemptID
+	}
+	if werr := in.Target.WriteRecovery(ctx, target.RecoveryMarker{
+		RecoveryID:       recoveryID,
+		SourceAttemptID:  sourceAttempt,
+		Project:          rep.Project,
+		Environment:      rep.Environment,
+		FromRelease:      rep.FromVersion,
+		FromBundleDigest: rep.FromBundleDigest,
+		ToRelease:        rep.ToVersion,
+		ToBundleDigest:   rep.ToBundleDigest,
+		Authorization:    string(in.Authorization),
+		StartedAt:        now().UTC().Format(time.RFC3339),
+	}); werr != nil {
+		return failInfra("recovery marker could not be persisted; refusing consequential work", werr)
+	}
+	rep.RecoveryID = recoveryID
+	rep.RecoveryMarkerCreated = true
 
 	// From-release ROLLBACK hook: undoes From-specific consequences —
 	// above all its own migration. It runs only if the failed release's
@@ -399,11 +467,16 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 		return failRollback("verify failed")
 	}
 
-	// Verified — and only verified — lets observed state move back.
+	// Verified — and only verified — lets observed state move back. The
+	// commit is signed with this recovery's id: the durable proof of
+	// WHICH operation produced this observation (release identity alone
+	// cannot distinguish "rollback done" from "rollback never started",
+	// because observed state may have said the To release all along).
 	observed.Current = &target.CurrentDeployment{
 		Release:      rep.ToVersion,
 		BundleDigest: rep.ToBundleDigest,
 		Since:        now().UTC().Format(time.RFC3339),
+		OperationID:  "recovery:" + recoveryID,
 	}
 	observed.UpdatedAt = now().UTC().Format(time.RFC3339)
 	if werr := in.Target.WriteState(ctx, observed); werr != nil {
@@ -412,8 +485,14 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	rep.Committed = true
 
 	// Trusted terminal: the restored release verified and the state
-	// committed — the attempt (original or created here) is resolved.
+	// committed — signed recovery:<recoveryId> in observed state.
 	rep.RecoveryResolved = haveMarker
+	// Clearing order matters. The ATTEMPT marker goes first: a leftover
+	// attempt marker alone (recovery already cleared) would read as
+	// "recovery still needed" and invite a replay over committed state.
+	// A leftover RECOVERY marker alone, by contrast, is provably
+	// committed via the observed state's operationId and self-heals
+	// without executing anything.
 	if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
 		err = errors.Join(fmt.Errorf("observed state committed, but the attempt marker could not be cleared: %w", cerr))
 		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.succeeded"); herr != nil {
@@ -421,8 +500,40 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 		}
 		return rep, err
 	}
+	if cerr := in.Target.ClearRecovery(ctx, rep.Project, rep.Environment); cerr != nil {
+		err = errors.Join(fmt.Errorf("observed state committed, but the recovery marker could not be cleared: %w", cerr))
+		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.succeeded"); herr != nil {
+			return rep, errors.Join(err, fmt.Errorf("history outcome not recorded: %w", herr))
+		}
+		return rep, err
+	}
 	if err := recordRollbackOutcome(ctx, in, now, rep, "rollback.succeeded"); err != nil {
 		return rep, fmt.Errorf("record history outcome: %w", err)
+	}
+	return rep, nil
+}
+
+// resolveCommittedRecovery completes the bookkeeping of a recovery that
+// has demonstrably committed: observed state carries the recovery marker's
+// operationId, so no hook may run — only marker cleanup. The attempt
+// marker is cleared only when it is still exactly the one this recovery
+// was resolving; anything else is someone else's evidence and is left for
+// explicit resolution.
+func resolveCommittedRecovery(ctx context.Context, in RollbackInput, now func() time.Time, rep *RollbackReport, attempt target.AttemptMarker, haveAttempt bool, recovery target.RecoveryMarker) (*RollbackReport, error) {
+	clearedAttempt := false
+	if haveAttempt && recovery.SourceAttemptID != "" && attempt.AttemptID == recovery.SourceAttemptID {
+		if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
+			return rep, fmt.Errorf("observed state is committed (recovery %s), but the attempt marker could not be cleared: %w", recovery.RecoveryID, cerr)
+		}
+		clearedAttempt = true
+	}
+	if cerr := in.Target.ClearRecovery(ctx, rep.Project, rep.Environment); cerr != nil {
+		return rep, fmt.Errorf("observed state is committed (recovery %s), but the recovery marker could not be cleared: %w", recovery.RecoveryID, cerr)
+	}
+	rep.AlreadyRecovered = true
+	rep.RecoveryResolved = clearedAttempt
+	if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.already-recovered"); herr != nil {
+		return rep, fmt.Errorf("record history outcome: %w", herr)
 	}
 	return rep, nil
 }
@@ -519,8 +630,17 @@ func recordRollbackOutcome(ctx context.Context, in RollbackInput, now func() tim
 	if rep.RecoveryResolved {
 		data["recoveryResolved"] = true
 	}
-	if rep.MarkerCreated {
-		data["markerCreated"] = true
+	if rep.RecoveryMarkerCreated {
+		data["recoveryMarkerCreated"] = true
+	}
+	if rep.AlreadyRecovered {
+		data["alreadyRecovered"] = true
+	}
+	if rep.RecoveryRequired {
+		data["recoveryRequired"] = true
+	}
+	if rep.RecoveryID != "" {
+		data["recoveryId"] = rep.RecoveryID
 	}
 	if rep.Committed {
 		data["committed"] = true

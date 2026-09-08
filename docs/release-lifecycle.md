@@ -238,12 +238,21 @@ release's staged contract supplies `preflight`, `apply`, and the mandatory
 `verify`. The restored release's forward `migrate` is never run as an undo
 mechanism.
 
-The attempt marker survives any rollback failure — a rollback's own
-outcome can be unresolved too — and is cleared only after the restored
-release verifies and observed state commits. Auto/manual rollbacks that
-leave Git desired state pointing at the failed release produce structured
-evidence (`rollback.succeeded` with from/to identities); the reconciliation
-PR is step 11 (GitHub wiring), not the lifecycle engine.
+Every recovery writes its own **recovery marker** before the first
+consequential stage — a failed recovery is not blindly retried: the marker
+survives any failure (a rollback's own outcome can be unresolved too, and
+repeating a rollback hook or an apply is no safer than repeating a failed
+migration), and the next ordinary recovery refuses until an operator
+resolves it explicitly. Observed-state commits are signed with the
+committing operation (`operationId`), so a recovery that committed and
+then lost the marker cleanup self-heals on the next invocation — with
+proof, and without executing anything. Normal Deploy refuses while a
+recovery is unresolved. See `docs/target-state.md` for the marker model.
+
+Auto/manual rollbacks that leave Git desired state pointing at the failed
+release produce structured evidence (`rollback.succeeded`/`rollback.failed`
+with from/to identities and the recovery id); the reconciliation PR is
+step 11 (GitHub wiring), not the lifecycle engine.
 
 **Normal** rollback of a *healthy* deployment remains ordinary promotion
 with a reverse diff:

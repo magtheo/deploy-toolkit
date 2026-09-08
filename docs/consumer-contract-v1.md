@@ -279,9 +279,28 @@ Bindings are evidential, not advisory: with an unresolved attempt, the
 rollback source must equal `attempt.toRelease` + its pinned bundle digest,
 and the restore target must equal `attempt.fromRelease` and committed
 observed state. Without one (manual), observed state must equal the
-release being undone. The attempt marker survives every failure — a
-rollback's own outcome can be unresolved too — and is cleared only after
-the restored release verifies and observed state commits.
+release being undone.
+
+Rollback attempts are durable facts in their own right. Before its first
+consequential stage, a recovery writes a **recovery marker**
+(`recoveries/<env>.json`): the transition (from/to releases + digests),
+the authorization, the id of the deployment attempt it resolves, and its
+own `recoveryId`. Observed state is signed with the committing operation:
+`current.operationId` is `deploy:<attemptId>` or `recovery:<recoveryId>`.
+
+A failed recovery is therefore never blindly retried: any failure after
+the recovery marker exists keeps it, and the next ordinary recovery —
+under any authorization — refuses, because repeating a rollback hook or an
+apply is not known-safe without a hook idempotency contract v0.1 does not
+have. Resolution is explicit: verify the target, remove the markers, start
+a fresh recovery. The one automatic path: if observed state carries the
+leftover recovery marker's `recoveryId` as its `operationId`, the recovery
+is proven committed (state commit and marker cleanup are separated by a
+crash window that release identity alone cannot distinguish), and the next
+invocation for the same transition completes the cleanup without running
+hooks (`rollback.already-recovered`). Normal Deploy refuses while any
+recovery marker is unresolved; marker resolution belongs to the recovery
+operation.
 
 ## Target contract
 

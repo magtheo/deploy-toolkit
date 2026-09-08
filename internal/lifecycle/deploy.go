@@ -179,6 +179,21 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	if aerr != nil && !errors.Is(aerr, target.ErrAttemptAbsent) {
 		return rep, fmt.Errorf("read attempt marker: %w", aerr)
 	}
+
+	// An unresolved RECOVERY marker is a harder stop: a previous rollback
+	// may have performed consequential work with an unknown outcome, and
+	// production may be between the two releases. Deploying anything —
+	// even the release the recovery was restoring — would repeat
+	// consequential work into an unknown target. Resolution is the
+	// rollback operation itself (which self-heals a committed-but-unclean
+	// recovery via the observed state's operationId) or explicit operator
+	// cleanup after verifying the target.
+	if _, rerr := in.Target.ReadRecovery(ctx, rep.Project, rep.Environment); rerr == nil {
+		rep.RecoveryRequired = true
+		return failDeployment("unresolved recovery marker: a previous rollback has not been reconciled to trusted observed state — run the recovery to resolution or resolve it explicitly before deploying")
+	} else if !errors.Is(rerr, target.ErrRecoveryAbsent) {
+		return rep, fmt.Errorf("read recovery marker: %w", rerr)
+	}
 	if aerr == nil {
 		// Self-heal requires the FULL identity match: the marker must
 		// describe an attempt to exactly the requested release with
@@ -291,7 +306,7 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	// here until a trusted terminal, an interrupted attempt leaves this
 	// marker behind — and the next deployment refuses rather than
 	// re-running migrate/apply into an unknown target state.
-	attemptID, err := randomAttemptID()
+	attemptID, err := randomHexID()
 	if err != nil {
 		return rep, fmt.Errorf("generate attempt id: %w", err)
 	}
@@ -345,11 +360,14 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}
 
 	// Verify succeeded — and only verify success — lets observed state
-	// advance. staged ≠ deployed; apply success ≠ verified.
+	// advance. staged ≠ deployed; apply success ≠ verified. The commit is
+	// signed with this attempt's id: it is the durable proof of WHICH
+	// operation produced this observation.
 	observed.Current = &target.CurrentDeployment{
 		Release:      rep.Version,
 		BundleDigest: rel.Bundle.Digest,
 		Since:        now().UTC().Format(time.RFC3339),
+		OperationID:  "deploy:" + attemptID,
 	}
 	observed.UpdatedAt = now().UTC().Format(time.RFC3339)
 	if err := in.Target.WriteState(ctx, observed); err != nil {
@@ -377,7 +395,9 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	return rep, nil
 }
 
-func randomAttemptID() (string, error) {
+// randomHexID generates a 16-hex-digit operation id, used for attempt and
+// recovery markers.
+func randomHexID() (string, error) {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err

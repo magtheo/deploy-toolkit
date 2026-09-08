@@ -17,6 +17,7 @@ import (
 type failingRunTransport struct {
 	inner       transport.Transport
 	failWhen    func(argv0 string) bool
+	failRunWhen func(argv []string) bool // finer-grained: matches the full argv
 	failPut     bool
 	failPutWhen func(path string) bool
 }
@@ -30,6 +31,9 @@ func (t *failingRunTransport) Put(ctx context.Context, req transport.PutRequest)
 
 func (t *failingRunTransport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
 	if t.failWhen != nil && t.failWhen(req.Argv[0]) {
+		return transport.RunResult{}, fmt.Errorf("ssh connection died mid-deployment")
+	}
+	if t.failRunWhen != nil && t.failRunWhen(req.Argv) {
 		return transport.RunResult{}, fmt.Errorf("ssh connection died mid-deployment")
 	}
 	return t.inner.Run(ctx, req)

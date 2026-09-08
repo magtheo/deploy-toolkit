@@ -15,7 +15,8 @@ configuration:
     <deployRoot>/<project>/releases/<version>/    staged release trees
     <deployRoot>/<project>/state/<env>.json       observed state snapshot
     <deployRoot>/<project>/history/<env>.jsonl    durable history log
-    <deployRoot>/<project>/attempts/<env>.json    unresolved-attempt marker
+    <deployRoot>/<project>/attempts/<env>.json    unresolved deployment attempt
+    <deployRoot>/<project>/recoveries/<env>.json  unresolved recovery (rollback)
     <deployRoot>/<project>/.locks/<env>/          environment lock
 
 ## Release staging
@@ -121,14 +122,21 @@ The history log records facts ("stage completed", "deploy started",
 "verification failed") — it does not decide anything. Authorization remains
 where it has always been: the human merge of the promotion PR.
 
-## Attempt markers: recovery versus concurrency
+## Attempt and recovery markers: recovery versus concurrency
 
-Two facts are deliberately kept apart:
+Three facts are deliberately kept apart:
 
 - the **environment lock** (`.locks/<env>/`) means *someone may be executing
   right now* — active concurrency control;
-- the **attempt marker** (`attempts/<env>.json`) means *the previous result
-  is unresolved* — a recovery fact.
+- the **attempt marker** (`attempts/<env>.json`) means *a deployment was not
+  reconciled* — WHY recovery is needed (an attempt `A → B` may have
+  executed consequential work with an unknown outcome);
+- the **recovery marker** (`recoveries/<env>.json`) means *a recovery was
+  not reconciled* — WHAT recovery was started (a rollback `B → A` with the
+  same unknown-outcome property). The two markers are deliberately separate
+  files with separate validators: a rollback's transition is the reverse of
+  the deployment attempt's, and overloading one file for both meanings made
+  a failed emergency rollback unrecoverable.
 
 The lifecycle layer writes the marker before the first consequential stage
 (migrate) and removes it only when the attempt is **reconciled to trusted
@@ -151,10 +159,31 @@ same digest, the attempt demonstrably reached its terminal and the
 leftover marker is cleared. A marker for a *different* target release is
 never erased by deploying the currently observed release.
 
-The marker is strict metadata — one JSON value, schema-validated
-(`toolkit.attempt/v1`): attempt id, from/to release, bundle digest,
-start time. A corrupt marker fails closed, never silently counts as
-absent.
+Both markers are strict metadata — one JSON value, schema-validated
+(`toolkit.attempt/v1`, `toolkit.recovery/v1`): ids, from/to releases,
+bundle digests, authorization, start time. A corrupt marker fails closed,
+never silently counts as absent.
+
+**Retrying a failed recovery is not automatic.** Once a recovery marker
+exists, any failure — hook, transport, state commit — keeps it, and the
+next ordinary recovery REFUSES: repeating a rollback hook (which may
+reverse a migration) or an apply is no safer than repeating a failed
+migration, and v0.1 assumes no hook idempotency contract. Resolution is
+explicit: an operator verifies the target's actual state, removes the
+markers, and starts a fresh, deliberate recovery.
+
+**The self-heal proof.** Observed state records the operation that
+committed it — `current.operationId` is `deploy:<attemptId>` or
+`recovery:<recoveryId>`. This is what resolves the crash window where a
+committed state is observationally identical to the pre-operation state
+(a rollback to A looks the same before and after, because observed already
+said A): when the leftover recovery marker's id appears verbatim in
+observed state, the recovery demonstrably committed, and the next recovery
+invocation for the same transition completes the cleanup without executing
+anything. Clearing order at the terminal follows the same logic — the
+attempt marker first (a leftover attempt marker alone would read as
+"recovery still needed" and invite a replay), the recovery marker second
+(a leftover recovery marker alone is provably committed and self-heals).
 
 ## Reused staged material is verified, not trusted
 

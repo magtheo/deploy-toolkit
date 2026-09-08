@@ -25,6 +25,12 @@ var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // not a failure.
 var ErrStateAbsent = errors.New("observed state: no deployment recorded")
 
+// operationIDPattern pins the operationId shape: which kind of lifecycle
+// operation committed this observation, and that operation's durable ID
+// (attempt or recovery marker id). Empty means "committed before the
+// operationId contract existed" — readable, never fabricated.
+var operationIDPattern = regexp.MustCompile(`^(deploy|recovery):[0-9a-f]{16}$`)
+
 // CurrentDeployment is the observed fact "this environment is (believed to
 // be) running this release". It is written by the deployment state machine
 // after lifecycle verification — never by staging.
@@ -32,6 +38,14 @@ type CurrentDeployment struct {
 	Release      string `json:"release"`
 	BundleDigest string `json:"bundleDigest"`
 	Since        string `json:"since"` // RFC3339, UTC — when the observation was recorded
+	// OperationID names the lifecycle operation that committed this
+	// observation: "deploy:<attemptId>" or "recovery:<recoveryId>". It is
+	// the proof that resolves the crash window where a committed state is
+	// observationally identical to the pre-operation state (e.g. a
+	// rollback to A looks the same before and after, because observed
+	// already said A): only when the operationId matches the unresolved
+	// marker's id has THIS operation demonstrably committed.
+	OperationID string `json:"operationId,omitempty"`
 }
 
 // State is an atomic snapshot of OBSERVED state, not desired state. It
@@ -73,6 +87,9 @@ func validateState(st State, project, env string) error {
 	}
 	if _, err := time.Parse(time.RFC3339, st.Current.Since); err != nil {
 		return fmt.Errorf("current.since %q: %w", st.Current.Since, err)
+	}
+	if st.Current.OperationID != "" && !operationIDPattern.MatchString(st.Current.OperationID) {
+		return fmt.Errorf("current.operationId %q is not an operation-qualified id", st.Current.OperationID)
 	}
 	return nil
 }

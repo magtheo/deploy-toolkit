@@ -37,6 +37,11 @@ func (f *fixture) attemptPath() string {
 	return f.root + "/my-app/attempts/production.json"
 }
 
+// recoveryPath is where the durable unresolved-recovery marker lives.
+func (f *fixture) recoveryPath() string {
+	return f.root + "/my-app/recoveries/production.json"
+}
+
 func attemptPresent(t *testing.T, f *fixture) bool {
 	t.Helper()
 	_, err := f.target.ReadAttempt(t.Context(), "my-app", "production")
@@ -48,6 +53,29 @@ func attemptPresent(t *testing.T, f *fixture) bool {
 	}
 	t.Fatalf("read attempt marker: %v", err)
 	return false
+}
+
+func recoveryPresent(t *testing.T, f *fixture) bool {
+	t.Helper()
+	_, err := f.target.ReadRecovery(t.Context(), "my-app", "production")
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, target.ErrRecoveryAbsent) {
+		return false
+	}
+	t.Fatalf("read recovery marker: %v", err)
+	return false
+}
+
+// removeRecoveryMarker is the documented explicit operator resolution:
+// after verifying the target's actual state, the operator removes the
+// unresolved recovery marker so a fresh recovery can start.
+func removeRecoveryMarker(t *testing.T, f *fixture) {
+	t.Helper()
+	if err := os.Remove(f.recoveryPath()); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestDeployUncertainCommitRetryIsRefused(t *testing.T) {

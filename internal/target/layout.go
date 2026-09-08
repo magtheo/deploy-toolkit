@@ -19,9 +19,11 @@ var (
 
 // Layout derives every path the toolkit owns on a target:
 //
-//	<deployRoot>/<project>/releases/<version>/   staged release trees
-//	<deployRoot>/<project>/state/<env>.json      observed state snapshot
-//	<deployRoot>/<project>/history/<env>.jsonl   durable history log
+//	<deployRoot>/<project>/releases/<version>/    staged release trees
+//	<deployRoot>/<project>/state/<env>.json       observed state snapshot
+//	<deployRoot>/<project>/history/<env>.jsonl    durable history log
+//	<deployRoot>/<project>/attempts/<env>.json    unresolved deployment attempt
+//	<deployRoot>/<project>/recoveries/<env>.json  unresolved recovery (rollback) attempt
 //
 // Paths are a pure function of validated identities — project, environment
 // and version — never of time, sequence numbers or configuration state.
@@ -85,6 +87,23 @@ func (l Layout) AttemptPath(project, env string) (string, error) {
 		return "", err
 	}
 	return l.root + "/" + project + "/attempts/" + env + ".json", nil
+}
+
+// RecoveryPath is the durable unresolved-recovery marker: evidence that a
+// previous ROLLBACK may have performed consequential work with an
+// unresolved outcome. This is deliberately a separate fact from the
+// deployment attempt marker — the attempt says why recovery is needed,
+// the recovery marker says what recovery was started and whether it
+// finished. Presence requires explicit resolution before any new
+// deployment or recovery of the environment.
+func (l Layout) RecoveryPath(project, env string) (string, error) {
+	if err := checkSlug("project", project); err != nil {
+		return "", err
+	}
+	if err := checkSlug("environment", env); err != nil {
+		return "", err
+	}
+	return l.root + "/" + project + "/recoveries/" + env + ".json", nil
 }
 
 // LockPath is the environment lock directory: acquired atomically with

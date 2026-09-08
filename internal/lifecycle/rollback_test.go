@@ -102,8 +102,11 @@ func TestRollbackResolvesUnresolvedAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.FailureReason != "" || !rep.Committed || !rep.RecoveryResolved || rep.MarkerCreated {
+	if rep.FailureReason != "" || !rep.Committed || !rep.RecoveryResolved || !rep.RecoveryMarkerCreated {
 		t.Fatalf("rollback rep = %+v", rep)
+	}
+	if rep.RecoveryID == "" {
+		t.Fatal("a recovery must carry its marker id in the report")
 	}
 	want := "preflight-1.0.0,migrate-1.0.0,apply-1.0.0,verify-1.0.0," +
 		"preflight-2.0.0,migrate-2.0.0,apply-2.0.0,verify-2.0.0," +
@@ -125,13 +128,17 @@ func TestRollbackResolvesUnresolvedAttempt(t *testing.T) {
 	// the recovery (their only appearances are the failed deployment
 	// itself).
 
-	// Observed state is back to the restored release; the marker is gone.
+	// Observed state is back to the restored release, signed by THIS
+	// recovery; both markers are gone.
 	st, err = f.target.ReadState(t.Context(), "my-app", "production")
 	if err != nil || st.Current == nil || st.Current.Release != "1.0.0" || st.Current.BundleDigest != rep.ToBundleDigest {
 		t.Fatalf("state after rollback = %+v, %v", st.Current, err)
 	}
-	if attemptPresent(t, f) {
-		t.Error("trusted terminal did not clear the attempt marker")
+	if st.Current.OperationID != "recovery:"+rep.RecoveryID {
+		t.Errorf("state operationId = %q, want recovery:%s", st.Current.OperationID, rep.RecoveryID)
+	}
+	if attemptPresent(t, f) || recoveryPresent(t, f) {
+		t.Error("trusted terminal did not clear the attempt and recovery markers")
 	}
 	requireNoLock(t, f)
 
@@ -145,6 +152,9 @@ func TestRollbackResolvesUnresolvedAttempt(t *testing.T) {
 	rb := records[2].Data
 	if rb["fromRelease"] != "2.0.0" || rb["toRelease"] != "1.0.0" || rb["authorization"] != "recovery" || rb["recoveryResolved"] != true {
 		t.Errorf("rollback history data = %+v", rb)
+	}
+	if rb["recoveryId"] != rep.RecoveryID {
+		t.Errorf("rollback history recoveryId = %#v, want %s", rb["recoveryId"], rep.RecoveryID)
 	}
 }
 
@@ -171,7 +181,7 @@ func TestRollbackEmergencyWithoutMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.FailureReason != "" || !rep.Committed || !rep.MarkerCreated || rep.RecoveryResolved {
+	if rep.FailureReason != "" || !rep.Committed || !rep.RecoveryMarkerCreated || rep.RecoveryResolved {
 		t.Fatalf("rollback rep = %+v", rep)
 	}
 	if got := strings.Join(order(t, f.marker), ","); got != "preflight,migrate,apply,verify,preflight,migrate,apply,verify,preflight,rollback,apply,verify" {
@@ -181,12 +191,12 @@ func TestRollbackEmergencyWithoutMarker(t *testing.T) {
 	if err != nil || st.Current == nil || st.Current.Release != "1.0.0" {
 		t.Fatalf("state after emergency rollback = %+v, %v", st.Current, err)
 	}
-	if attemptPresent(t, f) {
-		t.Error("emergency rollback's own marker was not cleared")
+	if attemptPresent(t, f) || recoveryPresent(t, f) {
+		t.Error("emergency rollback's recovery marker was not cleared")
 	}
 	requireNoLock(t, f)
 	records := history(t, f)
-	if len(records) != 3 || records[2].Type != "rollback.succeeded" || records[2].Data["markerCreated"] != true {
+	if len(records) != 3 || records[2].Type != "rollback.succeeded" || records[2].Data["recoveryMarkerCreated"] != true {
 		t.Fatalf("history = %+v", records)
 	}
 }
@@ -343,8 +353,8 @@ func TestRollbackAutoRequiresMarkerAndSafeRelease(t *testing.T) {
 		if rep.StagedFrom != target.StageNew {
 			t.Errorf("stagedFrom = %s, want new (auto recovery stages the failed release itself)", rep.StagedFrom)
 		}
-		if attemptPresent(t, f) {
-			t.Error("resolved auto rollback left the marker")
+		if attemptPresent(t, f) || recoveryPresent(t, f) {
+			t.Error("resolved auto rollback left attempt/recovery markers behind")
 		}
 		requireNoLock(t, f)
 	})
@@ -391,10 +401,15 @@ func TestRollbackIrreversibleRefusedForEveryAuthority(t *testing.T) {
 	requireNoLock(t, f)
 }
 
-func TestRollbackFailureKeepsMarkerAndRetryResolves(t *testing.T) {
-	// A rollback that dies mid-flight has an unknown outcome: the marker
-	// stays and the environment stays recovery-required. Because the
-	// bindings still hold, a LATER rollback is the retry that resolves.
+func TestRollbackFailedRecoveryRequiresExplicitResolution(t *testing.T) {
+	// The recovery-of-recovery rule: once the recovery marker exists, ANY
+	// failure keeps it, and an ordinary retry REFUSES instead of
+	// repeating consequential work. B's rollback hook may have reversed a
+	// migration and A's apply may have half-run — "try the whole
+	// sequence again" is exactly the behavior the attempt-marker
+	// machinery exists to prevent. Resolution is explicit: an operator
+	// verifies the target, removes the marker, and takes a fresh,
+	// deliberate recovery.
 	f := newFixture(t, "my-app", versionTaggedHooks)
 	revA := f.revision
 	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
@@ -409,7 +424,8 @@ func TestRollbackFailureKeepsMarkerAndRetryResolves(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Recovery loses the transport during 1.0.0's apply.
+	// Recovery loses the transport during 1.0.0's apply — AFTER 2.0.0's
+	// rollback hook ran.
 	tr := &failingRunTransport{
 		inner:    local.New(),
 		failWhen: func(argv0 string) bool { return strings.Contains(argv0, "apply.sh") },
@@ -423,28 +439,313 @@ func TestRollbackFailureKeepsMarkerAndRetryResolves(t *testing.T) {
 	if _, err := Rollback(t.Context(), in); err == nil {
 		t.Fatal("transport loss during recovery must be an error")
 	}
-	if !attemptPresent(t, f) {
-		t.Fatal("a failed recovery must keep the marker — its own outcome is unresolved")
+	if !attemptPresent(t, f) || !recoveryPresent(t, f) {
+		t.Fatal("a failed recovery must keep BOTH markers — its own outcome is unresolved")
 	}
 	if st, err := f.target.ReadState(t.Context(), "my-app", "production"); err != nil || st.Current.Release != "1.0.0" {
 		t.Fatalf("state must be untouched by the failed recovery: %+v, %v", st.Current, err)
 	}
 	requireNoLock(t, f)
+	afterFirst := order(t, f.marker)
+	if strings.Count(strings.Join(afterFirst, ","), "rollback-2.0.0") != 1 {
+		t.Fatalf("rollback hook execution = %v, want exactly one rollback hook run", afterFirst)
+	}
 
-	// The retry (healthy transport) resolves the same recorded attempt.
+	// An ordinary retry REFUSES and repeats nothing.
 	rep, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.FailureReason != "" || !rep.Committed || !rep.RecoveryResolved {
-		t.Fatalf("retry rep = %+v", rep)
+	if !rep.RecoveryRequired || rep.Committed {
+		t.Fatalf("retry rep = %+v, want recovery-required refusal", rep)
 	}
-	if attemptPresent(t, f) {
-		t.Error("resolved retry left the marker")
+	if !strings.Contains(rep.FailureReason, "not known-safe") {
+		t.Errorf("failure reason = %q", rep.FailureReason)
+	}
+	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(afterFirst, ",") {
+		t.Fatalf("the refused retry re-ran hooks: %v → %v", afterFirst, got)
+	}
+	if !attemptPresent(t, f) || !recoveryPresent(t, f) {
+		t.Fatal("a refused retry must keep both markers")
+	}
+
+	// Explicit resolution: the operator verifies the target and removes
+	// the recovery marker — then a FRESH recovery is authorized and
+	// resolves the original deployment attempt.
+	removeRecoveryMarker(t, f)
+	rep, err = Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.FailureReason != "" || !rep.Committed || !rep.RecoveryResolved || !rep.RecoveryMarkerCreated {
+		t.Fatalf("fresh recovery rep = %+v", rep)
+	}
+	if attemptPresent(t, f) || recoveryPresent(t, f) {
+		t.Error("resolved recovery left markers behind")
 	}
 	records := history(t, f)
+	if records[len(records)-1].Type != "rollback.succeeded" {
+		t.Fatalf("history tail = %+v", records[len(records)-1])
+	}
+}
+
+func TestRollbackEmergencyRetryIsRefusedNotReplayed(t *testing.T) {
+	// A marker-less emergency rollback that fails mid-flight must leave a
+	// RECOVERY marker whose direction is the rollback's own (B → A). The
+	// pre-recovery-marker design recorded that direction on the attempt
+	// marker and then misread it as an original deployment attempt,
+	// making the retry impossible; now the retry is simply refused —
+	// with no hook repetition — until explicit resolution. (Plain hooks:
+	// both deployments must be healthy here.)
+	f := newFixture(t, "my-app", nil)
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deploy(t, f, "my-app", "2.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	tr := &failingRunTransport{
+		inner:    local.New(),
+		failWhen: func(argv0 string) bool { return strings.Contains(argv0, "apply.sh") },
+	}
+	tgt, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := rollbackInput(t, f, f.revision, "2.0.0", f.revision, "1.0.0", RollbackManual)
+	in.Target = tgt
+	if _, err := Rollback(t.Context(), in); err == nil {
+		t.Fatal("transport loss during emergency rollback must be an error")
+	}
+	if attemptPresent(t, f) {
+		t.Fatal("an emergency rollback must not fabricate a deployment attempt marker")
+	}
+	if !recoveryPresent(t, f) {
+		t.Fatal("a failed emergency rollback must leave its recovery marker")
+	}
+	rm, err := f.target.ReadRecovery(t.Context(), "my-app", "production")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rm.FromRelease != "2.0.0" || rm.ToRelease != "1.0.0" || rm.SourceAttemptID != "" || rm.Authorization != "manual" {
+		t.Fatalf("recovery marker = %+v, want the rollback's own transition", rm)
+	}
+	afterFirst := order(t, f.marker)
+
+	rep, err := Rollback(t.Context(), rollbackInput(t, f, f.revision, "2.0.0", f.revision, "1.0.0", RollbackManual))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.RecoveryRequired || rep.Committed {
+		t.Fatalf("retry rep = %+v, want refusal", rep)
+	}
+	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(afterFirst, ",") {
+		t.Fatalf("the refused retry re-ran hooks: %v → %v", afterFirst, got)
+	}
+	if !recoveryPresent(t, f) {
+		t.Fatal("a refused retry deleted the recovery marker")
+	}
+	requireNoLock(t, f)
+}
+
+func TestRollbackStaleRecoveryMarkerSelfHealsWithoutHooks(t *testing.T) {
+	// The crash window that release identity cannot close: recovery
+	// commits observed state (A, operationId recovery:X) and the marker
+	// cleanup fails. Durable state — observed A + recovery marker — is
+	// observationally identical to "rollback never started" (observed A
+	// already said A). The operationId breaks the tie: when observed
+	// state carries recovery:X, the NEXT recovery invocation for the
+	// same transition may complete the cleanup — and must run NO hooks,
+	// because re-running B's rollback hook or A's apply over a committed
+	// A would be blind consequential work.
+	f := newFixture(t, "my-app", versionTaggedHooks)
+	revA := f.revision
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB := secondRevision(t, f)
+	relB, bytesB := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "2.0.0"), Release: relB, Bundle: bytesB, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The recovery succeeds through the state commit; removing the
+	// recovery marker then loses the connection.
+	tr := &failingRunTransport{
+		inner: local.New(),
+		failRunWhen: func(argv []string) bool {
+			return argv[0] == "rm" && strings.HasSuffix(argv[len(argv)-1], "/recoveries/production.json")
+		},
+	}
+	tgt, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery)
+	in.Target = tgt
+	rep, err := Rollback(t.Context(), in)
+	if err == nil || !strings.Contains(err.Error(), "recovery marker could not be cleared") {
+		t.Fatalf("err = %v, want a recovery-cleanup failure", err)
+	}
+	if !rep.Committed {
+		t.Fatal("the state commit happened and must be reported")
+	}
+	// Clearing order: the attempt marker went first and is gone; the
+	// leftover RECOVERY marker is the healable one.
+	if !recoveryPresent(t, f) {
+		t.Fatal("the recovery marker must survive the failed cleanup")
+	}
+	if attemptPresent(t, f) {
+		t.Fatal("the attempt marker should already be cleared (attempt-first order)")
+	}
+	if st, err := f.target.ReadState(t.Context(), "my-app", "production"); err != nil || st.Current.OperationID != "recovery:"+rep.RecoveryID {
+		t.Fatalf("state = %+v, %v; want operationId recovery:%s", st.Current, err, rep.RecoveryID)
+	}
+	before := order(t, f.marker)
+
+	// The next recovery invocation for the same transition recognizes the
+	// proven commit, runs nothing, and completes the cleanup.
+	rep2, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep2.AlreadyRecovered || rep2.Committed || rep2.RecoveryMarkerCreated {
+		t.Fatalf("self-heal rep = %+v, want cleanup-only", rep2)
+	}
+	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(before, ",") {
+		t.Fatalf("the self-heal executed hooks: %v → %v", before, got)
+	}
+	if attemptPresent(t, f) || recoveryPresent(t, f) {
+		t.Error("self-heal did not clear the markers")
+	}
+	requireNoLock(t, f)
+	records := history(t, f)
 	last := records[len(records)-1]
-	if last.Type != "rollback.succeeded" {
+	if last.Type != "rollback.already-recovered" || last.Data["alreadyRecovered"] != true {
+		t.Fatalf("history tail = %+v", last)
+	}
+}
+
+func TestRollbackRecoveryMarkerMismatchAndCorruptionFailClosed(t *testing.T) {
+	f := newFixture(t, "my-app", versionTaggedHooks)
+	revA := f.revision
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB := secondRevision(t, f)
+	relB, bytesB := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "2.0.0"), Release: relB, Bundle: bytesB, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before := order(t, f.marker)
+
+	t.Run("corrupt recovery marker", func(t *testing.T) {
+		if err := os.MkdirAll(filepath.Dir(f.recoveryPath()), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f.recoveryPath(), []byte("{broken"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery)); err == nil {
+			t.Fatal("a corrupt recovery marker must fail closed, not count as absent")
+		}
+		if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(before, ",") {
+			t.Error("hooks ran despite a corrupt recovery marker")
+		}
+	})
+	t.Run("different transition", func(t *testing.T) {
+		relB2, _ := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+		if err := f.target.WriteRecovery(t.Context(), target.RecoveryMarker{
+			RecoveryID:       "0123456789abcdef",
+			SourceAttemptID:  "",
+			Project:          "my-app",
+			Environment:      "production",
+			FromRelease:      "2.0.0",
+			FromBundleDigest: relB2.Bundle.Digest,
+			ToRelease:        "0.9.0",
+			ToBundleDigest:   relB2.Bundle.Digest,
+			Authorization:    "manual",
+			StartedAt:        "2026-09-08T00:00:00Z",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rep, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !rep.RecoveryRequired || rep.Committed || !strings.Contains(rep.FailureReason, "not known-safe") {
+			t.Fatalf("rep = %+v, want unresolved-recovery refusal", rep)
+		}
+		if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(before, ",") {
+			t.Error("hooks ran despite an unresolved unrelated recovery")
+		}
+		if !recoveryPresent(t, f) {
+			t.Error("the refusal deleted the unrelated recovery marker")
+		}
+	})
+	requireNoLock(t, f)
+}
+
+func TestDeployRefusesWhileRecoveryUnresolved(t *testing.T) {
+	// An unresolved recovery means production may be between the two
+	// releases. Normal Deploy of ANYTHING must refuse — including the
+	// release the recovery was restoring — and must never heal or clear
+	// the recovery marker; resolution belongs to the recovery operation.
+	f := newFixture(t, "my-app", versionTaggedHooks)
+	revA := f.revision
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB := secondRevision(t, f)
+	relB, bytesB := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "2.0.0"), Release: relB, Bundle: bytesB, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tr := &failingRunTransport{
+		inner:    local.New(),
+		failWhen: func(argv0 string) bool { return strings.Contains(argv0, "apply.sh") },
+	}
+	tgt, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery)
+	in.Target = tgt
+	if _, err := Rollback(t.Context(), in); err == nil {
+		t.Fatal("test setup: recovery must fail")
+	}
+	before := order(t, f.marker)
+
+	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.RecoveryRequired || rep.Committed || rep.AlreadyCurrent {
+		t.Fatalf("deploy rep = %+v, want recovery-required refusal", rep)
+	}
+	if !strings.Contains(rep.FailureReason, "unresolved recovery marker") {
+		t.Errorf("failure reason = %q", rep.FailureReason)
+	}
+	if got := order(t, f.marker); strings.Join(got, ",") != strings.Join(before, ",") {
+		t.Fatalf("deploy ran hooks during an unresolved recovery: %v → %v", before, got)
+	}
+	if !recoveryPresent(t, f) || !attemptPresent(t, f) {
+		t.Fatal("deploy must not touch either marker")
+	}
+	requireNoLock(t, f)
+	records := history(t, f)
+	last := records[len(records)-1]
+	if last.Type != "deploy.failed" || last.Data["recoveryRequired"] != true {
 		t.Fatalf("history tail = %+v", last)
 	}
 }
