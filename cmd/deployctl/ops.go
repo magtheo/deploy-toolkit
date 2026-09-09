@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -20,14 +21,25 @@ import (
 // Exit codes for the operational commands. 0 = success (including
 // already-current / already-recovered), 1 = a reported outcome failure
 // (determined: the history log records what happened), 2 = usage or
-// configuration error, 3 = infrastructure failure (UNCERTAIN: the command
-// may have executed consequential work; never blindly retry — run status).
+// configuration error, 3 = infrastructure failure.
+//
+// Exit 3 alone must never be read as "outcome uncertain": the command's
+// REPORT distinguishes pre-execution failures (no lifecycle operation
+// ran), bookkeeping failures after a committed state, and uncertain
+// outcomes (an attempt/recovery marker is unresolved — RECOVERY
+// REQUIRED). Automation keys on that reported recovery state, never on
+// the exit code alone.
 const (
 	exitOK     = 0
 	exitFailed = 1
 	exitUsage  = 2
 	exitInfra  = 3
 )
+
+// errTargetConfig marks a connect() failure that is local configuration —
+// an unset variable, an unreadable or unparseable credential file — rather
+// than a target-infrastructure problem. No network contact was attempted.
+var errTargetConfig = errors.New("target configuration")
 
 // deploymentContext is everything the operational commands load from the
 // consumer repository: the environment (desired state), the release it
@@ -64,8 +76,21 @@ func (dc *deploymentContext) loadRelease(version string) (*manifest.Release, err
 }
 
 // connect builds the transport the Target manifest declares and returns
-// the target handle. Credentials and host keys come from the environment
-// variables the manifest names — never from Git.
+// the target handle.
+//
+// SSH environment-variable contract: the manifest names variables; the
+// environment holds values.
+//
+//	hostFrom:       value is the hostname.
+//	credentialFrom: value is a PATH to the SSH private-key file.
+//	hostKeyFrom:    value is a PATH to a file holding the pinned host key
+//	                (authorized_keys format). The target pins its host key;
+//	                host-key prompts and StrictHostKeyChecking bypasses do
+//	                not exist here.
+//
+// Credential material itself never lives in the manifest or in Git.
+// Failures to assemble this configuration return an error wrapping
+// errTargetConfig; only dial/handshake failures are infrastructure.
 func connect(ctx context.Context, mt *manifest.Target) (*target.Target, error) {
 	spec := mt.Spec.Transport
 	var tr transport.Transport
@@ -75,23 +100,31 @@ func connect(ctx context.Context, mt *manifest.Target) (*target.Target, error) {
 	case manifest.TransportSSH:
 		host := os.Getenv(spec.HostFrom)
 		if host == "" {
-			return nil, fmt.Errorf("ssh: %s is not set (the target manifest names the variable, the environment holds the value)", spec.HostFrom)
+			return nil, fmt.Errorf("ssh: %s is not set (the target manifest names the variable, the environment holds the value): %w", spec.HostFrom, errTargetConfig)
 		}
-		keyData, err := os.ReadFile(os.Getenv(spec.CredentialFrom))
+		keyPath := os.Getenv(spec.CredentialFrom)
+		if keyPath == "" {
+			return nil, fmt.Errorf("ssh: %s is not set (names the private-key file path): %w", spec.CredentialFrom, errTargetConfig)
+		}
+		keyData, err := os.ReadFile(keyPath)
 		if err != nil {
-			return nil, fmt.Errorf("ssh: read credential %s: %w", spec.CredentialFrom, err)
+			return nil, fmt.Errorf("ssh: read credential file (%s, from %s): %w (%w)", keyPath, spec.CredentialFrom, err, errTargetConfig)
 		}
 		signer, err := ssh.ParsePrivateKey(keyData)
 		if err != nil {
-			return nil, fmt.Errorf("ssh: parse credential: %w", err)
+			return nil, fmt.Errorf("ssh: %s does not contain a parseable private key: %w (%w)", keyPath, err, errTargetConfig)
 		}
-		hostKeyData, err := os.ReadFile(os.Getenv(spec.HostKeyFrom))
+		hostKeyPath := os.Getenv(spec.HostKeyFrom)
+		if hostKeyPath == "" {
+			return nil, fmt.Errorf("ssh: %s is not set (names the pinned host-key file path): %w", spec.HostKeyFrom, errTargetConfig)
+		}
+		hostKeyData, err := os.ReadFile(hostKeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("ssh: read pinned host key %s: %w", spec.HostKeyFrom, err)
+			return nil, fmt.Errorf("ssh: read pinned host key file (%s, from %s): %w (%w)", hostKeyPath, spec.HostKeyFrom, err, errTargetConfig)
 		}
 		hostKey, err := ssh.ParseHostKey(string(hostKeyData))
 		if err != nil {
-			return nil, fmt.Errorf("ssh: parse pinned host key: %w", err)
+			return nil, fmt.Errorf("ssh: %s does not contain a parseable host key: %w (%w)", hostKeyPath, err, errTargetConfig)
 		}
 		tr, err = ssh.New(ctx, ssh.Config{
 			Host: host, Port: spec.EffectivePort(), User: spec.User,
@@ -101,9 +134,40 @@ func connect(ctx context.Context, mt *manifest.Target) (*target.Target, error) {
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("target %q declares unsupported transport type %q", mt.Metadata.Name, spec.Type)
+		return nil, fmt.Errorf("target %q declares unsupported transport type %q: %w", mt.Metadata.Name, spec.Type, errTargetConfig)
 	}
 	return target.FromManifest(tr, mt)
+}
+
+// reportConnectFailure renders a failure that happened before any
+// lifecycle operation: nothing was executed and nothing is unresolved.
+func reportConnectFailure(err error, cmd, envName string, stderr io.Writer) int {
+	if errors.Is(err, errTargetConfig) {
+		fmt.Fprintf(stderr, "✗ %s %s: configuration error: %v\n", cmd, envName, err)
+		fmt.Fprintln(stderr, "  Nothing was started; no lifecycle operation was executed.")
+		return exitUsage
+	}
+	fmt.Fprintf(stderr, "✗ %s %s: infrastructure failure: %v\n", cmd, envName, err)
+	fmt.Fprintln(stderr, "  The operation did not start: the target could not be reached.")
+	fmt.Fprintln(stderr, "  No lifecycle operation was executed; nothing is unresolved.")
+	return exitInfra
+}
+
+// hasUnresolvedMarkers reports whether an attempt or recovery marker is
+// readable on the target. Used to classify an engine infrastructure
+// failure: the durable markers — not internal bookkeeping — decide
+// whether the consequential boundary may have been crossed. The engine
+// writes the marker before the first consequential stage, so an error
+// with no marker present means no consequential work was executed.
+func hasUnresolvedMarkers(ctx context.Context, tgt *target.Target, project, env string) bool {
+	if tgt == nil {
+		return false
+	}
+	if _, err := tgt.ReadAttempt(ctx, project, env); err == nil {
+		return true
+	}
+	_, err := tgt.ReadRecovery(ctx, project, env)
+	return err == nil
 }
 
 // prepareBundle is the prepare side at the command line: build the

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
+	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
 // runDeploy executes a deployment of the release the environment pins.
@@ -17,8 +18,9 @@ import (
 // and renders the report.
 //
 // Exit codes: 0 success / already-current, 1 reported deployment failure,
-// 2 usage or configuration error, 3 infrastructure failure (uncertain —
-// never blindly retry; run deployctl status).
+// 2 usage or configuration error, 3 infrastructure failure. The failure
+// REPORT — not the exit code — says whether the outcome is uncertain
+// (unresolved attempt/recovery marker) or nothing was executed.
 func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		fmt.Fprintln(stderr, "usage: deployctl deploy <environment> [--repo-dir .] [--owner identity]")
@@ -53,8 +55,7 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 	tgt, err := connect(ctx, dc.Target)
 	if err != nil {
-		fmt.Fprintf(stderr, "✗ deploy %s: %v\n", envName, err)
-		return exitInfra
+		return reportConnectFailure(err, "deploy", envName, stderr)
 	}
 	ownerID := *owner
 	if ownerID == "" {
@@ -69,14 +70,31 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		Bundle:         bundleBytes,
 		Owner:          ownerID,
 	})
-	return reportDeploy(rep, err, stdout, stderr)
+	return reportDeploy(ctx, rep, err, tgt, stdout, stderr)
 }
 
-func reportDeploy(rep *lifecycle.Report, err error, stdout, stderr io.Writer) int {
+func reportDeploy(ctx context.Context, rep *lifecycle.Report, err error, tgt *target.Target, stdout, stderr io.Writer) int {
 	if err != nil {
-		fmt.Fprintf(stderr, "✗ deploy %s: infrastructure failure: %v\n", rep.Project+"/"+rep.Environment, err)
-		fmt.Fprintln(stderr, "  The outcome is UNCERTAIN — the deployment may have executed consequential work.")
-		fmt.Fprintln(stderr, "  Do not simply retry: run `deployctl status` and follow the recovery guidance.")
+		env := "?"
+		if rep != nil {
+			env = rep.Project + "/" + rep.Environment
+		}
+		fmt.Fprintf(stderr, "✗ deploy %s: infrastructure failure: %v\n", env, err)
+		switch {
+		case rep != nil && rep.Committed:
+			fmt.Fprintln(stderr, "  The observed state IS committed — the deployment itself succeeded.")
+			fmt.Fprintln(stderr, "  What failed is bookkeeping (marker/history cleanup): the leftover")
+			fmt.Fprintln(stderr, "  marker still blocks normal operation. Run `deployctl status` and")
+			fmt.Fprintln(stderr, "  follow its guidance.")
+		case rep != nil && hasUnresolvedMarkers(ctx, tgt, rep.Project, rep.Environment):
+			fmt.Fprintln(stderr, "  The outcome is UNCERTAIN: consequential deployment work may have")
+			fmt.Fprintln(stderr, "  executed (an attempt or recovery marker is unresolved).")
+			fmt.Fprintln(stderr, "  Do not retry. Run `deployctl status` and follow the recovery guidance.")
+		default:
+			fmt.Fprintln(stderr, "  No consequential work was executed — nothing was applied to the target.")
+			fmt.Fprintln(stderr, "  After the infrastructure problem is fixed, the deployment can simply")
+			fmt.Fprintln(stderr, "  be rerun.")
+		}
 		return exitInfra
 	}
 	fmt.Fprintf(stdout, "Deploy %s: release %s\n", rep.Project+"/"+rep.Environment, rep.Version)

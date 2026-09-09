@@ -141,8 +141,18 @@ with a reverse diff, not `rollback`.
 
 Operational exit codes (deploy, rollback): `0` success, `1` reported
 outcome failure (determined — history records what happened), `2`
-usage/configuration error, `3` infrastructure failure (**uncertain** —
-consequential work may have executed; never blindly retry, run `status`).
+usage/configuration error, `3` infrastructure failure. The failure
+**report** — never the exit code alone — distinguishes pre-execution
+failures (nothing ran), bookkeeping failures after a committed state, and
+uncertain outcomes (an attempt/recovery marker is unresolved). Automation
+keys on the reported recovery state, not on exit 3.
+
+For SSH targets, the manifest names environment variables and the
+environment holds values: `credentialFrom` and `hostKeyFrom` name
+variables whose values are **paths** to the private-key file and to the
+pinned host-key file (authorized_keys format). `status` fails closed:
+unreadable recovery evidence is DEGRADED EVIDENCE, never a silent
+HEALTHY, and a held lock dominates marker guidance.
 
 ## For consumers
 

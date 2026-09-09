@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
+	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
 // runRollback is the explicit manual/emergency recovery path: restore a
@@ -50,6 +51,18 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		fmt.Fprintln(stderr, "deployctl rollback: --to <version> is required")
 		return exitUsage
 	}
+	// Versions become release paths: validate them as strict SemVer
+	// before they feed into filesystem path construction.
+	if err := target.CheckVersion(*to); err != nil {
+		fmt.Fprintf(stderr, "deployctl rollback: --to: %v\n", err)
+		return exitUsage
+	}
+	if *from != "" {
+		if err := target.CheckVersion(*from); err != nil {
+			fmt.Fprintf(stderr, "deployctl rollback: --from: %v\n", err)
+			return exitUsage
+		}
+	}
 
 	dc, err := loadDeploymentContext(*repoDir, envName)
 	if err != nil {
@@ -82,15 +95,13 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		fmt.Fprintf(stderr, "✗ rollback %s: %v\n", envName, err)
 		return exitUsage
 	}
-	tgt, err := connect(ctx, dc.Target)
-	if err != nil {
-		fmt.Fprintf(stderr, "✗ rollback %s: %v\n", envName, err)
-		return exitInfra
-	}
 
-	// Typed confirmation. The sentence names environment and transition;
-	// near-misses are refused. This is the human authorization act for
-	// the emergency path — deliberate friction by design.
+	// Typed confirmation BEFORE the target is contacted: the human
+	// authorization boundary is also the first production contact.
+	// Nothing — not even an authenticated connection — happens before
+	// the sentence matches. The sentence names environment and
+	// transition; near-misses are refused. This is deliberate friction
+	// by design.
 	sentence := fmt.Sprintf("rollback %s to %s", envName, toRel.Metadata.Version)
 	got := *confirm
 	if got == "" {
@@ -108,8 +119,13 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		got = strings.TrimSpace(line)
 	}
 	if got != sentence {
-		fmt.Fprintf(stderr, "✗ rollback aborted: confirmation does not match %q — nothing was executed\n", sentence)
+		fmt.Fprintf(stderr, "✗ rollback aborted: confirmation does not match %q — nothing was executed, the target was not contacted\n", sentence)
 		return exitFailed
+	}
+
+	tgt, err := connect(ctx, dc.Target)
+	if err != nil {
+		return reportConnectFailure(err, "rollback", envName, stderr)
 	}
 
 	ownerID := *owner
@@ -127,14 +143,31 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		Authorization:  lifecycle.RollbackManual,
 		Owner:          ownerID,
 	})
-	return reportRollback(rep, err, envName, stdout, stderr)
+	return reportRollback(ctx, rep, err, tgt, envName, stdout, stderr)
 }
 
-func reportRollback(rep *lifecycle.RollbackReport, err error, envName string, stdout, stderr io.Writer) int {
+func reportRollback(ctx context.Context, rep *lifecycle.RollbackReport, err error, tgt *target.Target, envName string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "✗ rollback %s: infrastructure failure: %v\n", envName, err)
-		fmt.Fprintln(stderr, "  The outcome is UNCERTAIN — the recovery may have executed consequential work.")
-		fmt.Fprintln(stderr, "  Do not simply retry: run `deployctl status` and follow the recovery guidance.")
+		switch {
+		case rep != nil && rep.Committed:
+			fmt.Fprintln(stderr, "  The observed state IS committed — the recovery itself succeeded.")
+			fmt.Fprintln(stderr, "  What failed is bookkeeping (marker/history cleanup): the leftover")
+			fmt.Fprintln(stderr, "  marker still blocks normal operation. Run `deployctl status` and")
+			fmt.Fprintln(stderr, "  follow its guidance.")
+		case rep != nil && rep.AlreadyRecovered:
+			fmt.Fprintln(stderr, "  The recovery IS already committed (observed state carries its")
+			fmt.Fprintln(stderr, "  operationId); what failed is marker cleanup, which still blocks")
+			fmt.Fprintln(stderr, "  normal operation. Run `deployctl status` and follow its guidance.")
+		case rep != nil && hasUnresolvedMarkers(ctx, tgt, rep.Project, rep.Environment):
+			fmt.Fprintln(stderr, "  The outcome is UNCERTAIN: consequential recovery work may have")
+			fmt.Fprintln(stderr, "  executed (an attempt or recovery marker is unresolved).")
+			fmt.Fprintln(stderr, "  Do not retry. Run `deployctl status` and follow the recovery guidance.")
+		default:
+			fmt.Fprintln(stderr, "  No consequential work was executed — nothing was applied to the target.")
+			fmt.Fprintln(stderr, "  After the infrastructure problem is fixed, the recovery can simply")
+			fmt.Fprintln(stderr, "  be rerun.")
+		}
 		return exitInfra
 	}
 	fmt.Fprintf(stdout, "Recovery %s: %s → %s\n", rep.Project+"/"+rep.Environment, rep.FromVersion, rep.ToVersion)

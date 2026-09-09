@@ -71,8 +71,11 @@ Usage:
 
 Operational exit codes (deploy, rollback): 0 success, 1 reported outcome
 failure (determined — history records what happened), 2 usage/configuration
-error, 3 infrastructure failure (UNCERTAIN — consequential work may have
-executed; never blindly retry, run deployctl status).
+error, 3 infrastructure failure. The failure REPORT — never the exit code
+alone — distinguishes pre-execution failures (nothing ran), bookkeeping
+failures after a committed state, and uncertain outcomes (an attempt or
+recovery marker is unresolved). Automation keys on the reported recovery
+state, not on exit 3.
 
 Release creation stops at the Release boundary: it never updates environments
 and never opens pull requests. Promotion proposals stop at the open, verified
@@ -120,15 +123,27 @@ Rollback flags (manual/emergency recovery):
   --repo-dir .                  checkout containing both release revisions
   --confirm "sentence"          typed confirmation; omit to be prompted
 
-Requires typing exactly: rollback <env> to <version>. Normal rollback of a
-healthy deployment is an ordinary promotion with a reverse diff, not this
-command.
+Requires typing exactly: rollback <env> to <version>. The confirmation gate
+precedes target contact: nothing — not even the connection — happens before
+the sentence matches. Normal rollback of a healthy deployment is an ordinary
+promotion with a reverse diff, not this command.
 
 Status flags:
   --repo-dir .                  checkout containing .deploy/
 
 Status is read-only but uses the deploy credential to inspect the target.
-`, version)
+It fails closed: an unreadable lock, attempt marker, recovery marker or
+observed state is DEGRADED EVIDENCE — HEALTHY is never claimed while any
+evidence is unreadable. A held lock dominates the markers (an operation in
+flight creates them legitimately). Rollback guidance derives from the
+attempt marker's own origin; a first deployment has no restore target.
+
+SSH targets (deploy, rollback, status): the manifest names environment
+variables; the environment holds values. credentialFrom and hostKeyFrom
+name variables whose values are PATHS to the private-key file and the
+pinned host-key file (authorized_keys format). Missing or unparseable
+credential configuration is exit 2; unreachable targets are exit 3 with
+"did not start — nothing was executed".`, version)
 }
 
 func runValidate(paths []string, stdout, stderr io.Writer) int {

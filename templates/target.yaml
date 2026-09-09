@@ -12,6 +12,12 @@ spec:
   transport:
     type: ssh
 
+    # The manifest names environment variables; the environment holds the
+    # values. hostFrom's value is the hostname. hostKeyFrom and
+    # credentialFrom name variables whose VALUES are file PATHS:
+    # credentialFrom points at the SSH private-key file, hostKeyFrom at a
+    # file holding the pinned host key (authorized_keys format). Secret
+    # material itself never lives in this manifest or in Git.
     hostFrom: DEPLOY_HOST
     port: 22
     user: deploy

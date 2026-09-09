@@ -3,13 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"fmt"
-	"github.com/magtheo/deploy-toolkit/internal/bundle"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	gossh "golang.org/x/crypto/ssh"
+
+	"github.com/magtheo/deploy-toolkit/internal/bundle"
 )
 
 // cliFixture is a full consumer repository: hooks, .deploy manifests and
@@ -322,8 +328,14 @@ func TestDeployCommandReportsDeterminedFailure(t *testing.T) {
 	if code != exitOK || !strings.Contains(out, "RECOVERY REQUIRED") {
 		t.Fatalf("status exit = %d, want recovery-required rendering:\n%s", code, out)
 	}
-	if !strings.Contains(out, "deployctl rollback production --to") {
-		t.Errorf("status should point at the explicit recovery path:\n%s", out)
+	// The failed operation was the FIRST deployment (nothing verified
+	// existed before it): the marker's origin is empty, so status must
+	// NOT suggest rolling back to the release that failed.
+	if strings.Contains(out, "deployctl rollback production --to") {
+		t.Errorf("status suggested a rollback target for a first deployment:\n%s", out)
+	}
+	if !strings.Contains(out, "FIRST deployment") {
+		t.Errorf("status should state that no restore target exists:\n%s", out)
 	}
 }
 
@@ -353,15 +365,21 @@ func TestDeployCommandRefusesTamperedRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Flip the first two hex digits of the pinned bundle digest: the
-	// manifest stays structurally valid (parse pipeline passes), but the
-	// bytes no longer hash to the pin.
+	// Flip the first hex digit of the pinned bundle digest to a
+	// GUARANTEED-different digit (a fixed replacement would be a no-op
+	// when the genuine digest already starts with it): the manifest
+	// stays structurally valid (parse pipeline passes), but the bytes
+	// no longer hash to the pin.
 	needle := "bundle:\n  digest: sha256:"
 	i := strings.Index(string(raw), needle)
 	if i < 0 {
 		t.Fatal("fixture bug: bundle digest line not found")
 	}
-	tampered := string(raw)[:i+len(needle)] + "ff" + string(raw)[i+len(needle)+2:]
+	repl := "0"
+	if string(raw)[i+len(needle)] == '0' {
+		repl = "1"
+	}
+	tampered := string(raw)[:i+len(needle)] + repl + string(raw)[i+len(needle)+1:]
 	if err := os.WriteFile(p, []byte(tampered), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -371,5 +389,266 @@ func TestDeployCommandRefusesTamperedRelease(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(f.deployDir, "my-app")); !os.IsNotExist(err) {
 		t.Error("a tampered release must not touch the target")
+	}
+}
+
+// ---- fail-closed status evidence -------------------------------------
+
+func (f *cliFixture) statePath() string {
+	return filepath.Join(f.deployDir, "my-app", "state", "production.json")
+}
+
+func (f *cliFixture) attemptPath() string {
+	return filepath.Join(f.deployDir, "my-app", "attempts", "production.json")
+}
+
+func (f *cliFixture) recoveryPath() string {
+	return filepath.Join(f.deployDir, "my-app", "recoveries", "production.json")
+}
+
+func (f *cliFixture) lockPath() string {
+	return filepath.Join(f.deployDir, "my-app", ".locks", "production")
+}
+
+func writeFileCLIF(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const fakeDigest = "sha256:" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// A valid observed-state document may carry "current": null — "nothing
+// observed deployed". Status must render that, not panic.
+func TestStatusHandlesEmptyCurrentState(t *testing.T) {
+	f := newCLIFixture(t)
+	writeFileCLIF(t, f.statePath(), `{"schema":"toolkit.state/v1","project":"my-app","environment":"production","current":null,"updatedAt":"2026-09-09T00:00:00Z"}`)
+	code, out, errOut := runCLI("status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK {
+		t.Fatalf("status exit = %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	if !strings.Contains(out, "NOT DEPLOYED") || !strings.Contains(out, "records no current deployment") {
+		t.Errorf("stdout =\n%s", out)
+	}
+}
+
+// Corrupt evidence must degrade the whole report: a status that says
+// HEALTHY while the attempt marker is unreadable is exactly backwards.
+func TestStatusFailsClosedOnCorruptMarkers(t *testing.T) {
+	f := newCLIFixture(t)
+	if code, out, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy: %d\n%s\n%s", code, out, errOut)
+	}
+
+	for _, tc := range []struct{ name, path, content string }{
+		{"attempt", f.attemptPath(), "{not json"},
+		{"recovery", f.recoveryPath(), `{"schema":"wrong`},
+	} {
+		writeFileCLIF(t, tc.path, tc.content)
+		code, out, _ := runCLI("status", "production", "--repo-dir", f.repoDir)
+		if code != exitOK {
+			t.Fatalf("%s: status exit = %d", tc.name, code)
+		}
+		if !strings.Contains(out, "DEGRADED EVIDENCE") {
+			t.Errorf("%s marker corrupt: stdout =\n%s", tc.name, out)
+		}
+		if strings.Contains(out, "State         HEALTHY") {
+			t.Errorf("%s marker corrupt: state line claims HEALTHY:\n%s", tc.name, out)
+		}
+		if !strings.Contains(out, "UNREADABLE") {
+			t.Errorf("%s marker corrupt: unreadable fact not named:\n%s", tc.name, out)
+		}
+		os.Remove(tc.path)
+	}
+}
+
+// A held lock dominates marker guidance: during an active rollback the
+// lock AND the recovery marker legitimately coexist, and the only safe
+// instruction is "wait, touch nothing".
+func TestStatusLockDominatesMarkers(t *testing.T) {
+	f := newCLIFixture(t)
+	if code, out, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy: %d\n%s\n%s", code, out, errOut)
+	}
+	writeFileCLIF(t, f.recoveryPath(), fmt.Sprintf(`{"schema":"toolkit.recovery/v1","recoveryId":"0123456789abcdef","sourceAttemptId":"","project":"my-app","environment":"production","fromRelease":"1.0.0","fromBundleDigest":%q,"toRelease":"2.0.0","toBundleDigest":%q,"authorization":"manual","startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest, fakeDigest))
+	writeFileCLIF(t, f.lockPath(), "")
+	code, out, _ := runCLI("status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK {
+		t.Fatalf("status exit = %d", code)
+	}
+	if !strings.Contains(out, "State         LOCKED") {
+		t.Errorf("state line =\n%s", out)
+	}
+	if strings.Contains(out, "RECOVERY REQUIRED") {
+		t.Errorf("an active operation was reported as needing recovery:\n%s", out)
+	}
+	if !strings.Contains(out, "Wait for the active operation") {
+		t.Errorf("missing wait guidance:\n%s", out)
+	}
+}
+
+// Rollback guidance comes from the attempt marker's own origin. An empty
+// origin is a first deployment: there is nothing to restore, and the
+// guidance must say so instead of pointing at the failed release.
+func TestStatusFirstDeploymentAttemptHasNoRestoreTarget(t *testing.T) {
+	f := newCLIFixture(t)
+	writeFileCLIF(t, f.attemptPath(), fmt.Sprintf(`{"schema":"toolkit.attempt/v1","attemptId":"0123456789abcdef","project":"my-app","environment":"production","fromRelease":"","toRelease":"1.0.0","bundleDigest":%q,"startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest))
+	code, out, _ := runCLI("status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK {
+		t.Fatalf("status exit = %d", code)
+	}
+	if !strings.Contains(out, "RECOVERY REQUIRED") || !strings.Contains(out, "FIRST deployment") {
+		t.Errorf("stdout =\n%s", out)
+	}
+	if strings.Contains(out, "deployctl rollback") {
+		t.Errorf("status suggested rollback for a first deployment:\n%s", out)
+	}
+
+	// With a real origin, the suggestion names the attempt's origin, not
+	// the desired release.
+	writeFileCLIF(t, f.attemptPath(), fmt.Sprintf(`{"schema":"toolkit.attempt/v1","attemptId":"0123456789abcdef","project":"my-app","environment":"production","fromRelease":"0.9.0","toRelease":"1.0.0","bundleDigest":%q,"startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest))
+	code, out, _ = runCLI("status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK || !strings.Contains(out, "--to 0.9.0") {
+		t.Errorf("origin-derived guidance missing (--to 0.9.0):\n%s", out)
+	}
+}
+
+// ---- SSH configuration and connection classification ------------------
+
+// useSSHTransport repoints the environment's target at an SSH transport:
+// host 127.0.0.1 port 1 (connection refused), with real generated key
+// material unless overridden. Missing variables are simulated with an
+// empty value.
+func (f *cliFixture) useSSHTransport(t *testing.T, keyPEM, hostKeyLine string) {
+	t.Helper()
+	dir := t.TempDir()
+	writeTarget := func() {
+		writeFileCLIF(t, filepath.Join(f.repoDir, ".deploy", "targets", "local-dev.yaml"), fmt.Sprintf(`apiVersion: deploy.toolkit/v1
+kind: Target
+metadata:
+  name: local-dev
+spec:
+  deployRoot: %s
+  transport:
+    type: ssh
+    hostFrom: DEPLOY_TEST_HOST
+    port: 1
+    user: deploy
+    hostKeyFrom: DEPLOY_TEST_HOSTKEY
+    credentialFrom: DEPLOY_TEST_KEY
+`, f.deployDir))
+	}
+	writeTarget()
+	keyPath := filepath.Join(dir, "key.pem")
+	hostKeyPath := filepath.Join(dir, "hostkey")
+	if keyPEM != "" {
+		writeFileCLIF(t, keyPath, keyPEM)
+	}
+	if hostKeyLine != "" {
+		writeFileCLIF(t, hostKeyPath, hostKeyLine)
+	}
+	t.Setenv("DEPLOY_TEST_HOST", "127.0.0.1")
+	t.Setenv("DEPLOY_TEST_KEY", keyPath)
+	t.Setenv("DEPLOY_TEST_HOSTKEY", hostKeyPath)
+}
+
+func validSSHMaterial(t *testing.T) (string, string) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := gossh.MarshalPrivateKey(priv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub, err := gossh.NewPublicKey(priv.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(block)), string(gossh.MarshalAuthorizedKey(pub))
+}
+
+// Missing or unparseable credential configuration is a configuration
+// error (exit 2), never an infrastructure failure, and nothing runs.
+func TestDeploySSHConfigurationErrors(t *testing.T) {
+	validKey, validHostKey := validSSHMaterial(t)
+	tests := []struct {
+		name       string
+		key        string
+		hostKey    string
+		wantStderr string
+	}{
+		{"missing host variable", "", "", ""},
+		{"missing key file", "", validHostKey, "read credential file"},
+		{"malformed private key", "not a key", validHostKey, "parseable private key"},
+		{"malformed host key", validKey, "nope", "parseable host key"},
+	}
+	// The first case needs an UNSET host variable; t.Setenv cannot
+	// unset, so it is handled inside the loop via a dedicated fixture.
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCLIFixture(t)
+			f.useSSHTransport(t, tc.key, tc.hostKey)
+			if i == 0 {
+				os.Setenv("DEPLOY_TEST_HOST", "")
+			}
+			markerBefore := len(orderCLI(t, f))
+			code, _, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
+			if code != exitUsage {
+				t.Fatalf("exit = %d, want %d\nstderr:\n%s", code, exitUsage, errOut)
+			}
+			if tc.wantStderr != "" && !strings.Contains(errOut, tc.wantStderr) {
+				t.Errorf("stderr missing %q:\n%s", tc.wantStderr, errOut)
+			}
+			if i == 0 && !strings.Contains(errOut, "DEPLOY_TEST_HOST is not set") {
+				t.Errorf("stderr =\n%s", errOut)
+			}
+			if !strings.Contains(errOut, "Nothing was started") {
+				t.Errorf("pre-execution framing missing:\n%s", errOut)
+			}
+			if len(orderCLI(t, f)) != markerBefore {
+				t.Error("hooks ran despite configuration failure")
+			}
+		})
+	}
+}
+
+// An unreachable target is an infrastructure failure (exit 3) with
+// explicit pre-execution framing: no lifecycle operation was executed.
+func TestDeploySSHUnreachableTarget(t *testing.T) {
+	f := newCLIFixture(t)
+	keyPEM, hostKey := validSSHMaterial(t)
+	f.useSSHTransport(t, keyPEM, hostKey)
+	markerBefore := len(orderCLI(t, f))
+	code, _, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
+	if code != exitInfra {
+		t.Fatalf("exit = %d, want %d\nstderr:\n%s", code, exitInfra, errOut)
+	}
+	if !strings.Contains(errOut, "did not start") || !strings.Contains(errOut, "No lifecycle operation was executed") {
+		t.Errorf("stderr =\n%s", errOut)
+	}
+	if len(orderCLI(t, f)) != markerBefore {
+		t.Error("hooks ran despite connection failure")
+	}
+}
+
+// The confirmation gate precedes target contact: with the target
+// unreachable, a WRONG confirmation still aborts as an authorization
+// failure (exit 1) — proving the connection was never attempted.
+func TestRollbackConfirmationPrecedesConnection(t *testing.T) {
+	f := newCLIFixture(t)
+	keyPEM, hostKey := validSSHMaterial(t)
+	f.useSSHTransport(t, keyPEM, hostKey)
+	code, _, errOut := runCLI("rollback", "production", "--to", "1.0.0", "--repo-dir", f.repoDir, "--confirm", "rollback production to 9.9.9")
+	if code != exitFailed {
+		t.Fatalf("exit = %d, want %d\nstderr:\n%s", code, exitFailed, errOut)
+	}
+	if !strings.Contains(errOut, "nothing was executed, the target was not contacted") {
+		t.Errorf("stderr =\n%s", errOut)
 	}
 }
