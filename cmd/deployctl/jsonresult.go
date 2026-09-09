@@ -157,6 +157,12 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 	switch {
 	case err != nil:
 		switch {
+		case errors.Is(err, lifecycle.ErrEnvLockHeld):
+			// A held lock is a REFUSAL per the frozen cli-v1
+			// contract: another operation may currently be executing.
+			// It is never safe-to-retry infrastructure.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: the environment lock is held — another operation may currently be executing"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"
@@ -226,6 +232,11 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 	switch {
 	case err != nil:
 		switch {
+		case errors.Is(err, lifecycle.ErrEnvLockHeld):
+			// Mirror deploy: a held lock is a refusal, never
+			// safe-to-retry infrastructure.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: the environment lock is held — another operation may currently be executing"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -113,6 +114,12 @@ func reportDeploy(rep *lifecycle.Report, err error, stdout, stderr io.Writer) in
 		env := "?"
 		if rep != nil {
 			env = rep.Project + "/" + rep.Environment
+		}
+		if errors.Is(err, lifecycle.ErrEnvLockHeld) {
+			fmt.Fprintf(stderr, "✗ deploy %s: refused: the environment lock is held — another\noperation may currently be executing.\n", env)
+			fmt.Fprintln(stderr, "  Do not rerun mechanically. Run `deployctl status`; only remove a stale")
+			fmt.Fprintln(stderr, "  lock after verifying no deployment is in flight.")
+			return exitFailed
 		}
 		fmt.Fprintf(stderr, "✗ deploy %s: infrastructure failure: %v\n", env, err)
 		switch {

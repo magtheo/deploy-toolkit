@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -211,6 +212,12 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 
 func reportRollback(rep *lifecycle.RollbackReport, err error, envName string, stdout, stderr io.Writer) int {
 	if err != nil {
+		if errors.Is(err, lifecycle.ErrEnvLockHeld) {
+			fmt.Fprintf(stderr, "✗ rollback %s: refused: the environment lock is held — another\noperation may currently be executing.\n", envName)
+			fmt.Fprintln(stderr, "  Do not rerun mechanically. Run `deployctl status`; only remove a stale")
+			fmt.Fprintln(stderr, "  lock after verifying no recovery is in flight.")
+			return exitFailed
+		}
 		fmt.Fprintf(stderr, "✗ rollback %s: infrastructure failure: %v\n", envName, err)
 		switch {
 		case rep != nil && rep.Committed:

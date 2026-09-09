@@ -1543,3 +1543,59 @@ func TestResolveSinglePassLexing(t *testing.T) {
 		}
 	})
 }
+
+// A genuinely held environment lock is a REFUSAL per the frozen
+// deployctl.result/v1 contract — never safe-to-retry infrastructure.
+// These regressions drive the engine sentinel through both commands and
+// pin the JSON shape and the human classification.
+func TestHeldLockIsRefusalNotInfra(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"deploy", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
+		{"rollback", []string{"rollback", "production", "--to", "2.0.0", "--repo-dir", "%DIR%", "--confirm", "rollback production to 2.0.0", "--owner", "test"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCLIFixture(t)
+			if err := os.MkdirAll(f.lockPath(), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			before := len(orderCLI(t, f))
+
+			args := make([]string, len(tc.args))
+			for i, a := range tc.args {
+				args[i] = strings.ReplaceAll(a, "%DIR%", f.repoDir)
+			}
+			code, doc := runJSON(t, args...)
+			if code != exitFailed {
+				t.Fatalf("exit = %d, want %d (%s)", code, exitFailed, doc["message"])
+			}
+			if doc["outcome"] != "refused" || doc["recoveryRequired"] != false || doc["safeToRetry"] != false {
+				t.Errorf("shape = %v %v %v, want refused/false/false", doc["outcome"], doc["recoveryRequired"], doc["safeToRetry"])
+			}
+			if doc["command"] != tc.name {
+				t.Errorf("command = %v", doc["command"])
+			}
+			if len(orderCLI(t, f)) != before {
+				t.Error("hooks ran despite a held lock")
+			}
+			if f.attemptExists() {
+				t.Error("an attempt marker was written despite a held lock")
+			}
+
+			// Human mode: refused framing, never "simply rerun".
+			hArgs := append([]string{}, args...)
+			code, _, errOut := runCLI(hArgs...)
+			if code != exitFailed {
+				t.Fatalf("human exit = %d, want %d", code, exitFailed)
+			}
+			if !strings.Contains(errOut, "refused") || !strings.Contains(errOut, "may currently be executing") {
+				t.Errorf("human stderr lacks refused framing:\n%s", errOut)
+			}
+			if strings.Contains(errOut, "simply") || strings.Contains(errOut, "infrastructure failure") {
+				t.Errorf("human stderr misclassifies a refusal:\n%s", errOut)
+			}
+		})
+	}
+}
