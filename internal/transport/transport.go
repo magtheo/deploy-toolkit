@@ -11,7 +11,34 @@ import (
 type Transport interface {
 	Put(ctx context.Context, req PutRequest) error
 	Run(ctx context.Context, req RunRequest) (RunResult, error)
+
+	// ProbePath answers exactly one question: what occupies this
+	// absolute path on the target? PathAbsent is a POSITIVE fact,
+	// returned only when absence has been proven — never as a fallback
+	// for "the probe could not tell". Permission failures, broken
+	// hierarchies (a non-directory where a directory is required),
+	// unsupported path kinds and transport failures are errors. The
+	// probe follows symlinks (v0.1 preserves the historical semantics;
+	// a target-tree symlink policy would be separate hardening).
+	ProbePath(ctx context.Context, path string) (PathState, error)
 }
+
+// Implementations must return a meaningful PathState only when the
+// error is nil; when the error is non-nil, callers must ignore the
+// state value entirely (it may be the zero value, PathAbsent).
+
+// PathState is the kind of object found at a probed path. It is
+// deliberately not generic filesystem metadata: the lifecycle cares
+// about evidence of presence, absence and directory-ness, and nothing
+// else. Any state that cannot be positively established is an error,
+// not a PathState.
+type PathState int
+
+const (
+	PathAbsent    PathState = iota // proven: no object occupies the path
+	PathFile                       // proven: a non-directory object occupies the path
+	PathDirectory                  // proven: a directory occupies the path
+)
 
 type PutRequest struct {
 	Path string

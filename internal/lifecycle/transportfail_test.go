@@ -39,6 +39,10 @@ func (t *failingRunTransport) Run(ctx context.Context, req transport.RunRequest)
 	return t.inner.Run(ctx, req)
 }
 
+func (t *failingRunTransport) ProbePath(ctx context.Context, path string) (transport.PathState, error) {
+	return t.inner.ProbePath(ctx, path)
+}
+
 // hangingTransport blocks Run for one program until its context is done —
 // the stalled-target shape.
 type hangingTransport struct {
@@ -48,6 +52,10 @@ type hangingTransport struct {
 
 func (t *hangingTransport) Put(ctx context.Context, req transport.PutRequest) error {
 	return t.inner.Put(ctx, req)
+}
+
+func (t *hangingTransport) ProbePath(ctx context.Context, path string) (transport.PathState, error) {
+	return t.inner.ProbePath(ctx, path)
 }
 
 func (t *hangingTransport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {

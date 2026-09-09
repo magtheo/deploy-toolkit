@@ -90,11 +90,14 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 		return StageNotAttempted, fmt.Errorf("refusing to stage %s %s: bundle bytes hash to %s but the release pins %s", rel.Metadata.Project, rel.Metadata.Version, actual, rel.Bundle.Digest)
 	}
 
-	present, err := t.exists(ctx, releaseDir)
+	st, err := t.probePath(ctx, releaseDir)
 	if err != nil {
 		return StageNotAttempted, err
 	}
-	if present {
+	if st == transport.PathFile {
+		return StageNotAttempted, fmt.Errorf("release directory %s is not a directory (broken target hierarchy)", releaseDir)
+	}
+	if st == transport.PathDirectory {
 		m, err := t.readMarker(ctx, markerPath)
 		if err != nil {
 			return StageNotAttempted, fmt.Errorf("release directory %s exists but is not a complete stage (interrupted stages must be removed manually): %w", releaseDir, err)

@@ -22,6 +22,14 @@ import (
 // answered. To the client that is a dead transport: the connection is
 // up, the session starts, and the read produces no exit status.
 func startFakeSSH(t *testing.T, authorized gossh.PublicKey, failIf string) *fakeSSHServer {
+	return startFakeSSHOpts(t, authorized, failIf, false)
+}
+
+// startFakeSSHOpts additionally accepts a dead-probe mode: the server
+// performs the real handshake and answers exec, but REJECTS the sftp
+// subsystem — connect succeeds, every substrate read fails. This is how
+// transport death during a ProbePath walk presents to the CLI.
+func startFakeSSHOpts(t *testing.T, authorized gossh.PublicKey, failIf string, rejectSFTP bool) *fakeSSHServer {
 	t.Helper()
 	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -44,7 +52,7 @@ func startFakeSSH(t *testing.T, authorized gossh.PublicKey, failIf string) *fake
 	if err != nil {
 		t.Fatal(err)
 	}
-	ts := &fakeSSHServer{ln: ln, config: config, failIf: failIf, hostKeyLine: string(gossh.MarshalAuthorizedKey(hostSigner.PublicKey()))}
+	ts := &fakeSSHServer{ln: ln, config: config, failIf: failIf, rejectSFTP: rejectSFTP, hostKeyLine: string(gossh.MarshalAuthorizedKey(hostSigner.PublicKey()))}
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -66,6 +74,7 @@ type fakeSSHServer struct {
 	ln          net.Listener
 	config      *gossh.ServerConfig
 	failIf      string
+	rejectSFTP  bool
 	hostKeyLine string
 }
 
@@ -113,7 +122,7 @@ func (ts *fakeSSHServer) handleSession(newChan gossh.NewChannel) {
 			return
 		case "subsystem":
 			var payload struct{ Name string }
-			if err := gossh.Unmarshal(req.Payload, &payload); err != nil || payload.Name != "sftp" {
+			if err := gossh.Unmarshal(req.Payload, &payload); err != nil || payload.Name != "sftp" || ts.rejectSFTP {
 				req.Reply(false, nil)
 				continue
 			}

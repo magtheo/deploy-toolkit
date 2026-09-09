@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -187,6 +188,17 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 	if mode == 0 {
 		mode = 0o644
 	}
+	return t.withSFTP(ctx, func(cl *sftp.Client) error {
+		return sftpPut(cl, dst, mode, req.Content)
+	})
+}
+
+// withSFTP runs fn with one dedicated SFTP client on one dedicated SSH
+// session — the same pattern Put has always used, now shared so a probe
+// walks the whole parent chain inside a single session rather than
+// paying a session per component. Closing the session unblocks the
+// caller on cancellation; the sftp client is closed by fn's deferral.
+func (t *Transport) withSFTP(ctx context.Context, fn func(cl *sftp.Client) error) error {
 	session, err := t.conn.NewSession()
 	if err != nil {
 		return fmt.Errorf("ssh: open sftp session: %w", err)
@@ -214,7 +226,7 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 			return
 		}
 		defer cl.Close()
-		done <- sftpPut(cl, dst, mode, req.Content)
+		done <- fn(cl)
 	}()
 	select {
 	case err := <-done:
@@ -224,6 +236,73 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 		<-done
 		return ctx.Err()
 	}
+}
+
+// ProbePath implements transport.Transport. Absence is PROVEN, never
+// guessed from a status code: the walk starts at "/" — the one anchor
+// that must exist on any Linux target — and descends component by
+// component. At every step, all previously traversed prefixes have been
+// positively stat-verified as directories, so when a later component
+// reports SSH_FX_NO_SUCH_FILE, ENOTDIR is impossible: servers (OpenSSH
+// included) map both ENOENT and ENOTDIR onto that one status, and the
+// walk is what removes the ambiguity. A missing component is therefore
+// proven absence of everything beneath it — including a deployRoot that
+// does not exist yet, which is a legitimate fresh-target fact, not an
+// error. A non-directory where a directory is required, a permission
+// failure, any other protocol code, and transport failures are errors —
+// "cannot establish" is never mapped to absence.
+//
+// The walk trusts that each stat sees a stable namespace for its
+// duration; an external actor rewriting an already-verified parent
+// mid-walk is outside v0.1's threat model (the toolkit serializes its
+// own operations, and SFTP offers no openat-style atomic walk to do
+// better without disguising an assumption as atomicity).
+func (t *Transport) ProbePath(ctx context.Context, path string) (transport.PathState, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	p, err := transport.ValidateAbsolutePath(path)
+	if err != nil {
+		return 0, err
+	}
+	var state transport.PathState
+	err = t.withSFTP(ctx, func(cl *sftp.Client) error {
+		st, perr := probeSFTPPath(cl, p)
+		state = st
+		return perr
+	})
+	return state, err
+}
+
+func probeSFTPPath(cl *sftp.Client, p string) (transport.PathState, error) {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	cur := "/"
+	for i, part := range parts {
+		fi, err := cl.Stat(path.Join(cur, part))
+		if err != nil {
+			switch {
+			case errors.Is(err, os.ErrNotExist):
+				// Every earlier prefix was positively verified as a
+				// directory, so this cannot be ENOTDIR: proven absence.
+				return transport.PathAbsent, nil
+			case errors.Is(err, os.ErrPermission):
+				return 0, fmt.Errorf("target: probe %s: %s: permission denied", p, path.Join(cur, part))
+			default:
+				return 0, fmt.Errorf("target: probe %s: %s: %w", p, path.Join(cur, part), err)
+			}
+		}
+		if i == len(parts)-1 {
+			if fi.IsDir() {
+				return transport.PathDirectory, nil
+			}
+			return transport.PathFile, nil
+		}
+		if !fi.IsDir() {
+			return 0, fmt.Errorf("target: probe %s: %s is not a directory (broken target hierarchy)", p, cur)
+		}
+		cur = path.Join(cur, part)
+	}
+	return transport.PathDirectory, nil
 }
 
 func sftpPut(cl *sftp.Client, dst string, mode os.FileMode, content []byte) error {

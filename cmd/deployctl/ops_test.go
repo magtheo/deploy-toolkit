@@ -483,7 +483,7 @@ func TestStatusLockDominatesMarkers(t *testing.T) {
 		t.Fatalf("deploy: %d\n%s\n%s", code, out, errOut)
 	}
 	writeFileCLIF(t, f.recoveryPath(), fmt.Sprintf(`{"schema":"toolkit.recovery/v1","recoveryId":"0123456789abcdef","sourceAttemptId":"","project":"my-app","environment":"production","fromRelease":"1.0.0","fromBundleDigest":%q,"toRelease":"2.0.0","toBundleDigest":%q,"authorization":"manual","startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest, fakeDigest))
-	writeFileCLIF(t, f.lockPath(), "")
+	os.MkdirAll(f.lockPath(), 0o755)
 	code, out, _ := runCLI("status", "production", "--repo-dir", f.repoDir)
 	if code != exitOK {
 		t.Fatalf("status exit = %d", code)
@@ -771,7 +771,7 @@ func TestStatusGuidanceObeyesClassificationPrecedence(t *testing.T) {
 			name: "lock + attempt",
 			setup: func(t *testing.T, f *cliFixture) {
 				writeAttemptMarker(t, f, "1.0.0")
-				writeFileCLIF(t, f.lockPath(), "")
+				os.MkdirAll(f.lockPath(), 0o755)
 			},
 			want:    "Wait for the active operation",
 			notWant: "deployctl rollback",
@@ -1299,7 +1299,7 @@ func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
 	// Held lock: refused, environment named.
 	os.Remove(f.statePath())
 	writeAttemptMarker(t, f, "1.0.0")
-	writeFileCLIF(t, f.lockPath(), "")
+	os.MkdirAll(f.lockPath(), 0o755)
 	code, doc = runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
 		"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
 	if code != exitFailed || doc["outcome"] != "refused" {
@@ -1311,48 +1311,14 @@ func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
 	}
 }
 
-// Dead transport is infrastructure, not refusal: when the connection is
-// up but a read class cannot be answered, the preflight must report
-// infrastructure-failure (exit 3) — the same classification the engine
-// applies to its own reads — with exactly one JSON document. Each read
-// class is exercised individually by killing exactly that command on
-// the fake target.
-func TestJSONResolveDeadTransportPerReadClass(t *testing.T) {
-	tests := []struct {
-		name   string
-		failIf string
-		seed   func(t *testing.T, f *cliFixture)
-	}{
-		{"state read", "/state/", nil},
-		{"attempt read", "/attempts/", nil},
-		{"recovery read", "/recoveries/", nil},
-		// The lock precheck is only reached when SOMETHING is
-		// unresolved; seed an attempt marker so the reads succeed and
-		// the precheck is the next command to die.
-		{"lock precheck", "/.locks/", func(t *testing.T, f *cliFixture) { writeAttemptMarker(t, f, "1.0.0") }},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newCLIFixture(t)
-			if tc.seed != nil {
-				tc.seed(t, f)
-			}
-			keyPEM, hostKeyLine := validSSHMaterial(t)
-			key, _, _, _, err := gossh.ParseAuthorizedKey([]byte(hostKeyLine))
-			if err != nil {
-				t.Fatal(err)
-			}
-			srv := startFakeSSH(t, key, tc.failIf)
-			host, port := srv.hostPort()
-			f.useSSHTransportAt(t, keyPEM, srv.hostKey(), host, port)
-			code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
-				"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
-			if code != exitInfra || doc["outcome"] != "infrastructure-failure" {
-				t.Fatalf("exit = %d outcome = %v (%s), want 3/infrastructure-failure", code, doc["outcome"], doc["message"])
-			}
-		})
-	}
-}
+// NOTE: dead-transport classification is covered by
+// TestJSONResolveDeadProbeIsInfrastructure (CLI end-to-end: a probe that
+// cannot run is exit 3 infrastructure-failure, never refusal or absence)
+// and by TestUnknownIsNeverAbsence in internal/target (every read class
+// refuses to interpret unknown as absence). The substrate no longer
+// shells out for existence, so per-command kill-the-exec tests cannot
+// target individual reads — and no longer need to: all read classes
+// share one proven-absence primitive and one failure classification.
 
 // The blocked-state facts in resolve JSON come from the engine's
 // post-operation presence flags — not from the read-time marker ids:
@@ -1597,5 +1563,64 @@ func TestHeldLockIsRefusalNotInfra(t *testing.T) {
 				t.Errorf("human stderr misclassifies a refusal:\n%s", errOut)
 			}
 		})
+	}
+}
+
+// Transport death during the substrate probe is infrastructure, never
+// absence: the CLI must report infrastructure-failure (exit 3) — a dead
+// probe must never let a mid-recovery environment present itself as a
+// fresh target.
+func TestJSONResolveDeadProbeIsInfrastructure(t *testing.T) {
+	f := newCLIFixture(t)
+	writeAttemptMarker(t, f, "1.0.0")
+	keyPEM, hostKeyLine := validSSHMaterial(t)
+	key, _, _, _, err := gossh.ParseAuthorizedKey([]byte(hostKeyLine))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := startFakeSSHOpts(t, key, "", true) // sftp rejected: probes cannot run
+	host, port := srv.hostPort()
+	f.useSSHTransportAt(t, keyPEM, srv.hostKey(), host, port)
+	code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
+	if code != exitInfra || doc["outcome"] != "infrastructure-failure" {
+		t.Fatalf("exit = %d outcome = %v (%s), want 3/infrastructure-failure", code, doc["outcome"], doc["message"])
+	}
+	if !f.attemptExists() {
+		t.Error("the marker must survive a dead probe")
+	}
+}
+
+// status may emit not-deployed only from PROVEN absence; a broken
+// hierarchy renders as degraded evidence claiming nothing.
+func TestStatusBrokenHierarchyIsDegradedNotNotDeployed(t *testing.T) {
+	f := newCLIFixture(t)
+	// "state" exists as a regular FILE where the hierarchy needs a
+	// directory — the exact shape the old `test -e` misreported as a
+	// fresh target.
+	writeFileCLIF(t, f.statePath(), "{")
+	code, doc := runJSON(t, "status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK {
+		t.Fatalf("a degraded status report is still a successful report: exit = %d", code)
+	}
+	data, _ := doc["data"].(map[string]any)
+	if data["state"] != "degraded" {
+		t.Fatalf("state = %v, want degraded", data["state"])
+	}
+	if data["observed"] != nil {
+		t.Errorf("degraded status must claim no observed state: %v", data["observed"])
+	}
+}
+
+// A regular FILE at the lock path is broken evidence — degraded, never
+// "free" (which would green-light operations) and never "held".
+func TestLockPathFileIsNotFree(t *testing.T) {
+	f := newCLIFixture(t)
+	writeFileCLIF(t, f.lockPath(), "not a lock")
+	code, doc := runJSON(t, "status", "production", "--repo-dir", f.repoDir)
+	data, _ := doc["data"].(map[string]any)
+	lock, _ := data["lock"].(string)
+	if lock == "free" {
+		t.Errorf("a file at the lock path was reported free: %v (exit %d)", doc, code)
 	}
 }

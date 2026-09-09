@@ -3,7 +3,9 @@ package local
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +21,34 @@ var _ transport.Transport = (*Transport)(nil)
 
 func checkTargetPath(path string) (string, error) {
 	return transport.ValidateAbsolutePath(path)
+}
+
+// ProbePath implements transport.Transport. The local kernel
+// distinguishes ENOENT from ENOTDIR natively, so a single os.Stat of the
+// final path suffices: ENOENT is proven absence (the kernel resolved
+// every parent and found nothing at the leaf — including a dangling
+// symlink at the final component), ENOTDIR and every other failure are
+// errors. Symlinks are followed, matching the v0.1 semantics.
+func (t *Transport) ProbePath(ctx context.Context, path string) (transport.PathState, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	p, err := checkTargetPath(path)
+	if err != nil {
+		return 0, err
+	}
+	fi, err := os.Stat(p)
+	switch {
+	case err == nil:
+		if fi.IsDir() {
+			return transport.PathDirectory, nil
+		}
+		return transport.PathFile, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return transport.PathAbsent, nil
+	default:
+		return 0, fmt.Errorf("target: probe %s: %w", p, err)
+	}
 }
 
 func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
