@@ -45,10 +45,10 @@ it. Stale proposals are regenerated deliberately — never quietly re-based.
 
 ## Execution from trusted code
 
-The check must run from code the PR cannot influence: the toolkit's reusable
-workflow, pinned by full commit SHA, executing `deployctl promotion check
---repo <repo> --base <base-sha> --head <head-sha> [--repo-dir <checkout>]`
-against the Git data API. It never executes PR-controlled code and needs no
+The check must run from code the PR cannot influence: a trusted execution of
+`deployctl promotion check --repo <repo> --base <base-sha> --head <head-sha>
+[--repo-dir <checkout>]` against the Git data API — ultimately the toolkit's
+reusable workflow pinned by full commit SHA (planned; not published yet). It never executes PR-controlled code and needs no
 production secrets.
 
 ## Freshness is enforced inside the checker
@@ -71,9 +71,13 @@ IF:           main is still BASE and the proposal sits directly on it
   GitHub's compare endpoint, which caps its file list at 300 entries. "Nothing
   else changed" must mean *nothing else*, not *nothing else in the first
   page*.
-- each tree leaf is compared by **OID, Git mode and type together** — chmod-only
-  changes, regular↔symlink flips and submodule (gitlink) additions, removals or
-  changes are all visible to the policy and rejected. A tree whose enumeration
+- each tree leaf is compared by **OID, Git mode and type together** —
+  regular↔symlink flips and submodule (gitlink) additions, removals or changes
+  are all visible to the policy and rejected. A chmod-only change to a release
+  file is rejected (it modifies an immutable artifact); a chmod-only change to
+  an environment file passes the structural policy (the bytes are identical,
+  so the semantic comparison sees no change) — the mode bit on the environment
+  file is not itself authorized material. A tree whose enumeration
   is incomplete is never evaluated.
 
 ## Two promotion classes, two evidence rules

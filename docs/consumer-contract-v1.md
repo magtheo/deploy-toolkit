@@ -1,9 +1,9 @@
 # Consumer Contract v1
 
-> **Status: candidate.** v1 is not frozen yet. It freezes only after (1) this
-> contract-hardening pass and (2) a real `platform-core` deployment has
-> exercised release generation end to end. Freezing before the reference
-> consumer has used the contract would be backwards.
+> **Status: candidate.** v1 is not frozen yet. It remains candidate until it has
+> been exercised end to end by a real external consumer in a production-shaped
+> deployment rehearsal. Freezing before a real consumer has used the contract
+> would be backwards.
 
 The configuration surface of Deploy Toolkit is an **API**. This document is the
 compatibility promise for `deploy.toolkit/v1` and the policy for changing it.

@@ -83,11 +83,13 @@ credentials.
 
 ## Pinned consumption
 
-Consumers reference this repository's workflows and binary by **full commit
-SHA**:
+Consumers will reference this repository's workflows and binary by **full
+commit SHA**. The reusable workflows (including `deploy.yml`) are planned, not
+published yet — until they exist, consumers run `deployctl` directly and own
+the wiring themselves:
 
 ```
-uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-sha>
+uses: <org>/<toolkit>/.github/workflows/deploy.yml@<full-sha>   # planned
 ```
 
 Readable release tags (`v0.4.0 → 12ab...`) are documentation above an

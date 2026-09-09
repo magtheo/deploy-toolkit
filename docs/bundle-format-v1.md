@@ -1,7 +1,8 @@
 # Bundle Format v1
 
-Status: **candidate** — frozen together with Consumer Contract v1 after a real
-`platform-core` deployment has exercised it.
+Status: **candidate** — frozen together with Consumer Contract v1, after the
+format has been exercised end to end by a real external consumer in a
+production-shaped deployment rehearsal.
 
 The bundle is the runtime payload a deployment stages on the target. Its
 construction must be **deterministic**: the same release revision and the same

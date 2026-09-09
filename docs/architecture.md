@@ -52,7 +52,7 @@ consuming repository:
 ci-toolkit
      ╲
       ╲
-       platform-core
+       example-service
       ╱
      ╱
 deploy-toolkit
@@ -62,7 +62,7 @@ deploy-toolkit
 
 | Concept                 | Meaning                                                  |
 | ----------------------- | -------------------------------------------------------- |
-| **Project**             | Something that can be deployed, e.g. `platform-core`     |
+| **Project**             | Something that can be deployed, e.g. `example-service`   |
 | **Release**             | Immutable application version + artifacts                |
 | **Environment**         | Desired deployment state, e.g. `production`              |
 | **Target**              | A machine/environment capable of receiving a release     |
@@ -79,7 +79,7 @@ Release ≠ Deployment
 
 ```
 release:
-    platform-core @ abc123
+    example-service @ abc123
 
 deployments:
     staging     → abc123
@@ -103,12 +103,12 @@ apiVersion: deploy.toolkit/v1
 kind: Release
 
 metadata:
-  project: platform-core
+  project: example-service
   version: 0.1.17
 
 source:
   type: github
-  repository: magtheo/platform-core
+  repository: example-org/example-service
   revision: abc123def456...
 
 artifacts:
@@ -252,7 +252,7 @@ Git owns desired state; the target owns observed state:
 
 ```json
 {
-  "project": "platform-core",
+"project": "example-service",
   "environment": "production",
   "release": "0.1.17",
   "sourceRevision": "abc123...",
@@ -300,6 +300,6 @@ never added because mature-looking systems have them.
 
 ## Consumers
 
-`platform-core` is the reference consumer; every feature is validated against a
-real deployment there. `examples/static-site` (later) proves the generic
+The contract is validated by a real external consumer in a production-shaped
+deployment rehearsal; `examples/static-site` (later) proves the generic
 contract. Consumer specifics never leak into this repository.

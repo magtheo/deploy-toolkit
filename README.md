@@ -61,7 +61,7 @@ Deploy Toolkit deliberately has a small vocabulary:
 
 | Concept                 | Meaning                                                  |
 | ----------------------- | -------------------------------------------------------- |
-| **Project**             | Something that can be deployed, e.g. `platform-core`     |
+| **Project**             | Something that can be deployed, e.g. `example-service`   |
 | **Release**             | Immutable application version + artifacts                |
 | **Environment**         | Desired deployment state, e.g. `production`              |
 | **Target**              | A machine/environment capable of receiving a release     |
@@ -82,8 +82,8 @@ deployment is a deterministic machine act.
 ## Status
 
 Pre-v0.1. **Consumer Contract v1 is a candidate, not yet frozen** — it freezes
-after contract hardening has been exercised by a real `platform-core`
-deployment. The schemas are defined and `deployctl validate` enforces them;
+it has been exercised end to end by a real external consumer in a
+production-shaped deployment rehearsal. The schemas are defined and `deployctl validate` enforces them;
 see [docs/consumer-contract-v1.md](docs/consumer-contract-v1.md) and the v0.1
 scope in [docs/architecture.md](docs/architecture.md).
 
