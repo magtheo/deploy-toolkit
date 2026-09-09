@@ -87,8 +87,8 @@ func TestResolveAttemptAfterFailedDeploy(t *testing.T) {
 	}
 	records := history(t, f)
 	last := records[len(records)-1]
-	if last.Type != "attempt.resolved" {
-		t.Fatalf("history = %+v, want attempt.resolved", last)
+	if last.Type != "attempt.resolve-authorized" {
+		t.Fatalf("history = %+v, want attempt.resolve-authorized", last)
 	}
 	if last.Data["actor"] != "operator" {
 		t.Errorf("evidence actor = %#v", last.Data["actor"])
@@ -162,16 +162,21 @@ func TestResolveRemovesAttemptBeforeRecovery(t *testing.T) {
 		t.Error("the recovery marker must survive its own failed removal")
 	}
 
-	// Retry on a healthy transport completes the resolution.
-	if _, err := Resolve(t.Context(), resolveInput(t, f, recID, attID)); err != nil {
+	// The retry must confirm what is ACTUALLY still there: the attempt
+	// marker is already gone, so the stale attempt id is refused...
+	if _, err := Resolve(t.Context(), resolveInput(t, f, recID, attID)); err == nil || !strings.Contains(err.Error(), "does not carry that marker") {
+		t.Fatalf("err = %v, want a stale-confirmation refusal", err)
+	}
+	// ...and the resolution completes by confirming the remaining fact.
+	if _, err := Resolve(t.Context(), resolveInput(t, f, recID, "")); err != nil {
 		t.Fatal(err)
 	}
 	if recoveryPresent(t, f) || attemptPresent(t, f) {
 		t.Error("markers must be gone after the completed resolution")
 	}
 	last := history(t, f)[3]
-	if last.Type != "recovery.resolved" {
-		t.Errorf("retry history = %+v, want recovery.resolved", last)
+	if last.Type != "recovery.resolve-authorized" {
+		t.Errorf("retry history = %+v, want recovery.resolve-authorized", last)
 	}
 }
 
@@ -201,5 +206,74 @@ func TestResolveRefusesUnderHeldLock(t *testing.T) {
 	}
 	if !attemptPresent(t, f) {
 		t.Error("a refused resolution must not remove the marker")
+	}
+}
+
+// Emergency rollbacks carry sourceAttemptId "" — no source attempt. A
+// coexisting attempt marker under such a recovery is inconsistent
+// evidence, not permission to clear both: refuse as inspect-first.
+func TestResolveRefusesInconsistentMarkerCoexistence(t *testing.T) {
+	f := newFixture(t, "my-app", nil)
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	// Forge the inconsistent pair: an emergency-style recovery marker
+	// (no source attempt) plus an unrelated attempt marker.
+	if err := f.target.WriteRecovery(t.Context(), target.RecoveryMarker{
+		Schema: "toolkit.recovery/v1", RecoveryID: "0123456789abcdef",
+		SourceAttemptID: "", Project: "my-app", Environment: "production",
+		FromRelease: "1.0.0", FromBundleDigest: "sha256:" + strings.Repeat("aa", 32),
+		ToRelease: "0.9.0", ToBundleDigest: "sha256:" + strings.Repeat("bb", 32),
+		Authorization: "manual", StartedAt: "2026-09-09T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.target.WriteAttempt(t.Context(), target.AttemptMarker{
+		Schema: "toolkit.attempt/v1", AttemptID: "fedcba9876543210",
+		Project: "my-app", Environment: "production",
+		FromRelease: "0.9.0", ToRelease: "1.0.0",
+		BundleDigest: "sha256:" + strings.Repeat("cc", 32),
+		StartedAt:    "2026-09-09T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Clearing BOTH in one authorization is refused...
+	if _, err := Resolve(t.Context(), resolveInput(t, f, "0123456789abcdef", "fedcba9876543210")); err == nil || !strings.Contains(err.Error(), "inconsistent evidence") {
+		t.Fatalf("err = %v, want the coexistence refusal", err)
+	}
+	if !recoveryPresent(t, f) || !attemptPresent(t, f) {
+		t.Error("a refused resolution must not remove either marker")
+	}
+	// ...but resolving ONE AT A TIME is the inspect-first path and
+	// works: each partial resolution leaves the other marker blocking.
+	rep1, err := Resolve(t.Context(), resolveInput(t, f, "", "fedcba9876543210"))
+	if err != nil || rep1.ResolvedAttemptID == "" || rep1.LeftRecoveryID != "0123456789abcdef" {
+		t.Fatalf("rep1 = %+v, %v", rep1, err)
+	}
+	if attemptPresent(t, f) || !recoveryPresent(t, f) {
+		t.Fatal("only the attempt marker must be gone after the partial resolution")
+	}
+	rep2, err := Resolve(t.Context(), resolveInput(t, f, "0123456789abcdef", ""))
+	if err != nil || rep2.ResolvedRecoveryID == "" {
+		t.Fatalf("rep2 = %+v, %v", rep2, err)
+	}
+	if recoveryPresent(t, f) || attemptPresent(t, f) {
+		t.Error("both markers must be gone after one-at-a-time resolution")
+	}
+}
+
+// Resolve owns the same manifest binding Deploy and Rollback enforce:
+// the environment must point at the target manifest it is resolving on.
+func TestResolveRefusesEnvironmentTargetMismatch(t *testing.T) {
+	f := newFixture(t, "my-app", nil)
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	in := resolveInput(t, f, "", "")
+	other := *f.targetManifest()
+	other.Metadata.Name = "some-other-target"
+	in.TargetManifest = &other
+	if _, err := Resolve(t.Context(), in); err == nil || !strings.Contains(err.Error(), "targets") {
+		t.Fatalf("err = %v, want the environment/target binding refusal", err)
 	}
 }

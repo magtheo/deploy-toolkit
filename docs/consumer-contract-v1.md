@@ -292,8 +292,10 @@ A failed recovery is therefore never blindly retried: any failure after
 the recovery marker exists keeps it, and the next ordinary recovery —
 under any authorization — refuses, because repeating a rollback hook or an
 apply is not known-safe without a hook idempotency contract v0.1 does not
-have. Resolution is explicit: verify the target, remove the markers, start
-a fresh recovery. The one automatic path: if observed state carries the
+have. Resolution is explicit: the operator verifies the target by hand,
+then `recovery resolve` records the authorization evidence and removes
+the markers (identity-bound, lock-checked, failing closed on unreadable
+evidence), and a fresh recovery starts from there. The one automatic path: if observed state carries the
 leftover recovery marker's `recoveryId` as its `operationId` AND the
 observed release/digest equal the marker's `toRelease`/`toBundleDigest`,
 the recovery is proven committed, and the next invocation for the same

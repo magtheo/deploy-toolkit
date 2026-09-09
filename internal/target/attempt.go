@@ -19,9 +19,12 @@ var ErrAttemptAbsent = errors.New("attempt: no unresolved attempt")
 
 // AttemptMarker is a durable, environment-scoped recovery fact. It is
 // written by the lifecycle layer BEFORE the first consequential stage and
-// removed only when the attempt has been reconciled to trusted observed
-// state: observed state committed (by the attempt itself or by an
-// explicit recovery rollback), or explicit recovery resolving it. A
+// removed by exactly one of three authorities: the attempt reconciles to
+// trusted observed state (observed state committed by the attempt itself,
+// or by an explicit recovery rollback that resolves it), or explicit
+// operator resolution (lifecycle.Resolve, after the operator has verified
+// the target by hand). There is no fourth way — a bare file deletion is a
+// runbook shortcut with no evidence, not a removal authority. A
 // determined hook failure does NOT remove it — a migration can partially
 // apply and then exit 1, so "known failure" is not "safe to repeat
 // consequential work". Its presence therefore means:

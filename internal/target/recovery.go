@@ -34,7 +34,12 @@ var recoveryAuthorizations = map[string]bool{
 // proven by the observed state's operationId carrying THIS marker's
 // recoveryId. Any failure after it exists keeps it: repeating a rollback
 // hook or an apply is no safer than repeating a failed migration, and
-// v0.1 assumes no hook idempotency contract.
+// v0.1 assumes no hook idempotency contract. It is removed by exactly
+// one of two authorities: the proven-committed self-heal (observed state
+// carries this marker's recoveryId as its operationId, proven by the
+// whole committed identity), or explicit operator resolution
+// (lifecycle.Resolve) after the operator has verified the target by
+// hand.
 type RecoveryMarker struct {
 	Schema           string `json:"schema"`
 	RecoveryID       string `json:"recoveryId"`      // random 16-hex recovery identity

@@ -46,6 +46,11 @@ type ResolveReport struct {
 	// NothingToResolve: no marker was unresolved; the invocation is an
 	// idempotent no-op.
 	NothingToResolve bool
+	// Left*ID names present markers the confirmation did NOT name: a
+	// partial authorization leaves them (and the block) in place by
+	// design.
+	LeftRecoveryID string
+	LeftAttemptID  string
 	// Observed records what the target claimed at resolution time — the
 	// state the operator verified against, preserved as evidence.
 	ObservedRelease      string
@@ -83,6 +88,10 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 		return nil, fmt.Errorf("ResolveInput.Project is required")
 	case in.Environment == nil:
 		return nil, fmt.Errorf("ResolveInput.Environment is required")
+	case in.Environment.Spec.Target == "":
+		return nil, fmt.Errorf("environment %q declares no target", in.Environment.Metadata.Name)
+	case in.Environment.Spec.Target != in.TargetManifest.Metadata.Name:
+		return nil, fmt.Errorf("environment %q targets %q, but the resolution targets %q", in.Environment.Metadata.Name, in.Environment.Spec.Target, in.TargetManifest.Metadata.Name)
 	}
 
 	now := in.Now
@@ -148,19 +157,42 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	// Identity bindings: what the operator confirmed is what must lie on
 	// the target. A mismatch means the situation changed since they
 	// looked — refuse and let them look again.
-	if recoveryPresent && recovery.RecoveryID != in.ConfirmRecoveryID {
-		return rep, fmt.Errorf("the unresolved recovery marker is %s, but the confirmation names %s — re-run `status` and confirm what is actually there", recovery.RecoveryID, orEmpty(in.ConfirmRecoveryID))
+	if in.ConfirmRecoveryID != "" {
+		if !recoveryPresent || recovery.RecoveryID != in.ConfirmRecoveryID {
+			return rep, fmt.Errorf("the confirmation names recovery %s, but the target does not carry that marker — re-run `status` and confirm what is actually there", in.ConfirmRecoveryID)
+		}
 	}
-	if attemptPresent && attempt.AttemptID != in.ConfirmAttemptID {
-		return rep, fmt.Errorf("the unresolved attempt marker is %s, but the confirmation names %s — re-run `status` and confirm what is actually there", attempt.AttemptID, orEmpty(in.ConfirmAttemptID))
+	if in.ConfirmAttemptID != "" {
+		if !attemptPresent || attempt.AttemptID != in.ConfirmAttemptID {
+			return rep, fmt.Errorf("the confirmation names attempt %s, but the target does not carry that marker — re-run `status` and confirm what is actually there", in.ConfirmAttemptID)
+		}
 	}
-	if recoveryPresent && recovery.SourceAttemptID != "" && attemptPresent && attempt.AttemptID != recovery.SourceAttemptID {
-		return rep, fmt.Errorf("the recovery resolves attempt %s, but the attempt marker on the target is %s — this state must be inspected, not resolved blind", recovery.SourceAttemptID, attempt.AttemptID)
+	if in.ConfirmRecoveryID == "" && in.ConfirmAttemptID == "" {
+		return rep, fmt.Errorf("a resolution must name at least one marker id — refusing to clear unnamed facts")
+	}
+	if recoveryPresent && attemptPresent && in.ConfirmRecoveryID != "" && in.ConfirmAttemptID != "" {
+		// Clearing BOTH together is only consistent as one story: this
+		// recovery is resolving THIS attempt. An emergency rollback
+		// carries sourceAttemptId "" (no source attempt) — a coexisting
+		// attempt marker under it is evidence inconsistency, and must
+		// never be erased in one authorization. Resolving ONE marker at
+		// a time (leaving the other to keep the block) stays available:
+		// that is the inspect-first path.
+		if recovery.SourceAttemptID == "" || recovery.SourceAttemptID != attempt.AttemptID {
+			return rep, fmt.Errorf("inconsistent evidence: the recovery marker (sourceAttemptId %q) coexists with attempt marker %s — inspect the target and resolve them one at a time", orEmpty(recovery.SourceAttemptID), attempt.AttemptID)
+		}
 	}
 
-	kind := "recovery.resolved"
+	// The pre-removal record is an AUTHORIZATION fact, deliberately not
+	// named "resolved": it says the operator authorized clearing these
+	// exact facts — it cannot promise the removal succeeded. If a
+	// subsequent marker removal fails, durable evidence says
+	// resolve-authorized while status still says RECOVERY REQUIRED, and
+	// those agree: the block is still up. Only ResolveReport.Resolved*
+	// (and the absence of the markers) claim completion.
+	kind := "recovery.resolve-authorized"
 	if !recoveryPresent {
-		kind = "attempt.resolved"
+		kind = "attempt.resolve-authorized"
 	}
 	data := map[string]any{
 		"authorization":       "manual",
@@ -189,17 +221,26 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 
 	// Attempt first, recovery last: a crash between the two removals
 	// leaves the recovery marker — the more informative fact — in place.
-	if attemptPresent {
+	if in.ConfirmAttemptID != "" {
 		if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
 			return rep, fmt.Errorf("clear attempt marker %s: %w", attempt.AttemptID, cerr)
 		}
 		rep.ResolvedAttemptID = attempt.AttemptID
 	}
-	if recoveryPresent {
+	if in.ConfirmRecoveryID != "" {
 		if cerr := in.Target.ClearRecovery(ctx, rep.Project, rep.Environment); cerr != nil {
 			return rep, fmt.Errorf("clear recovery marker %s: %w", recovery.RecoveryID, cerr)
 		}
 		rep.ResolvedRecoveryID = recovery.RecoveryID
+	}
+	// Facts confirmed for removal but left by a partial authorization
+	// keep blocking; name them so the operator sees the block is not
+	// fully lifted.
+	if recoveryPresent && in.ConfirmRecoveryID == "" {
+		rep.LeftRecoveryID = recovery.RecoveryID
+	}
+	if attemptPresent && in.ConfirmAttemptID == "" {
+		rep.LeftAttemptID = attempt.AttemptID
 	}
 	return rep, nil
 }

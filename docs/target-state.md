@@ -169,8 +169,26 @@ exists, any failure — hook, transport, state commit — keeps it, and the
 next ordinary recovery REFUSES: repeating a rollback hook (which may
 reverse a migration) or an apply is no safer than repeating a failed
 migration, and v0.1 assumes no hook idempotency contract. Resolution is
-explicit: an operator verifies the target's actual state, removes the
-markers, and starts a fresh, deliberate recovery.
+explicit: an operator verifies the target's actual state, then
+`deployctl recovery resolve` records who resolved which markers against
+which observed state, and removes them (the engine re-reads them under
+the lock and refuses on identity mismatch, a held lock, or unreadable
+evidence). A fresh, deliberate recovery can then start.
+
+**What resolution does and does not mean.** `recovery resolve` does not
+make an unknown deployment state trustworthy. It records that the
+operator has *independently established* a safe target condition and is
+explicitly authorizing removal of the block. Observed state `A` with an
+unresolved `A → B` attempt leaves the actual target condition unknown —
+possibly B, possibly half of B — so "the app responds" is not a
+sufficient inspection: the target must be understood to be in a
+condition compatible with the next action (typically manually restored
+to, and verified against, the known observed release). Resolution
+executes no hooks and changes nothing about what is running; the
+pre-removal history record is an *authorization* fact
+(`recovery.resolve-authorized` / `attempt.resolve-authorized`), not a
+completion claim — if a subsequent marker removal fails, the block is
+still up and status still says so.
 
 **The self-heal proof.** Observed state records the operation that
 committed it — `current.operationId` is `deploy:<attemptId>` or

@@ -172,6 +172,17 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	if rep.ResolvedAttemptID != "" {
 		fmt.Fprintf(stdout, " attempt %s", rep.ResolvedAttemptID)
 	}
+	if rep.LeftRecoveryID != "" || rep.LeftAttemptID != "" {
+		fmt.Fprintf(stdout, "  Still present (not named by this confirmation):")
+		if rep.LeftRecoveryID != "" {
+			fmt.Fprintf(stdout, " recovery %s", rep.LeftRecoveryID)
+		}
+		if rep.LeftAttemptID != "" {
+			fmt.Fprintf(stdout, " attempt %s", rep.LeftAttemptID)
+		}
+		fmt.Fprintf(stdout, "\n  The environment is still blocked — resolve the remaining marker\n  separately once inspected.\n")
+		return exitOK
+	}
 	fmt.Fprintf(stdout, "\n  The block is lifted. Verify the target still behaves as expected, then\n  deploy or recover normally. Observed state was not modified.\n")
 	return exitOK
 }
