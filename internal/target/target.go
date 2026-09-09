@@ -50,6 +50,13 @@ func (t *Target) exists(ctx context.Context, path string) (bool, error) {
 	}
 }
 
+// Exists is the exported read-only existence check for toolkit-owned
+// paths — the status interface uses it to report a held environment lock
+// without acquiring anything.
+func (t *Target) Exists(ctx context.Context, path string) (bool, error) {
+	return t.exists(ctx, path)
+}
+
 // ReadFile reads a toolkit-owned file from the target — staged contract
 // bytes, state snapshots, history logs. Callers must gate it behind
 // exists() when absence is meaningful: cat reports both absence and

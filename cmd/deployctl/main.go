@@ -37,6 +37,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runRelease(args[1:], stdout, stderr)
 	case "promotion":
 		return runPromotion(args[1:], stdout, stderr)
+	case "deploy":
+		return runDeploy(context.Background(), args[1:], stdout, stderr)
+	case "rollback":
+		return runRollback(context.Background(), args[1:], stdout, stderr)
+	case "status":
+		return runStatus(context.Background(), args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintf(stdout, "deployctl %s\n", version)
 		return 0
@@ -58,7 +64,15 @@ Usage:
   deployctl release create [flags]           run eligibility and create an immutable release manifest
   deployctl promotion propose <env> [flags]  open the human-authorization PR for a release
   deployctl promotion check [flags]          verify a promotion diff against the Promotion Diff Policy
+  deployctl deploy <env> [flags]             deploy the release the environment pins
+  deployctl rollback <env> [flags]           emergency/manual recovery: restore a previous release
+  deployctl status <env> [flags]             report desired vs observed state and all recovery facts
   deployctl version                          print version
+
+Operational exit codes (deploy, rollback): 0 success, 1 reported outcome
+failure (determined — history records what happened), 2 usage/configuration
+error, 3 infrastructure failure (UNCERTAIN — consequential work may have
+executed; never blindly retry, run deployctl status).
 
 Release creation stops at the Release boundary: it never updates environments
 and never opens pull requests. Promotion proposals stop at the open, verified
@@ -90,6 +104,30 @@ Promotion check flags (for the trusted CI workflow):
   --head <sha>                               promotion branch head (required)
 
 Both require GITHUB_TOKEN.
+
+Deploy flags:
+  --repo-dir .                  checkout containing the release revision (for the bundle)
+  --owner identity              recorded in the lock and history (default user@host)
+
+The deployment runs the full engine sequence — environment lock, staging,
+contract verification, preflight, migrate, apply, verify, observed-state
+commit — against the release the environment file pins. Merging the
+promotion PR is the authorization for this command; running it is not.
+
+Rollback flags (manual/emergency recovery):
+  --to <version>                version to restore (required)
+  --from <version>              version being undone (default: the pinned release)
+  --repo-dir .                  checkout containing both release revisions
+  --confirm "sentence"          typed confirmation; omit to be prompted
+
+Requires typing exactly: rollback <env> to <version>. Normal rollback of a
+healthy deployment is an ordinary promotion with a reverse diff, not this
+command.
+
+Status flags:
+  --repo-dir .                  checkout containing .deploy/
+
+Status is read-only but uses the deploy credential to inspect the target.
 `, version)
 }
 

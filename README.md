@@ -119,8 +119,30 @@ authorization act** (see
 Requires `GITHUB_TOKEN` for the GitHub API; registry auth uses the standard
 OCI keychain, independent of `GITHUB_TOKEN`.
 
-Planned (not yet implemented): `deploy`, `rollback`, `status`. See the
-roadmap in [docs/release-lifecycle.md](docs/release-lifecycle.md).
+### Deploy, rollback, status
+
+The deployment side is a thin, deliberate wrapper over the engine: every
+decision — locks, staging, contract verification, marker discipline, state
+transitions — lives in the lifecycle engine; the CLI loads manifests,
+prepares bundles from the pinned revisions, connects with the target's
+declared transport, and renders the report.
+
+```
+deployctl deploy production                      # deploy the release the environment pins
+deployctl rollback production --to 0.1.16        # emergency recovery; typed confirmation
+deployctl status production                      # desired vs observed + all recovery facts
+```
+
+Merging the promotion PR is the authorization for `deploy`; running the
+command is not. `rollback` requires typing exactly
+`rollback <env> to <version>` — deliberate friction for the emergency
+path. Normal rollback of a healthy deployment is an ordinary promotion
+with a reverse diff, not `rollback`.
+
+Operational exit codes (deploy, rollback): `0` success, `1` reported
+outcome failure (determined — history records what happened), `2`
+usage/configuration error, `3` infrastructure failure (**uncertain** —
+consequential work may have executed; never blindly retry, run `status`).
 
 ## For consumers
 
