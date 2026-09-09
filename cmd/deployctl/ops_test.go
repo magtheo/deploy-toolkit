@@ -1492,3 +1492,54 @@ func (f *cliFixture) attemptExists() bool {
 	_, err := os.Stat(f.attemptPath())
 	return err == nil
 }
+
+// The recovery-resolve prologue must lex the ENTIRE argv exactly once —
+// the same single-pass invariant as the other operational commands. An
+// empty argv must be a usage error (never a panic on args[1:]), and
+// --json in the first position must still select machine mode.
+func TestResolveSinglePassLexing(t *testing.T) {
+	t.Run("bare invocation is a usage error, not a panic", func(t *testing.T) {
+		f := newCLIFixture(t)
+		code, _, errOut := runCLI("recovery", "resolve")
+		if code != exitUsage {
+			t.Fatalf("exit = %d, want %d\nstderr:\n%s", code, exitUsage, errOut)
+		}
+		if strings.Contains(errOut, "panic") {
+			t.Errorf("panicked:\n%s", errOut)
+		}
+		if len(orderCLI(t, f)) != 0 || f.attemptExists() {
+			t.Error("something executed despite the usage error")
+		}
+	})
+
+	t.Run("--json in first position still selects machine mode", func(t *testing.T) {
+		newCLIFixture(t)
+		code, out, errOut := runCLI("recovery", "resolve", "--json")
+		if code != exitUsage {
+			t.Fatalf("exit = %d, want %d\nstdout:\n%s\nstderr:\n%s", code, exitUsage, out, errOut)
+		}
+		if !json.Valid([]byte(out)) {
+			t.Fatalf("--json stdout is not a single JSON document: out=%q stderr=%q", out, errOut)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(out), &doc); err != nil {
+			t.Fatal(err)
+		}
+		if doc["schema"] != "deployctl.result/v1" || doc["command"] != "recovery-resolve" || doc["outcome"] != "usage-error" {
+			t.Errorf("document = %v", doc)
+		}
+	})
+
+	t.Run("machine mode before the environment preserves interleaving", func(t *testing.T) {
+		f := newCLIFixture(t)
+		writeAttemptMarker(t, f, "1.0.0")
+		code, doc := runJSON(t, "recovery", "resolve", "--json", "production", "attempt", "0123456789abcdef",
+			"--repo-dir", f.repoDir, "--confirm", "resolve production attempt 0123456789abcdef")
+		if code != exitOK || doc["outcome"] != "success" {
+			t.Fatalf("exit = %d outcome = %v (%s), want interleaved parse to resolve", code, doc["outcome"], doc["message"])
+		}
+		if f.attemptExists() {
+			t.Error("the marker was not resolved")
+		}
+	})
+}
