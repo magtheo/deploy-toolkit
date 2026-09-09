@@ -157,7 +157,7 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	jsonMode := wantsJSON(args)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		if jsonMode {
-			return emitJSON(stdout, usageErrorResult("recovery-resolve", "", "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>]"))
+			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, "", "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>]"))
 		}
 		fmt.Fprintln(stderr, "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>] [--repo-dir .] [--owner identity] [--confirm \"...\"]")
 		return exitUsage
@@ -165,7 +165,7 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	envName := args[0]
 	if strings.Contains(envName, "/") {
 		if jsonMode {
-			return emitJSON(stdout, usageErrorResult("recovery-resolve", envName, "environment must be a bare name"))
+			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "environment must be a bare name"))
 		}
 		fmt.Fprintf(stderr, "deployctl recovery resolve: environment must be a bare name, got %q\n", envName)
 		return exitUsage
@@ -181,6 +181,9 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	// consume one token; boolean flags (json) consume none.
 	flagTokens, selectors := splitFlagsAndValues(args[1:], map[string]bool{"json": true})
 	if err := fs.Parse(flagTokens); err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "invalid flags: "+err.Error()))
+		}
 		return exitUsage
 	}
 
@@ -294,7 +297,7 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	}
 	if aerr != nil && rerr != nil {
 		if jsonMode {
-			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: "recovery-resolve", Outcome: outcomeSuccess, Project: project, Environment: envName, SafeToRetry: true, Message: "nothing to resolve; the environment is not blocked", Data: &resolveResultData{NothingToResolve: true}})
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeSuccess, Project: project, Environment: envName, SafeToRetry: true, Message: "nothing to resolve; the environment is not blocked", Data: &resolveResultData{NothingToResolve: true}})
 		}
 		fmt.Fprintf(stdout, "Nothing to resolve: no unresolved attempt or recovery marker on %s.\n", envName)
 		return exitOK

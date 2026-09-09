@@ -1253,6 +1253,8 @@ func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
 		{"rollback json is non-interactive", []string{"rollback", "production", "--to", "1.0.0", "--repo-dir", f.repoDir}, exitUsage, "usage-error"},
 		{"resolve json is non-interactive", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir}, exitUsage, "usage-error"},
 		{"resolve selectors do not replace confirmation", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir, "attempt", "0123456789abcdef"}, exitUsage, "usage-error"},
+		{"resolve unknown flag after confirm", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir, "attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef", "--bogus"}, exitUsage, "usage-error"},
+
 		{"resolve grammar before target", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir, "nonsense", "garbage"}, exitUsage, "usage-error"},
 	}
 	for _, tc := range tests {
@@ -1264,9 +1266,31 @@ func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
 		})
 	}
 
+	// A value flag with NO value is a different fs.Parse failure
+	// ("flag needs an argument"). It must be the LAST token, so this
+	// case drives runCLI directly — runJSON appends --json, which a
+	// trailing value flag would otherwise legally consume as its value.
+	code, out, _ := runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"attempt", "0123456789abcdef",
+		"--confirm", "resolve production attempt 0123456789abcdef",
+		"--json", "--owner")
+	if code != exitUsage {
+		t.Errorf("missing flag value: exit = %d, want %d", code, exitUsage)
+	}
+	if !json.Valid([]byte(out)) {
+		t.Errorf("missing flag value: stdout is not one JSON document: %q", out)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["outcome"] != "usage-error" || doc["command"] != "recovery-resolve" {
+		t.Errorf("missing flag value: outcome = %v command = %v", doc["outcome"], doc["command"])
+	}
+
 	// Corrupt evidence: refused, and the block is stated.
 	writeFileCLIF(t, f.statePath(), "{corrupt")
-	code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+	code, doc = runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
 		"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
 	if code != exitFailed || doc["outcome"] != "refused" {
 		t.Fatalf("corrupt state: exit = %d outcome = %v", code, doc["outcome"])
