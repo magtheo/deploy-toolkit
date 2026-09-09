@@ -85,7 +85,7 @@ go build -o deployctl ./cmd/deployctl
 ./deployctl validate templates/*.yaml
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly these checks on every push and PR.
+CI (`.github/workflows/ci.yml`) runs these checks on every pull request and every push to `main`.
 
 ## Contract status
 
@@ -104,7 +104,7 @@ traversal rules) live as `check()` methods in `internal/manifest`.
 If you change a schema, you are changing a published API — see the versioning
 policy in `docs/consumer-contract-v1.md`.
 
-## Reference consumer
+## Contract validation
 
 The contract must be validated by a real external consumer in a
 production-shaped deployment rehearsal; `examples/static-site` (later) proves

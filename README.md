@@ -81,9 +81,9 @@ deployment is a deterministic machine act.
 
 ## Status
 
-Pre-v0.1. **Consumer Contract v1 is a candidate, not yet frozen** — it freezes
-it has been exercised end to end by a real external consumer in a
-production-shaped deployment rehearsal. The schemas are defined and `deployctl validate` enforces them;
+Pre-v0.1. **Consumer Contract v1 is a candidate, not yet frozen.** It remains
+candidate until it has been exercised end to end by a real external consumer
+in a production-shaped deployment rehearsal. The schemas are defined and `deployctl validate` enforces them;
 see [docs/consumer-contract-v1.md](docs/consumer-contract-v1.md) and the v0.1
 scope in [docs/architecture.md](docs/architecture.md).
 
