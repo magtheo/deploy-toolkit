@@ -671,3 +671,50 @@ func TestDeployIncompleteInputFailsClosed(t *testing.T) {
 		t.Errorf("lock created despite incomplete input (stat err = %v)", err)
 	}
 }
+
+// A determined failure AFTER the durable boundary leaves the attempt
+// marker — the environment is recovery-required from the FIRST failure:
+// report, history and CLI must agree, not only a later status.
+func TestDeployDeterminedPostBoundaryFailureRequiresRecovery(t *testing.T) {
+	f := newFixture(t, "my-app", func(marker, envFile, script string) string {
+		if script == "apply" {
+			return "#!/bin/sh\necho apply >> " + marker + "\nexit 1\n"
+		}
+		return fmt.Sprintf("#!/bin/sh\necho %s >> %s\n", script, marker)
+	})
+	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.ConsequentialStarted || rep.AttemptID == "" {
+		t.Errorf("rep = %+v, want the durable boundary reported", rep)
+	}
+	if !rep.RecoveryRequired || rep.Committed {
+		t.Errorf("rep = %+v, want recovery-required on the first determined post-boundary failure", rep)
+	}
+	records := history(t, f)
+	if len(records) != 1 || records[0].Type != "deploy.failed" {
+		t.Fatalf("history = %+v", records)
+	}
+	if records[0].Data["recoveryRequired"] != true {
+		t.Errorf("history recoveryRequired = %#v, want true", records[0].Data["recoveryRequired"])
+	}
+	if !attemptPresent(t, f) {
+		t.Fatal("the attempt marker must survive the determined failure")
+	}
+
+	// Pre-boundary determined failure: retryable, no recoveryRequired.
+	f2 := newFixture(t, "my-app", func(marker, envFile, script string) string {
+		if script == "preflight" {
+			return "#!/bin/sh\nexit 1\n"
+		}
+		return fmt.Sprintf("#!/bin/sh\necho %s >> %s\n", script, marker)
+	})
+	rep2, err := deploy(t, f2, "my-app", "1.0.0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep2.ConsequentialStarted || rep2.RecoveryRequired {
+		t.Errorf("rep2 = %+v, want a retryable pre-boundary failure", rep2)
+	}
+}

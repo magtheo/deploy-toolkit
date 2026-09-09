@@ -158,6 +158,15 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		// the attempt finished (the self-heal below). Failures before the marker is
 		// written — validate, stage, contract, preflight — leave no
 		// marker and remain retryable.
+		//
+		// Consistency rule: a determined failure AFTER the durable
+		// boundary leaves the marker, so the environment is now
+		// recovery-required. The report, history and CLI output must
+		// say so on the FIRST failure — not only after a later status
+		// or refused retry reveals it.
+		if rep.ConsequentialStarted && !rep.Committed {
+			rep.RecoveryRequired = true
+		}
 		if herr := recordOutcome(ctx, in, now, rep, "deploy.failed"); herr != nil {
 			return rep, errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("history outcome not recorded: %w", herr))
 		}

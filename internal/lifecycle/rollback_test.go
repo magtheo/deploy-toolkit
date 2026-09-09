@@ -1054,3 +1054,52 @@ func TestRollbackFailsClosedOnIncompleteInput(t *testing.T) {
 		t.Error("marker written for refused input")
 	}
 }
+
+// Mirror of the deploy consistency rule: once the recovery marker is
+// durable (RecoveryStarted), a determined rollback-hook failure keeps it
+// and must declare recovery-required on the FIRST failure — report,
+// history and CLI alike.
+func TestRollbackDeterminedPostBoundaryFailureRequiresRecovery(t *testing.T) {
+	f := newFixture(t, "my-app", func(marker, envFile, script string) string {
+		if script == "rollback" {
+			return "#!/bin/sh\necho rollback-half-done >> " + marker + "\nexit 1\n"
+		}
+		return fmt.Sprintf("#!/bin/sh\necho %s >> %s\n", script, marker)
+	})
+	revA := f.revision
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB := secondRevision(t, f)
+	relB, bytesB := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "2.0.0"), Release: relB, Bundle: bytesB, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Rollback(t.Context(), rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackManual))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.FailureReason != "rollback hook failed" || rep.Committed {
+		t.Fatalf("rep = %+v, want a determined rollback-hook failure", rep)
+	}
+	if !rep.RecoveryStarted || rep.RecoveryID == "" {
+		t.Errorf("rep = %+v, want the durable boundary reported", rep)
+	}
+	if !rep.RecoveryRequired {
+		t.Error("RecoveryRequired = false, but the recovery marker survives a determined failure")
+	}
+	records := history(t, f)
+	if len(records) != 3 || records[2].Type != "rollback.failed" {
+		t.Fatalf("history = %+v", records)
+	}
+	if records[2].Data["recoveryRequired"] != true {
+		t.Errorf("history recoveryRequired = %#v, want true", records[2].Data["recoveryRequired"])
+	}
+	if !recoveryPresent(t, f) {
+		t.Fatal("the recovery marker must survive the determined failure")
+	}
+}

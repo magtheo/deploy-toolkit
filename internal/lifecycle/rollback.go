@@ -211,6 +211,14 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 		// may have half-undone the failed release. The environment stays
 		// recovery-required; a later rollback (whose bindings still
 		// hold) or operator action resolves it.
+		//
+		// Consistency rule, mirroring Deploy: once the durable boundary
+		// is crossed (RecoveryStarted) and the recovery did not commit,
+		// the recovery marker survives — so the report, history and CLI
+		// output must declare recovery-required on the FIRST failure.
+		if rep.RecoveryStarted && !rep.Committed {
+			rep.RecoveryRequired = true
+		}
 		if herr := recordRollbackOutcome(ctx, in, now, rep, "rollback.failed", string(in.Authorization)); herr != nil {
 			return rep, errors.Join(fmt.Errorf("%s", reason), fmt.Errorf("history outcome not recorded: %w", herr))
 		}

@@ -318,6 +318,11 @@ func TestDeployCommandReportsDeterminedFailure(t *testing.T) {
 	if !strings.Contains(out, "verify") || !strings.Contains(out, "deploy failed") {
 		t.Errorf("stdout =\n%s", out)
 	}
+	// The first failure already declares recovery required: the attempt
+	// marker survives a post-consequential determined failure.
+	if !strings.Contains(out, "RECOVERY REQUIRED") {
+		t.Errorf("first failure must declare RECOVERY REQUIRED:\n%s", out)
+	}
 
 	// A retry is refused with the recovery-required explanation: the
 	// attempt marker proves consequential work with an unknown outcome.
@@ -798,5 +803,53 @@ func TestStatusGuidanceObeyesClassificationPrecedence(t *testing.T) {
 				t.Errorf("output must not contain %q:\n%s", tc.notWant, out)
 			}
 		})
+	}
+}
+
+// A determined rollback-hook failure keeps the recovery marker: the CLI
+// must declare RECOVERY REQUIRED on the first failure, and status must
+// classify the environment accordingly.
+func TestRollbackCommandDeterminedFailureRequiresRecovery(t *testing.T) {
+	f := newCLIFixture(t)
+	if code, out, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy 1.0.0: %d\n%s\n%s", code, out, errOut)
+	}
+	// Break the rollback hook BEFORE creating the 2.0.0 release, so the
+	// failing hook is part of 2.0.0's immutable contract.
+	p := filepath.Join(f.repoDir, "deploy/rollback.sh")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, append(raw, []byte("exit 1\n")...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitf(t, f.repoDir, "add", "-A")
+	gitf(t, f.repoDir, "commit", "-q", "-m", "break rollback hook")
+	rev := gitf(t, f.repoDir, "rev-parse", "HEAD")
+	f.revision2 = rev
+	f.writeRelease(t, "2.0.0", rev)
+	f.writeEnv(t, "2.0.0")
+	if code, out, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy 2.0.0: %d\n%s\n%s", code, out, errOut)
+	}
+
+	code, out, _ := runCLI("rollback", "production", "--to", "1.0.0", "--repo-dir", f.repoDir, "--confirm", "rollback production to 1.0.0", "--owner", "test")
+	if code != exitFailed {
+		t.Fatalf("rollback exit = %d, want %d\nstdout:\n%s", code, exitFailed, out)
+	}
+	if !strings.Contains(out, "rollback") || !strings.Contains(out, "failed") {
+		t.Errorf("stdout =\n%s", out)
+	}
+	if !strings.Contains(out, "RECOVERY REQUIRED") {
+		t.Errorf("first rollback failure must declare RECOVERY REQUIRED:\n%s", out)
+	}
+
+	code, out, _ = runCLI("status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK {
+		t.Fatalf("status exit = %d", code)
+	}
+	if !strings.Contains(out, "RECOVERY REQUIRED") || !strings.Contains(out, "Recovery      UNRESOLVED") {
+		t.Errorf("status must classify the failed recovery:\n%s", out)
 	}
 }
