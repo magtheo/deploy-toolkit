@@ -87,8 +87,8 @@ func TestResolveAttemptAfterFailedDeploy(t *testing.T) {
 	}
 	records := history(t, f)
 	last := records[len(records)-1]
-	if last.Type != "attempt.resolve-authorized" {
-		t.Fatalf("history = %+v, want attempt.resolve-authorized", last)
+	if last.Type != "resolution.authorized" {
+		t.Fatalf("history = %+v, want resolution.authorized", last)
 	}
 	if last.Data["actor"] != "operator" {
 		t.Errorf("evidence actor = %#v", last.Data["actor"])
@@ -175,8 +175,8 @@ func TestResolveRemovesAttemptBeforeRecovery(t *testing.T) {
 		t.Error("markers must be gone after the completed resolution")
 	}
 	last := history(t, f)[3]
-	if last.Type != "recovery.resolve-authorized" {
-		t.Errorf("retry history = %+v, want recovery.resolve-authorized", last)
+	if last.Type != "resolution.authorized" {
+		t.Errorf("retry history = %+v, want resolution.authorized", last)
 	}
 }
 

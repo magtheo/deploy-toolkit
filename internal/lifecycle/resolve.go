@@ -187,13 +187,12 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	// named "resolved": it says the operator authorized clearing these
 	// exact facts — it cannot promise the removal succeeded. If a
 	// subsequent marker removal fails, durable evidence says
-	// resolve-authorized while status still says RECOVERY REQUIRED, and
-	// those agree: the block is still up. Only ResolveReport.Resolved*
-	// (and the absence of the markers) claim completion.
-	kind := "recovery.resolve-authorized"
-	if !recoveryPresent {
-		kind = "attempt.resolve-authorized"
-	}
+	// resolution-authorized while status still says RECOVERY REQUIRED,
+	// and those agree: the block is still up. Only ResolveReport.Resolved*
+	// (and the absence of the markers) claim completion. The event is
+	// neutral because the operation may authorize either marker or both:
+	// the confirmed ids carry the exact scope.
+	kind := "resolution.authorized"
 	data := map[string]any{
 		"authorization":       "manual",
 		"actor":               in.Owner,

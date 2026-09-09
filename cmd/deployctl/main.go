@@ -69,7 +69,8 @@ Usage:
   deployctl deploy <env> [flags]             deploy the release the environment pins
   deployctl rollback <env> [flags]           emergency/manual recovery: restore a previous release
   deployctl status <env> [flags]             report desired vs observed state and all recovery facts
-  deployctl recovery resolve <env> [flags]   explicitly resolve unresolved markers after manual verification
+  deployctl recovery resolve <env> [selectors] [flags]
+                                             explicitly resolve unresolved markers after manual verification
   deployctl version                          print version
 
 Operational exit codes (deploy, rollback): 0 success, 1 reported outcome
@@ -142,12 +143,20 @@ Recovery resolve flags:
 Recovery resolve is the explicit end of an unresolved situation, for use
 ONLY after the target has been verified by hand. It executes no hooks and
 changes nothing about what is running: it records who resolved which
-markers against which observed state, then removes them (attempt first,
-recovery marker last). The typed confirmation names the exact marker ids
-(resolve <env> recovery <id> | resolve <env> attempt <id>); the engine
-re-reads them under the lock and refuses on any mismatch, on a held
-lock, or on unreadable evidence. With no markers unresolved it is an
-idempotent no-op.
+markers against which observed state, then removes exactly the markers
+the operator authorized — attempt-only, recovery-only, or joint:
+
+  resolve <env> recovery <id>
+  resolve <env> attempt <id>
+  resolve <env> recovery <id> attempt <id>
+
+The authorized set comes from the positional selectors (recovery <id> /
+attempt <id>) or from the typed sentence — never from what happens to
+exist on the target. A joint authorization of an inconsistent pair
+(recovery not linked to that attempt) is refused; resolve one marker at
+a time instead. The engine re-reads the named markers under the lock and
+refuses on any mismatch, on a held lock, or on unreadable evidence. With
+no markers unresolved it is an idempotent no-op.
 
 Status is read-only but uses the deploy credential to inspect the target.
 It fails closed: an unreadable lock, attempt marker, recovery marker or

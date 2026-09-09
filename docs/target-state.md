@@ -186,8 +186,8 @@ condition compatible with the next action (typically manually restored
 to, and verified against, the known observed release). Resolution
 executes no hooks and changes nothing about what is running; the
 pre-removal history record is an *authorization* fact
-(`recovery.resolve-authorized` / `attempt.resolve-authorized`), not a
-completion claim — if a subsequent marker removal fails, the block is
+(`resolution.authorized`, its confirmed ids carrying the exact scope),
+not a completion claim — if a subsequent marker removal fails, the block is
 still up and status still says so.
 
 **The self-heal proof.** Observed state records the operation that

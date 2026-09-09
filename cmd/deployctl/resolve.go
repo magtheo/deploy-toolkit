@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
@@ -18,7 +19,7 @@ import (
 // explicit, supported end of an unresolved situation.
 func runRecovery(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: deployctl recovery resolve <environment> [--repo-dir .] [--owner identity] [--confirm \"...\"]")
+		fmt.Fprintln(stderr, "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>] [--repo-dir .] [--owner identity] [--confirm \"...\"]")
 		return exitUsage
 	}
 	switch args[0] {
@@ -30,15 +31,151 @@ func runRecovery(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	}
 }
 
+// splitFlagsAndValues partitions tokens into flag tokens (with their
+// values) and positional tokens, preserving order. A token starting with
+// "-" is a flag and consumes the following token as its value.
+func splitFlagsAndValues(tokens []string) (flags, positional []string) {
+	for i := 0; i < len(tokens); i++ {
+		if strings.HasPrefix(tokens[i], "-") {
+			flags = append(flags, tokens[i])
+			if i+1 < len(tokens) {
+				i++
+				flags = append(flags, tokens[i])
+			}
+			continue
+		}
+		positional = append(positional, tokens[i])
+	}
+	return flags, positional
+}
+
+// resolveScope is the set of markers the operator is authorizing for
+// removal. It is chosen EXPLICITLY — by positional selectors or by the
+// typed sentence — never derived from what happens to exist on the
+// target: the thing typed by the operator must be exactly the set of
+// markers sent to the engine.
+type resolveScope struct {
+	recoveryID string
+	attemptID  string
+}
+
+var markerIDPattern = mustCompileHex16()
+
+func mustCompileHex16() *regexp.Regexp {
+	return regexp.MustCompile(`^[0-9a-f]{16}$`)
+}
+
+// parseResolveScope parses the authorized set from positional selector
+// tokens and/or the confirmation sentence. Exactly one of them defines
+// the scope; when both are given they must agree.
+func parseResolveScope(envName string, tokens []string, confirm string) (sentence string, sc resolveScope, err error) {
+	if len(tokens) > 0 {
+		sc, err = parseSelectorTokens(tokens)
+		if err != nil {
+			return "", sc, err
+		}
+		sentence = canonicalResolveSentence(envName, sc)
+		if confirm != "" && confirm != sentence {
+			return "", sc, fmt.Errorf("--confirm does not match the selected authorization %q: %w", sentence, errScopeMismatch)
+		}
+		return sentence, sc, nil
+	}
+	if confirm != "" {
+		sc, err = parseResolveSentence(envName, confirm)
+		if err != nil {
+			return "", sc, err
+		}
+		return confirm, sc, nil
+	}
+	return "", sc, errInteractiveConfirmation
+}
+
+var errInteractiveConfirmation = errors.New("interactive confirmation required")
+
+// errScopeMismatch marks an authorization disagreement (selector set vs
+// --confirm sentence) — a failed authorization, not a usage error.
+var errScopeMismatch = errors.New("authorization mismatch")
+
+// parseSelectorTokens parses [recovery <id>] [attempt <id>] in either
+// order, each kind at most once, at least one required.
+func parseSelectorTokens(tokens []string) (resolveScope, error) {
+	sc, _, err := parseScopePairs(tokens)
+	return sc, err
+}
+
+// parseResolveSentence parses the typed authorization sentence:
+//
+//	resolve <env> [recovery <id>] [attempt <id>]
+//
+// in either pair order, at least one pair required.
+func parseResolveSentence(envName, sentence string) (resolveScope, error) {
+	fields := strings.Fields(sentence)
+	if len(fields) < 4 || fields[0] != "resolve" || fields[1] != envName {
+		return resolveScope{}, fmt.Errorf("not a valid resolution sentence for %s", envName)
+	}
+	sc, used, err := parseScopePairs(fields[2:])
+	if err != nil {
+		return resolveScope{}, err
+	}
+	if used != len(fields[2:]) {
+		return resolveScope{}, fmt.Errorf("unexpected token %q in the resolution sentence", fields[2:][used])
+	}
+	return sc, nil
+}
+
+func parseScopePairs(tokens []string) (resolveScope, int, error) {
+	var sc resolveScope
+	i := 0
+	for i < len(tokens) {
+		if i+1 >= len(tokens) {
+			return sc, i, fmt.Errorf("selector %q is missing an id", tokens[i])
+		}
+		kind, id := tokens[i], tokens[i+1]
+		if !markerIDPattern.MatchString(id) {
+			return sc, i, fmt.Errorf("%q is not a marker id (16 hex digits)", id)
+		}
+		switch kind {
+		case "recovery":
+			if sc.recoveryID != "" {
+				return sc, i, fmt.Errorf("recovery selected more than once")
+			}
+			sc.recoveryID = id
+		case "attempt":
+			if sc.attemptID != "" {
+				return sc, i, fmt.Errorf("attempt selected more than once")
+			}
+			sc.attemptID = id
+		default:
+			return sc, i, fmt.Errorf("unknown selector %q (want \"recovery\" or \"attempt\")", kind)
+		}
+		i += 2
+	}
+	if sc.recoveryID == "" && sc.attemptID == "" {
+		return sc, i, fmt.Errorf("a resolution must name at least one marker: recovery <id> and/or attempt <id>")
+	}
+	return sc, i, nil
+}
+
+func canonicalResolveSentence(envName string, sc resolveScope) string {
+	parts := []string{"resolve", envName}
+	if sc.recoveryID != "" {
+		parts = append(parts, "recovery", sc.recoveryID)
+	}
+	if sc.attemptID != "" {
+		parts = append(parts, "attempt", sc.attemptID)
+	}
+	return strings.Join(parts, " ")
+}
+
 // runRecoveryResolve lifts the deployment block after an operator has
 // verified the target BY HAND. It executes no hooks and changes nothing
-// about what is running: it records who resolved what against which
-// observed state, then removes the markers. The typed confirmation names
-// the exact marker ids being resolved — the engine re-reads them under
-// the lock and refuses on any mismatch.
+// about what is running: it records who resolved which markers against
+// which observed state, then removes exactly the markers the typed
+// sentence names. The engine re-reads those markers under the lock and
+// refuses on any mismatch.
 func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
-		fmt.Fprintln(stderr, "usage: deployctl recovery resolve <environment> [--repo-dir .] [--owner identity] [--confirm \"...\"]")
+		fmt.Fprintln(stderr, "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>] [--repo-dir .] [--owner identity] [--confirm \"...\"]")
 		return exitUsage
 	}
 	envName := args[0]
@@ -51,13 +188,14 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	repoDir := fs.String("repo-dir", ".", "checkout containing .deploy/")
 	owner := fs.String("owner", "", "identity recorded as resolution evidence (default user@host)")
 	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
-	if err := fs.Parse(args[1:]); err != nil {
+	// Go's flag parsing stops at the first positional token; split flags
+	// and positional selectors manually so both orders work. Every flag
+	// of this command takes exactly one value.
+	flagTokens, positional := splitFlagsAndValues(args[1:])
+	if err := fs.Parse(flagTokens); err != nil {
 		return exitUsage
 	}
-	if fs.NArg() > 0 {
-		fmt.Fprintf(stderr, "deployctl recovery resolve: unexpected argument %q\n", fs.Arg(0))
-		return exitUsage
-	}
+	selectors := positional
 
 	dc, err := loadDeploymentContext(*repoDir, envName)
 	if err != nil {
@@ -96,13 +234,32 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		fmt.Fprintf(stdout, "Nothing to resolve: no unresolved attempt or recovery marker on %s.\n", envName)
 		return exitOK
 	}
-	// A held lock means an operation may be executing right now — the
-	// engine refuses under a held lock; surface it as a determined
-	// refusal before asking the human to confirm anything.
-	if held, lerr := lockHeld(ctx, tgt, dc); lerr == nil && held {
+	// The lock precheck fails CLOSED: if it cannot establish whether an
+	// operation is active, the operator is not asked to authorize
+	// anything. (The engine enforces the lock itself; this keeps the
+	// human authorization honest.)
+	if held, lerr := lockHeld(ctx, tgt, dc); lerr != nil {
+		fmt.Fprintf(stderr, "✗ recovery resolve %s: cannot establish whether an operation is active: %v\n", envName, lerr)
+		fmt.Fprintln(stderr, "  Do not authorize a resolution while the lock state is unreadable. Repair access first.")
+		return exitFailed
+	} else if held {
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: the environment lock is HELD — an operation may be executing.\n", envName)
 		fmt.Fprintln(stderr, "  Wait for it to finish and verify no deployment is in flight first.")
 		return exitFailed
+	}
+
+	// The authorized marker set: explicit selectors, or the typed
+	// sentence — never marker presence.
+	interactive := false
+	sentence, scope, err := parseResolveScope(envName, selectors, *confirm)
+	if errors.Is(err, errInteractiveConfirmation) {
+		interactive = true
+	} else if err != nil {
+		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
+		if errors.Is(err, errScopeMismatch) {
+			return exitFailed
+		}
+		return exitUsage
 	}
 
 	fmt.Fprintf(stdout, "Environment   %s\n", envName)
@@ -113,33 +270,45 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	if aerr == nil {
 		fmt.Fprintf(stdout, "Attempt       %s: %s → %s (id %s)\n", attempt.AttemptID, orNone(attempt.FromRelease), attempt.ToRelease, attempt.AttemptID)
 	}
-	fmt.Fprintf(stdout, "Resolution    records evidence, then removes the markers. It runs NO hooks\n")
-	fmt.Fprintf(stdout, "              and changes NOTHING about what is running. Use only after\n")
-	fmt.Fprintf(stdout, "              verifying the target by hand (app health, digest, migrations).\n\n")
+	fmt.Fprintf(stdout, "Resolution    records evidence, then removes exactly the markers you authorize.\n")
+	fmt.Fprintf(stdout, "              It runs NO hooks and changes NOTHING about what is running.\n")
+	fmt.Fprintf(stdout, "              Use only after verifying the target by hand (app health,\n")
+	fmt.Fprintf(stdout, "              digest, migrations).\n\n")
 
-	// The typed sentence names the exact markers being resolved.
-	var sentence string
-	switch {
-	case rerr == nil && aerr == nil:
-		sentence = fmt.Sprintf("resolve %s recovery %s", envName, recovery.RecoveryID)
-	case rerr == nil:
-		sentence = fmt.Sprintf("resolve %s recovery %s", envName, recovery.RecoveryID)
-	default:
-		sentence = fmt.Sprintf("resolve %s attempt %s", envName, attempt.AttemptID)
-	}
-	got := *confirm
-	if got == "" {
-		fmt.Fprintf(stdout, "Type the sentence to confirm:\n  %s\n> ", sentence)
+	if interactive {
+		fmt.Fprintf(stdout, "Type the sentence for what you authorize:\n")
+		fmt.Fprintf(stdout, "  resolve %s recovery <id>\n", envName)
+		fmt.Fprintf(stdout, "  resolve %s attempt <id>\n", envName)
+		fmt.Fprintf(stdout, "  resolve %s recovery <id> attempt <id>\n> ", envName)
 		line, rerr2 := bufio.NewReader(os.Stdin).ReadString('\n')
 		if rerr2 != nil && line == "" {
 			fmt.Fprintf(stderr, "\n✗ resolve aborted: confirmation could not be read (%v)\n", rerr2)
 			return exitFailed
 		}
-		got = strings.TrimSpace(line)
-	}
-	if got != sentence {
-		fmt.Fprintf(stderr, "✗ resolve aborted: confirmation does not match %q — nothing was changed\n", sentence)
-		return exitFailed
+		got := strings.TrimSpace(line)
+		scope, err = parseResolveSentence(envName, got)
+		if err != nil {
+			fmt.Fprintf(stderr, "✗ resolve aborted: %v — nothing was changed\n", err)
+			return exitFailed
+		}
+		sentence = canonicalResolveSentence(envName, scope)
+	} else {
+		// Non-interactive confirmation: the sentence is still typed (or
+		// passed via --confirm) — it IS the authorization.
+		got := *confirm
+		if got == "" {
+			fmt.Fprintf(stdout, "Type the sentence to confirm:\n  %s\n> ", sentence)
+			line, rerr2 := bufio.NewReader(os.Stdin).ReadString('\n')
+			if rerr2 != nil && line == "" {
+				fmt.Fprintf(stderr, "\n✗ resolve aborted: confirmation could not be read (%v)\n", rerr2)
+				return exitFailed
+			}
+			got = strings.TrimSpace(line)
+		}
+		if got != sentence {
+			fmt.Fprintf(stderr, "✗ resolve aborted: confirmation does not match %q — nothing was changed\n", sentence)
+			return exitFailed
+		}
 	}
 
 	ownerID := *owner
@@ -152,8 +321,8 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		Project:           project,
 		Environment:       dc.Env,
 		Owner:             ownerID,
-		ConfirmRecoveryID: confirmIDOrEmpty(rerr == nil, recovery.RecoveryID),
-		ConfirmAttemptID:  confirmIDOrEmpty(aerr == nil, attempt.AttemptID),
+		ConfirmRecoveryID: scope.recoveryID,
+		ConfirmAttemptID:  scope.attemptID,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
@@ -165,15 +334,16 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		fmt.Fprintf(stdout, "✓ nothing to resolve — the environment is not blocked\n")
 		return exitOK
 	}
-	fmt.Fprintf(stdout, "✓ resolved: recorded evidence (history seq %d) and removed", rep.HistorySeq)
+	fmt.Fprintf(stdout, "✓ authorized resolution recorded (history seq %d); removed", rep.HistorySeq)
 	if rep.ResolvedRecoveryID != "" {
 		fmt.Fprintf(stdout, " recovery %s", rep.ResolvedRecoveryID)
 	}
 	if rep.ResolvedAttemptID != "" {
 		fmt.Fprintf(stdout, " attempt %s", rep.ResolvedAttemptID)
 	}
+	fmt.Fprintf(stdout, "\n")
 	if rep.LeftRecoveryID != "" || rep.LeftAttemptID != "" {
-		fmt.Fprintf(stdout, "  Still present (not named by this confirmation):")
+		fmt.Fprintf(stdout, "  Still present (not named by this authorization):")
 		if rep.LeftRecoveryID != "" {
 			fmt.Fprintf(stdout, " recovery %s", rep.LeftRecoveryID)
 		}
@@ -183,17 +353,8 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		fmt.Fprintf(stdout, "\n  The environment is still blocked — resolve the remaining marker\n  separately once inspected.\n")
 		return exitOK
 	}
-	fmt.Fprintf(stdout, "\n  The block is lifted. Verify the target still behaves as expected, then\n  deploy or recover normally. Observed state was not modified.\n")
+	fmt.Fprintf(stdout, "  The block is lifted. Verify the target still behaves as expected, then\n  deploy or recover normally. Observed state was not modified.\n")
 	return exitOK
-}
-
-// confirmIDOrEmpty passes the marker id only when the marker is present;
-// the empty string tells the engine this kind is not being resolved.
-func confirmIDOrEmpty(present bool, id string) string {
-	if !present {
-		return ""
-	}
-	return id
 }
 
 func observedLine(st target.State, stateErr error) string {

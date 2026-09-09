@@ -888,10 +888,11 @@ func TestRecoveryResolveCommand(t *testing.T) {
 	}
 	os.Remove(f.statePath())
 
-	// Wrong confirmation: refused, nothing changed.
+	// A sentence naming a marker that is not there: refused by the
+	// engine's identity binding, nothing changed.
 	code, _, errOut = runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
-	if code != exitFailed || !strings.Contains(errOut, "nothing was changed") {
-		t.Fatalf("wrong confirmation: exit = %d, stderr =\n%s", code, errOut)
+	if code != exitFailed || !strings.Contains(errOut, "NOT removed") {
+		t.Fatalf("absent-marker confirmation: exit = %d, stderr =\n%s", code, errOut)
 	}
 	if _, err := os.Stat(f.attemptPath()); err != nil {
 		t.Fatal("a refused resolution must not remove the marker")
@@ -909,7 +910,7 @@ func TestRecoveryResolveCommand(t *testing.T) {
 		t.Fatal(err)
 	}
 	code, out, errOut := runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir,
-		"--confirm", "resolve production attempt "+m.AttemptID, "--owner", "operator")
+		"attempt", m.AttemptID, "--confirm", "resolve production attempt "+m.AttemptID, "--owner", "operator")
 	if code != exitOK {
 		t.Fatalf("resolve exit = %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
@@ -922,7 +923,7 @@ func TestRecoveryResolveCommand(t *testing.T) {
 
 	// Resolving again immediately is a no-op.
 	code, out, _ = runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir,
-		"--confirm", "resolve production attempt "+m.AttemptID)
+		"attempt", m.AttemptID)
 	if code != exitOK || !strings.Contains(out, "Nothing to resolve") {
 		t.Errorf("second resolve should be a no-op: exit = %d, stdout =\n%s", code, out)
 	}
@@ -932,5 +933,73 @@ func TestRecoveryResolveCommand(t *testing.T) {
 	code, out, _ = runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
 	if code != exitFailed || !strings.Contains(out, "RECOVERY REQUIRED") {
 		t.Fatalf("post-resolve deploy exit = %d, stdout =\n%s", code, out)
+	}
+}
+
+// The authorized marker set must come from what the operator SELECTED,
+// not from what happens to exist: attempt-only, recovery-only and joint
+// scopes are all reachable from the CLI, and a partial authorization
+// leaves the other marker blocking — visibly.
+func TestRecoveryResolvePerMarkerScopes(t *testing.T) {
+	f := newCLIFixture(t)
+	writeAttemptMarker(t, f, "1.0.0")
+	// A recovery LINKED to that attempt (the consistent pair).
+	writeFileCLIF(t, f.recoveryPath(), fmt.Sprintf(`{"schema":"toolkit.recovery/v1","recoveryId":"0123456789abcdef","sourceAttemptId":"fedcba9876543210","project":"my-app","environment":"production","fromRelease":"2.0.0","fromBundleDigest":%q,"toRelease":"1.0.0","toBundleDigest":%q,"authorization":"manual","startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest, fakeDigest))
+	// Make the attempt id match the linked pair.
+	writeAttemptMarker(t, f, "1.0.0")
+	raw, err := os.ReadFile(f.attemptPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = bytes.Replace(raw, []byte(`"attemptId":"0123456789abcdef"`), []byte(`"attemptId":"fedcba9876543210"`), 1)
+	writeFileCLIF(t, f.attemptPath(), string(raw))
+	attID, recID := "fedcba9876543210", "0123456789abcdef"
+
+	// Grammar errors are usage errors.
+	code, _, errOut := runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "recovery")
+	if code != exitUsage {
+		t.Fatalf("dangling selector: exit = %d, stderr = %s", code, errOut)
+	}
+	code, _, errOut = runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "recovery", recID, "--confirm", "resolve production recovery deadbeefdeadbeef")
+	if code != exitFailed || !strings.Contains(errOut, "does not match the selected authorization") {
+		t.Fatalf("confirm/selector mismatch: exit = %d, stderr = %s", code, errOut)
+	}
+
+	// Attempt-only: the recovery marker stays and still blocks — said
+	// out loud, not silently.
+	code, out, errOut := runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"attempt", attID, "--confirm", "resolve production attempt "+attID, "--owner", "operator")
+	if code != exitOK {
+		t.Fatalf("attempt-only resolve exit = %d\n%s\n%s", code, out, errOut)
+	}
+	if !strings.Contains(out, "Still present") || !strings.Contains(out, recID) {
+		t.Errorf("partial authorization must report what it left:\\n%s", out)
+	}
+	if _, err := os.Stat(f.recoveryPath()); err != nil {
+		t.Fatal("the recovery marker must survive an attempt-only authorization")
+	}
+	if _, err := os.Stat(f.attemptPath()); !os.IsNotExist(err) {
+		t.Error("the attempt marker must be gone")
+	}
+
+	// Recovery-only completes the job.
+	code, out, _ = runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"recovery", recID, "--confirm", "resolve production recovery "+recID, "--owner", "operator")
+	if code != exitOK || !strings.Contains(out, "block is lifted") {
+		t.Fatalf("recovery-only resolve: exit = %d, stdout =\\n%s", code, out)
+	}
+	if _, err := os.Stat(f.recoveryPath()); !os.IsNotExist(err) {
+		t.Error("the recovery marker must be gone")
+	}
+
+	// Joint scope on a fresh inconsistent pair is refused by the engine.
+	f2 := newCLIFixture(t)
+	writeFileCLIF(t, f2.recoveryPath(), fmt.Sprintf(`{"schema":"toolkit.recovery/v1","recoveryId":"0123456789abcdef","sourceAttemptId":"","project":"my-app","environment":"production","fromRelease":"2.0.0","fromBundleDigest":%q,"toRelease":"1.0.0","toBundleDigest":%q,"authorization":"manual","startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest, fakeDigest))
+	writeAttemptMarker(t, f2, "1.0.0")
+	code, _, errOut = runCLI("recovery", "resolve", "production", "--repo-dir", f2.repoDir,
+		"recovery", recID, "attempt", "0123456789abcdef",
+		"--confirm", "resolve production recovery "+recID+" attempt 0123456789abcdef")
+	if code != exitFailed || !strings.Contains(errOut, "inconsistent evidence") {
+		t.Fatalf("joint inconsistent authorization: exit = %d, stderr =\\n%s", code, errOut)
 	}
 }
