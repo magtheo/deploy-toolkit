@@ -21,12 +21,19 @@ import (
 // REPORT — not the exit code — says whether the outcome is uncertain
 // (unresolved attempt/recovery marker) or nothing was executed.
 func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	jsonMode := wantsJSON(args)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("deploy", "", "usage: deployctl deploy <environment> [--repo-dir .] [--owner identity]"))
+		}
 		fmt.Fprintln(stderr, "usage: deployctl deploy <environment> [--repo-dir .] [--owner identity]")
 		return exitUsage
 	}
 	envName := args[0]
 	if strings.Contains(envName, "/") {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("deploy", envName, "environment must be a bare name"))
+		}
 		fmt.Fprintf(stderr, "deployctl deploy: environment must be a bare name, got %q\n", envName)
 		return exitUsage
 	}
@@ -34,6 +41,7 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	fs.SetOutput(io.Discard)
 	repoDir := fs.String("repo-dir", ".", "local checkout containing the release revision (for the bundle)")
 	owner := fs.String("owner", "", "identity recorded in the lock and history (default user@host)")
+	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
 	if err := fs.Parse(args[1:]); err != nil {
 		return exitUsage
 	}
@@ -41,20 +49,30 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		fmt.Fprintf(stderr, "deployctl deploy: unexpected argument %q\n", fs.Arg(0))
 		return exitUsage
 	}
+	humanOut := io.Writer(stdout)
+	if jsonMode {
+		humanOut = io.Discard
+	}
 
 	dc, err := loadDeploymentContext(*repoDir, envName)
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("deploy", envName, err.Error()))
+		}
 		fmt.Fprintf(stderr, "✗ deploy %s: %v\n", envName, err)
 		return exitUsage
 	}
 	bundleBytes, err := prepareBundle(ctx, dc.RepoDir, dc.Release)
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("deploy", envName, err.Error()))
+		}
 		fmt.Fprintf(stderr, "✗ deploy %s: %v\n", envName, err)
 		return exitUsage
 	}
 	tgt, err := connect(ctx, dc.Target)
 	if err != nil {
-		return reportConnectFailure(err, "deploy", envName, stderr)
+		return reportConnectFailure(err, "deploy", envName, stderr, jsonMode, stdout)
 	}
 	ownerID := *owner
 	if ownerID == "" {
@@ -69,7 +87,11 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		Bundle:         bundleBytes,
 		Owner:          ownerID,
 	})
-	return reportDeploy(rep, err, stdout, stderr)
+	if jsonMode {
+		env, _ := deployResult(rep, err)
+		return emitJSON(stdout, env)
+	}
+	return reportDeploy(rep, err, humanOut, stderr)
 }
 
 func reportDeploy(rep *lifecycle.Report, err error, stdout, stderr io.Writer) int {

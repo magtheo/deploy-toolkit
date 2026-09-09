@@ -59,6 +59,17 @@ type ResolveReport struct {
 	HistorySeq           int64
 }
 
+// ErrResolveRefused marks refusals: the operation was not allowed
+// (lock held, unreadable evidence, identity mismatch, inconsistent
+// coexistence) — nothing was changed and the invocation can be corrected.
+// It is distinct from infrastructure failures, which leave the outcome to
+// be retried after repair.
+var ErrResolveRefused = errors.New("resolve refused")
+
+func refuseResolve(format string, args ...any) error {
+	return fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), ErrResolveRefused)
+}
+
 // Resolve is the explicit, supported end of an unresolved situation — the
 // operation the runbook names after an operator has verified the target
 // by hand. It executes NO hooks and changes NOTHING about what is
@@ -114,7 +125,7 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 		Release:     "resolve",
 	})
 	if err != nil {
-		return rep, fmt.Errorf("acquire environment lock: %w", err)
+		return rep, refuseResolve("acquire environment lock: %v", err)
 	}
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
@@ -159,16 +170,16 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	// looked — refuse and let them look again.
 	if in.ConfirmRecoveryID != "" {
 		if !recoveryPresent || recovery.RecoveryID != in.ConfirmRecoveryID {
-			return rep, fmt.Errorf("the confirmation names recovery %s, but the target does not carry that marker — re-run `status` and confirm what is actually there", in.ConfirmRecoveryID)
+			return rep, refuseResolve("the confirmation names recovery %s, but the target does not carry that marker — re-run `status` and confirm what is actually there", in.ConfirmRecoveryID)
 		}
 	}
 	if in.ConfirmAttemptID != "" {
 		if !attemptPresent || attempt.AttemptID != in.ConfirmAttemptID {
-			return rep, fmt.Errorf("the confirmation names attempt %s, but the target does not carry that marker — re-run `status` and confirm what is actually there", in.ConfirmAttemptID)
+			return rep, refuseResolve("the confirmation names attempt %s, but the target does not carry that marker — re-run `status` and confirm what is actually there", in.ConfirmAttemptID)
 		}
 	}
 	if in.ConfirmRecoveryID == "" && in.ConfirmAttemptID == "" {
-		return rep, fmt.Errorf("a resolution must name at least one marker id — refusing to clear unnamed facts")
+		return rep, refuseResolve("a resolution must name at least one marker id — refusing to clear unnamed facts")
 	}
 	if recoveryPresent && attemptPresent && in.ConfirmRecoveryID != "" && in.ConfirmAttemptID != "" {
 		// Clearing BOTH together is only consistent as one story: this
@@ -179,7 +190,7 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 		// a time (leaving the other to keep the block) stays available:
 		// that is the inspect-first path.
 		if recovery.SourceAttemptID == "" || recovery.SourceAttemptID != attempt.AttemptID {
-			return rep, fmt.Errorf("inconsistent evidence: the recovery marker (sourceAttemptId %q) coexists with attempt marker %s — inspect the target and resolve them one at a time", orEmpty(recovery.SourceAttemptID), attempt.AttemptID)
+			return rep, refuseResolve("inconsistent evidence: the recovery marker (sourceAttemptId %q) coexists with attempt marker %s — inspect the target and resolve them one at a time", orEmpty(recovery.SourceAttemptID), attempt.AttemptID)
 		}
 	}
 

@@ -73,13 +73,23 @@ Usage:
                                              explicitly resolve unresolved markers after manual verification
   deployctl version                          print version
 
-Operational exit codes (deploy, rollback): 0 success, 1 reported outcome
-failure (determined — history records what happened), 2 usage/configuration
-error, 3 infrastructure failure. The failure REPORT — never the exit code
-alone — distinguishes pre-execution failures (nothing ran), bookkeeping
-failures after a committed state, and uncertain outcomes (an attempt or
-recovery marker is unresolved). Automation keys on the reported recovery
-state, not on exit 3.
+Operational exit codes (deploy, rollback, status, recovery resolve):
+0 success, 1 reported outcome failure (determined — history records what
+happened), 2 usage/configuration error, 3 infrastructure failure. Exit
+codes are broad process categories; decisions are made from the REPORT —
+never from the exit code alone.
+
+Machine interface: every operational command accepts --json and then
+writes exactly ONE versioned document to stdout (deployctl.result/v1) —
+no human prose — carrying the semantic fields automation consumes:
+outcome (success | failure | refused | uncertain | infrastructure-failure
+| usage-error), committed, alreadyCurrent, recoveryRequired, safeToRetry,
+consequential/recovery boundary identity (attemptId, recoveryId,
+recoveryStarted), desired/observed releases with digests and operationId,
+lock state, marker facts (present/unreadable) and status state. A
+determined failure records history and says so; an uncertain outcome says
+recoveryRequired: true and safeToRetry: false; an infrastructure failure
+before consequential work says safeToRetry: true.
 
 Release creation stops at the Release boundary: it never updates environments
 and never opens pull requests. Promotion proposals stop at the open, verified
@@ -115,6 +125,7 @@ Both require GITHUB_TOKEN.
 Deploy flags:
   --repo-dir .                  checkout containing the release revision (for the bundle)
   --owner identity              recorded in the lock and history (default user@host)
+  --json                        single deployctl.result/v1 document on stdout
 
 The deployment runs the full engine sequence — environment lock, staging,
 contract verification, preflight, migrate, apply, verify, observed-state
@@ -126,6 +137,7 @@ Rollback flags (manual/emergency recovery):
   --from <version>              version being undone (default: the pinned release)
   --repo-dir .                  checkout containing both release revisions
   --confirm "sentence"          typed confirmation; omit to be prompted
+  --json                        single deployctl.result/v1 document on stdout
 
 Requires typing exactly: rollback <env> to <version>. The confirmation gate
 precedes target contact: nothing — not even the connection — happens before
@@ -134,6 +146,7 @@ promotion with a reverse diff, not this command.
 
 Status flags:
   --repo-dir .                  checkout containing .deploy/
+  --json                        single deployctl.result/v1 document on stdout
 
 Recovery resolve flags:
   --repo-dir .                  checkout containing .deploy/

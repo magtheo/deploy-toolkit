@@ -24,18 +24,26 @@ import (
 // recovery markers: during an active deployment or rollback both exist by
 // design, and the only safe instruction then is "wait, touch nothing".
 func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	jsonMode := wantsJSON(args)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("status", "", "usage: deployctl status <environment> [--repo-dir .]"))
+		}
 		fmt.Fprintln(stderr, "usage: deployctl status <environment> [--repo-dir .]")
 		return exitUsage
 	}
 	envName := args[0]
 	if strings.Contains(envName, "/") {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("status", envName, "environment must be a bare name"))
+		}
 		fmt.Fprintf(stderr, "deployctl status: environment must be a bare name, got %q\n", envName)
 		return exitUsage
 	}
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repoDir := fs.String("repo-dir", ".", "checkout containing .deploy/")
+	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
 	if err := fs.Parse(args[1:]); err != nil {
 		return exitUsage
 	}
@@ -46,13 +54,22 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 
 	dc, err := loadDeploymentContext(*repoDir, envName)
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("status", envName, err.Error()))
+		}
 		fmt.Fprintf(stderr, "✗ status %s: %v\n", envName, err)
 		return exitUsage
 	}
 	tgt, err := connect(ctx, dc.Target)
 	if err != nil {
-		return reportConnectFailure(err, "status", envName, stderr)
+		return reportConnectFailure(err, "status", envName, stderr, jsonMode, stdout)
 	}
+	humanOut := io.Writer(stdout)
+	rawStdout := stdout
+	if jsonMode {
+		humanOut = io.Discard
+	}
+	stdout = humanOut
 
 	fmt.Fprintf(stdout, "Project       %s\n", dc.Release.Metadata.Project)
 	fmt.Fprintf(stdout, "Environment   %s\n", dc.Env.Metadata.Name)
@@ -126,6 +143,9 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	}
 
 	degraded := attemptUnreadable || recoveryUnreadable || lockErr != nil || stateUnreadable
+	if jsonMode {
+		return emitJSON(rawStdout, buildStatusJSON(dc, st, stateErr, stateAbsent, lock, lockErr, attempt, attemptErr, attemptUnreadable, recovery, recoveryErr, recoveryUnreadable))
+	}
 	fmt.Fprintf(stdout, "\nState         %s\n", classifyState(stateClassification{
 		degraded:      degraded,
 		lock:          lock,
@@ -163,23 +183,30 @@ type stateClassification struct {
 // flight outranks every marker it may have created; recovery marker;
 // attempt marker; desired/observed comparison.
 func classifyState(c stateClassification) string {
+	human, _ := c.classify()
+	return human
+}
+
+// classify returns the human line and the machine enum from ONE
+// precedence switch, so the two views cannot diverge.
+func (c stateClassification) classify() (human, machine string) {
 	switch {
 	case c.degraded:
-		return "DEGRADED EVIDENCE — a recovery fact is unreadable or invalid; claim nothing, repair access first"
+		return "DEGRADED EVIDENCE — a recovery fact is unreadable or invalid; claim nothing, repair access first", "degraded"
 	case c.lock:
-		return "LOCKED — an operation may be executing; wait, do not start recovery or deployment"
+		return "LOCKED — an operation may be executing; wait, do not start recovery or deployment", "locked"
 	case c.recovery:
-		return "RECOVERY REQUIRED — unresolved recovery marker blocks everything"
+		return "RECOVERY REQUIRED — unresolved recovery marker blocks everything", "recovery-required"
 	case c.attempt:
-		return "RECOVERY REQUIRED — unresolved deployment attempt blocks normal deployment"
+		return "RECOVERY REQUIRED — unresolved deployment attempt blocks normal deployment", "recovery-required"
 	case c.stateAbsent:
-		return "NOT DEPLOYED"
+		return "NOT DEPLOYED", "not-deployed"
 	case c.observed.Release != c.desired:
-		return "OUT OF DATE — desired release differs from observed"
+		return "OUT OF DATE — desired release differs from observed", "out-of-date"
 	case c.observed.BundleDigest != c.desiredDigest:
-		return "DRIFT — observed release carries a different bundle digest than the release pins"
+		return "DRIFT — observed release carries a different bundle digest than the release pins", "drift"
 	default:
-		return "HEALTHY — desired and observed agree"
+		return "HEALTHY — desired and observed agree", "healthy"
 	}
 }
 
@@ -250,6 +277,58 @@ func lockHeld(ctx context.Context, tgt *target.Target, dc *deploymentContext) (b
 		return false, err
 	}
 	return tgt.Exists(ctx, path)
+}
+
+// buildStatusJSON assembles the machine document from the same facts the
+// human rendering consumes — one read, two views, no divergence.
+func buildStatusJSON(dc *deploymentContext, st target.State, stateErr error, stateAbsent bool, lock bool, lockErr error, attempt target.AttemptMarker, attemptErr error, attemptUnreadable bool, recovery target.RecoveryMarker, recoveryErr error, recoveryUnreadable bool) *resultEnvelope {
+	desired := &releaseRef{Version: dc.Release.Metadata.Version, BundleDigest: dc.Release.Bundle.Digest}
+	var observed *releaseRef
+	if stateErr == nil && st.Current != nil {
+		observed = &releaseRef{Version: st.Current.Release, BundleDigest: st.Current.BundleDigest, Since: st.Current.Since, OperationID: st.Current.OperationID}
+	}
+	lockStr := "free"
+	switch {
+	case lockErr != nil:
+		lockStr = "unreadable"
+	case lock:
+		lockStr = "held"
+	}
+	attemptFact := &markerFact{}
+	switch {
+	case attemptErr == nil:
+		attemptFact.Present = true
+		attemptFact.ID = attempt.AttemptID
+		attemptFact.FromRelease = attempt.FromRelease
+		attemptFact.ToRelease = attempt.ToRelease
+		attemptFact.StartedAt = attempt.StartedAt
+	case attemptUnreadable:
+		attemptFact.Unreadable = attemptErr.Error()
+	}
+	recoveryFact := &markerFact{}
+	switch {
+	case recoveryErr == nil:
+		recoveryFact.Present = true
+		recoveryFact.ID = recovery.RecoveryID
+		recoveryFact.FromRelease = recovery.FromRelease
+		recoveryFact.ToRelease = recovery.ToRelease
+		recoveryFact.StartedAt = recovery.StartedAt
+		recoveryFact.Authorization = recovery.Authorization
+	case recoveryUnreadable:
+		recoveryFact.Unreadable = recoveryErr.Error()
+	}
+	c := stateClassification{
+		degraded:      attemptUnreadable || recoveryUnreadable || lockErr != nil || (stateErr != nil && !stateAbsent),
+		lock:          lock,
+		recovery:      recoveryErr == nil,
+		attempt:       attemptErr == nil,
+		desired:       dc.Release.Metadata.Version,
+		desiredDigest: dc.Release.Bundle.Digest,
+		observed:      st.Current,
+		stateAbsent:   stateAbsent,
+	}
+	_, machine := c.classify()
+	return statusResult(dc.Release.Metadata.Project, dc.Env.Metadata.Name, desired, observed, lockStr, machine, attemptFact, recoveryFact)
 }
 
 func orUnknown(s string) string {

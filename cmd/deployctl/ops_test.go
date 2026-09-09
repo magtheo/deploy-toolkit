@@ -882,7 +882,7 @@ func TestRecoveryResolveCommand(t *testing.T) {
 
 	// Unreadable observed state must be repaired, not resolved.
 	writeFileCLIF(t, f.statePath(), "{corrupt")
-	code, _, errOut := runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "x")
+	code, _, errOut := runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
 	if code != exitFailed || !strings.Contains(errOut, "repaired, not resolved") {
 		t.Fatalf("corrupt state: exit = %d, stderr =\n%s", code, errOut)
 	}
@@ -1002,4 +1002,229 @@ func TestRecoveryResolvePerMarkerScopes(t *testing.T) {
 	if code != exitFailed || !strings.Contains(errOut, "inconsistent evidence") {
 		t.Fatalf("joint inconsistent authorization: exit = %d, stderr =\\n%s", code, errOut)
 	}
+}
+
+// ---- the machine contract: deployctl.result/v1 ------------------------
+
+func runJSON(t *testing.T, args ...string) (int, map[string]any) {
+	t.Helper()
+	args = append(args, "--json")
+	code, out, errOut := runCLI(args...)
+	if !json.Valid([]byte(out)) {
+		t.Fatalf("--json stdout is not a single JSON document: exit=%d out=%q stderr=%q", code, out, errOut)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc["schema"] != "deployctl.result/v1" {
+		t.Errorf("schema = %v", doc["schema"])
+	}
+	return code, doc
+}
+
+func mustStr(t *testing.T, doc map[string]any, key, want string) {
+	t.Helper()
+	if got, _ := doc[key].(string); got != want {
+		t.Errorf("%s = %v, want %q", key, doc[key], want)
+	}
+}
+
+func TestJSONDeploySuccess(t *testing.T) {
+	f := newCLIFixture(t)
+	code, doc := runJSON(t, "deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
+	if code != exitOK {
+		t.Fatalf("exit = %d: %v", code, doc["message"])
+	}
+	mustStr(t, doc, "outcome", "success")
+	mustStr(t, doc, "project", "my-app")
+	mustStr(t, doc, "environment", "production")
+	if doc["recoveryRequired"] != false || doc["safeToRetry"] != false {
+		t.Errorf("flags = %v/%v", doc["recoveryRequired"], doc["safeToRetry"])
+	}
+	data := doc["data"].(map[string]any)
+	if data["committed"] != true || data["consequentialStarted"] != true {
+		t.Errorf("data = %v", data)
+	}
+	if stages, _ := data["stages"].([]any); len(stages) != 4 {
+		t.Errorf("stages = %v", data["stages"])
+	}
+
+	// Already-current is a deliberate no-op with outcome success.
+	code, doc = runJSON(t, "deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
+	if code != exitOK || doc["outcome"] != "success" {
+		t.Fatalf("redeploy: %d %v", code, doc["outcome"])
+	}
+	if doc["data"].(map[string]any)["alreadyCurrent"] != true {
+		t.Errorf("data = %v", doc["data"])
+	}
+}
+
+func TestJSONDeployDeterminedFailureIsRecoveryRequired(t *testing.T) {
+	f := newCLIFixture(t)
+	p := filepath.Join(f.repoDir, "deploy/verify.sh")
+	raw, _ := os.ReadFile(p)
+	os.WriteFile(p, append(raw, []byte("exit 1\n")...), 0o755)
+	gitf(t, f.repoDir, "add", "-A")
+	gitf(t, f.repoDir, "commit", "-q", "-m", "break verify")
+	rev := gitf(t, f.repoDir, "rev-parse", "HEAD")
+	f.writeRelease(t, "1.0.0", rev)
+
+	code, doc := runJSON(t, "deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
+	if code != exitFailed {
+		t.Fatalf("exit = %d", code)
+	}
+	mustStr(t, doc, "outcome", "failure")
+	if doc["recoveryRequired"] != true || doc["safeToRetry"] != false {
+		t.Errorf("flags = %v/%v", doc["recoveryRequired"], doc["safeToRetry"])
+	}
+	data := doc["data"].(map[string]any)
+	if data["consequentialStarted"] != true || data["attemptId"] == "" {
+		t.Errorf("data = %v", data)
+	}
+}
+
+func TestJSONStatusShapes(t *testing.T) {
+	f := newCLIFixture(t)
+	if code, out, _ := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy: %d %s", code, out)
+	}
+	code, doc := runJSON(t, "status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK || doc["outcome"] != "success" {
+		t.Fatalf("status: %d %v", code, doc)
+	}
+	data := doc["data"].(map[string]any)
+	if data["state"] != "healthy" || data["lock"] != "free" {
+		t.Errorf("data = %v", data)
+	}
+	if doc["recoveryRequired"] != false {
+		t.Errorf("recoveryRequired = %v", doc["recoveryRequired"])
+	}
+	obs := data["observed"].(map[string]any)
+	if obs["version"] != "1.0.0" || obs["operationId"] == "" {
+		t.Errorf("observed = %v", obs)
+	}
+
+	// Corrupt evidence → degraded, with the unreadable fact named.
+	writeFileCLIF(t, f.attemptPath(), "{corrupt")
+	_, doc = runJSON(t, "status", "production", "--repo-dir", f.repoDir)
+	data = doc["data"].(map[string]any)
+	if data["state"] != "degraded" || doc["recoveryRequired"] != false {
+		t.Errorf("data = %v", data)
+	}
+	if doc["outcome"] != "success" {
+		t.Errorf("status reporting degraded evidence is still a successful report: %v", doc["outcome"])
+	}
+	os.Remove(f.attemptPath())
+
+	// Unresolved attempt → recovery-required.
+	writeAttemptMarker(t, f, "1.0.0")
+	_, doc = runJSON(t, "status", "production", "--repo-dir", f.repoDir)
+	data = doc["data"].(map[string]any)
+	if data["state"] != "recovery-required" || doc["recoveryRequired"] != true {
+		t.Errorf("data = %v recoveryRequired = %v", data, doc["recoveryRequired"])
+	}
+	if m := data["attempt"].(map[string]any); m["present"] != true {
+		t.Errorf("attempt = %v", m)
+	}
+}
+
+func TestJSONRollbackRefusalAndSuccess(t *testing.T) {
+	f := newCLIFixture(t)
+	if code, out, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy: %d\n%s\n%s", code, out, errOut)
+	}
+	f.writeEnv(t, "2.0.0")
+	if code, out, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy 2.0.0: %d\n%s\n%s", code, out, errOut)
+	}
+
+	// A near-miss confirmation is a refused outcome, exit 1.
+	code, doc := runJSON(t, "rollback", "production", "--to", "1.0.0", "--repo-dir", f.repoDir, "--confirm", "rollback production to 9.9.9", "--owner", "test")
+	if code != exitFailed {
+		t.Fatalf("exit = %d", code)
+	}
+	mustStr(t, doc, "outcome", "refused")
+
+	code, doc = runJSON(t, "rollback", "production", "--to", "1.0.0", "--repo-dir", f.repoDir, "--confirm", "rollback production to 1.0.0", "--owner", "test")
+	if code != exitOK || doc["outcome"] != "success" {
+		t.Fatalf("rollback: %d %v", code, doc["outcome"])
+	}
+	data := doc["data"].(map[string]any)
+	if data["committed"] != true || data["fromVersion"] != "2.0.0" || data["toVersion"] != "1.0.0" || data["recoveryStarted"] != true {
+		t.Errorf("data = %v", data)
+	}
+}
+
+func TestJSONResolveScopes(t *testing.T) {
+	f := newCLIFixture(t)
+	// Blocked by a handcrafted pair.
+	writeAttemptMarker(t, f, "1.0.0")
+	writeFileCLIF(t, f.attemptPath(), strings.Replace(string(mustRead(t, f.attemptPath())), "0123456789abcdef", "fedcba9876543210", 1))
+	raw := fmt.Sprintf(`{"schema":"toolkit.recovery/v1","recoveryId":"0123456789abcdef","sourceAttemptId":"fedcba9876543210","project":"my-app","environment":"production","fromRelease":"2.0.0","fromBundleDigest":%q,"toRelease":"1.0.0","toBundleDigest":%q,"authorization":"manual","startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest, fakeDigest)
+	writeFileCLIF(t, f.recoveryPath(), raw)
+
+	// Partial: attempt-only, the recovery remains and still blocks.
+	code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"attempt", "fedcba9876543210", "--confirm", "resolve production attempt fedcba9876543210", "--owner", "operator")
+	if code != exitOK || doc["outcome"] != "success" {
+		t.Fatalf("partial: %d %v", code, doc["outcome"])
+	}
+	if doc["recoveryRequired"] != true {
+		t.Errorf("a partial resolution leaves the environment blocked: %v", doc["recoveryRequired"])
+	}
+	data := doc["data"].(map[string]any)
+	if data["resolvedAttemptId"] != "fedcba9876543210" || data["leftRecoveryId"] != "0123456789abcdef" {
+		t.Errorf("data = %v", data)
+	}
+
+	// Complete the resolution.
+	code, doc = runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"recovery", "0123456789abcdef", "--confirm", "resolve production recovery 0123456789abcdef", "--owner", "operator")
+	if code != exitOK || doc["recoveryRequired"] != false {
+		t.Fatalf("complete: %d %v %v", code, doc["outcome"], doc["recoveryRequired"])
+	}
+
+	// Nothing left: idempotent no-op.
+	code, doc = runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"recovery", "0123456789abcdef", "--confirm", "resolve production recovery 0123456789abcdef")
+	if code != exitOK || doc["outcome"] != "success" || doc["data"].(map[string]any)["nothingToResolve"] != true {
+		t.Fatalf("no-op: %d %v", code, doc)
+	}
+}
+
+func TestJSONUsageErrorIsJSONToo(t *testing.T) {
+	f := newCLIFixture(t)
+	code, doc := runJSON(t, "deploy")
+	if code != exitUsage || doc["outcome"] != "usage-error" {
+		t.Fatalf("exit = %d outcome = %v", code, doc["outcome"])
+	}
+	// Grammar errors are usage errors even when the target is unblocked.
+	code, doc = runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir, "nonsense", "garbage")
+	if code != exitUsage || doc["outcome"] != "usage-error" {
+		t.Fatalf("grammar-before-target: exit = %d outcome = %v", code, doc["outcome"])
+	}
+}
+
+func TestJSONUnreachableTargetIsPreExecutionInfra(t *testing.T) {
+	f := newCLIFixture(t)
+	keyPEM, hostKey := validSSHMaterial(t)
+	f.useSSHTransport(t, keyPEM, hostKey)
+	code, doc := runJSON(t, "deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
+	if code != exitInfra {
+		t.Fatalf("exit = %d", code)
+	}
+	mustStr(t, doc, "outcome", "infrastructure-failure")
+	if doc["safeToRetry"] != true {
+		t.Errorf("a pre-execution failure is safe to retry after repair: %v", doc["safeToRetry"])
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
 }

@@ -31,24 +31,6 @@ func runRecovery(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	}
 }
 
-// splitFlagsAndValues partitions tokens into flag tokens (with their
-// values) and positional tokens, preserving order. A token starting with
-// "-" is a flag and consumes the following token as its value.
-func splitFlagsAndValues(tokens []string) (flags, positional []string) {
-	for i := 0; i < len(tokens); i++ {
-		if strings.HasPrefix(tokens[i], "-") {
-			flags = append(flags, tokens[i])
-			if i+1 < len(tokens) {
-				i++
-				flags = append(flags, tokens[i])
-			}
-			continue
-		}
-		positional = append(positional, tokens[i])
-	}
-	return flags, positional
-}
-
 // resolveScope is the set of markers the operator is authorizing for
 // removal. It is chosen EXPLICITLY — by positional selectors or by the
 // typed sentence — never derived from what happens to exist on the
@@ -89,8 +71,6 @@ func parseResolveScope(envName string, tokens []string, confirm string) (sentenc
 	}
 	return "", sc, errInteractiveConfirmation
 }
-
-var errInteractiveConfirmation = errors.New("interactive confirmation required")
 
 // errScopeMismatch marks an authorization disagreement (selector set vs
 // --confirm sentence) — a failed authorization, not a usage error.
@@ -174,12 +154,19 @@ func canonicalResolveSentence(envName string, sc resolveScope) string {
 // sentence names. The engine re-reads those markers under the lock and
 // refuses on any mismatch.
 func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	jsonMode := wantsJSON(args)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("recovery-resolve", "", "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>]"))
+		}
 		fmt.Fprintln(stderr, "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>] [--repo-dir .] [--owner identity] [--confirm \"...\"]")
 		return exitUsage
 	}
 	envName := args[0]
 	if strings.Contains(envName, "/") {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("recovery-resolve", envName, "environment must be a bare name"))
+		}
 		fmt.Fprintf(stderr, "deployctl recovery resolve: environment must be a bare name, got %q\n", envName)
 		return exitUsage
 	}
@@ -188,23 +175,53 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	repoDir := fs.String("repo-dir", ".", "checkout containing .deploy/")
 	owner := fs.String("owner", "", "identity recorded as resolution evidence (default user@host)")
 	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
+	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
+	jsonFlag := jsonMode
 	// Go's flag parsing stops at the first positional token; split flags
-	// and positional selectors manually so both orders work. Every flag
-	// of this command takes exactly one value.
-	flagTokens, positional := splitFlagsAndValues(args[1:])
+	// and positional selectors manually so both orders work. Value flags
+	// consume one token; boolean flags (json) consume none.
+	flagTokens, selectors := splitFlagsAndValues(args[1:], map[string]bool{"json": true})
+	_ = jsonFlag
 	if err := fs.Parse(flagTokens); err != nil {
 		return exitUsage
 	}
-	selectors := positional
+
+	// Command SYNTAX is validated before any target access — and before
+	// the no-markers no-op return: grammar errors are usage errors
+	// regardless of target state. (The interactive path's sentence parse
+	// necessarily happens later, once the human has typed it.)
+	var scope resolveScope
+	var sentence string
+	var err error
+	interactive := len(selectors) == 0 && *confirm == ""
+	if !interactive {
+		sentence, scope, err = parseResolveScope(envName, selectors, *confirm)
+		if err != nil {
+			if jsonMode {
+				if errors.Is(err, errScopeMismatch) {
+					return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: "recovery-resolve", Outcome: outcomeRefused, Environment: envName, Message: err.Error()})
+				}
+				return emitJSON(stdout, usageErrorResult("recovery-resolve", envName, err.Error()))
+			}
+			fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
+			if errors.Is(err, errScopeMismatch) {
+				return exitFailed
+			}
+			return exitUsage
+		}
+	}
 
 	dc, err := loadDeploymentContext(*repoDir, envName)
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("recovery-resolve", envName, err.Error()))
+		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
 		return exitUsage
 	}
 	tgt, err := connect(ctx, dc.Target)
 	if err != nil {
-		return reportConnectFailure(err, "recovery resolve", envName, stderr)
+		return reportConnectFailure(err, "recovery resolve", envName, stderr, jsonMode, stdout)
 	}
 
 	project, env := dc.Release.Metadata.Project, dc.Env.Metadata.Name
@@ -231,6 +248,9 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		return exitFailed
 	}
 	if aerr != nil && rerr != nil {
+		if jsonMode {
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: "recovery-resolve", Outcome: outcomeSuccess, Project: project, Environment: envName, SafeToRetry: true, Message: "nothing to resolve; the environment is not blocked", Data: &resolveResultData{NothingToResolve: true}})
+		}
 		fmt.Fprintf(stdout, "Nothing to resolve: no unresolved attempt or recovery marker on %s.\n", envName)
 		return exitOK
 	}
@@ -248,38 +268,30 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		return exitFailed
 	}
 
-	// The authorized marker set: explicit selectors, or the typed
-	// sentence — never marker presence.
-	interactive := false
-	sentence, scope, err := parseResolveScope(envName, selectors, *confirm)
-	if errors.Is(err, errInteractiveConfirmation) {
-		interactive = true
-	} else if err != nil {
-		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
-		if errors.Is(err, errScopeMismatch) {
-			return exitFailed
-		}
-		return exitUsage
+	// The authorized marker set was parsed above from explicit
+	// selectors or the typed sentence — never marker presence.
+	humanOut := io.Writer(stdout)
+	if jsonMode {
+		humanOut = io.Discard
 	}
-
-	fmt.Fprintf(stdout, "Environment   %s\n", envName)
-	fmt.Fprintf(stdout, "Observed      %s\n", observedLine(st, serr))
+	fmt.Fprintf(humanOut, "Environment   %s\n", envName)
+	fmt.Fprintf(humanOut, "Observed      %s\n", observedLine(st, serr))
 	if rerr == nil {
-		fmt.Fprintf(stdout, "Recovery      %s: %s → %s (id %s, authorization %s)\n", recovery.RecoveryID, recovery.FromRelease, recovery.ToRelease, recovery.RecoveryID, recovery.Authorization)
+		fmt.Fprintf(humanOut, "Recovery      %s: %s → %s (id %s, authorization %s)\n", recovery.RecoveryID, recovery.FromRelease, recovery.ToRelease, recovery.RecoveryID, recovery.Authorization)
 	}
 	if aerr == nil {
-		fmt.Fprintf(stdout, "Attempt       %s: %s → %s (id %s)\n", attempt.AttemptID, orNone(attempt.FromRelease), attempt.ToRelease, attempt.AttemptID)
+		fmt.Fprintf(humanOut, "Attempt       %s: %s → %s (id %s)\n", attempt.AttemptID, orNone(attempt.FromRelease), attempt.ToRelease, attempt.AttemptID)
 	}
-	fmt.Fprintf(stdout, "Resolution    records evidence, then removes exactly the markers you authorize.\n")
-	fmt.Fprintf(stdout, "              It runs NO hooks and changes NOTHING about what is running.\n")
-	fmt.Fprintf(stdout, "              Use only after verifying the target by hand (app health,\n")
-	fmt.Fprintf(stdout, "              digest, migrations).\n\n")
+	fmt.Fprintf(humanOut, "Resolution    records evidence, then removes exactly the markers you authorize.\n")
+	fmt.Fprintf(humanOut, "              It runs NO hooks and changes NOTHING about what is running.\n")
+	fmt.Fprintf(humanOut, "              Use only after verifying the target by hand (app health,\n")
+	fmt.Fprintf(humanOut, "              digest, migrations).\n\n")
 
 	if interactive {
-		fmt.Fprintf(stdout, "Type the sentence for what you authorize:\n")
-		fmt.Fprintf(stdout, "  resolve %s recovery <id>\n", envName)
-		fmt.Fprintf(stdout, "  resolve %s attempt <id>\n", envName)
-		fmt.Fprintf(stdout, "  resolve %s recovery <id> attempt <id>\n> ", envName)
+		fmt.Fprintf(humanOut, "Type the sentence for what you authorize:\n")
+		fmt.Fprintf(humanOut, "  resolve %s recovery <id>\n", envName)
+		fmt.Fprintf(humanOut, "  resolve %s attempt <id>\n", envName)
+		fmt.Fprintf(humanOut, "  resolve %s recovery <id> attempt <id>\n> ", envName)
 		line, rerr2 := bufio.NewReader(os.Stdin).ReadString('\n')
 		if rerr2 != nil && line == "" {
 			fmt.Fprintf(stderr, "\n✗ resolve aborted: confirmation could not be read (%v)\n", rerr2)
@@ -297,7 +309,7 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		// passed via --confirm) — it IS the authorization.
 		got := *confirm
 		if got == "" {
-			fmt.Fprintf(stdout, "Type the sentence to confirm:\n  %s\n> ", sentence)
+			fmt.Fprintf(humanOut, "Type the sentence to confirm:\n  %s\n> ", sentence)
 			line, rerr2 := bufio.NewReader(os.Stdin).ReadString('\n')
 			if rerr2 != nil && line == "" {
 				fmt.Fprintf(stderr, "\n✗ resolve aborted: confirmation could not be read (%v)\n", rerr2)
@@ -325,10 +337,18 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		ConfirmAttemptID:  scope.attemptID,
 	})
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, mustEnvelope(resolveResult(rep, err, errors.Is(err, lifecycle.ErrResolveRefused))))
+		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
 		fmt.Fprintln(stderr, "  The markers were NOT removed — the block is still in place.")
 		fmt.Fprintln(stderr, "  Run `deployctl status` and follow its guidance.")
 		return exitFailed
+	}
+	if env, code := resolveResult(rep, nil, false); jsonMode {
+		return emitJSON(stdout, env)
+	} else {
+		_ = code
 	}
 	if rep.NothingToResolve {
 		fmt.Fprintf(stdout, "✓ nothing to resolve — the environment is not blocked\n")
@@ -355,6 +375,11 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	}
 	fmt.Fprintf(stdout, "  The block is lifted. Verify the target still behaves as expected, then\n  deploy or recover normally. Observed state was not modified.\n")
 	return exitOK
+}
+
+func mustEnvelope(env *resultEnvelope, code int) *resultEnvelope {
+	_ = code
+	return env
 }
 
 func observedLine(st target.State, stateErr error) string {

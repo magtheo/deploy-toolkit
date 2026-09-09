@@ -24,12 +24,19 @@ import (
 // automatic rollback after a failed deploy is Step 11 workflow wiring
 // that invokes the same engine with its own authorization.
 func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	jsonMode := wantsJSON(args)
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("rollback", "", "usage: deployctl rollback <environment> --to <version>"))
+		}
 		fmt.Fprintln(stderr, "usage: deployctl rollback <environment> --to <version> [--from <version>] [--repo-dir .] [--confirm \"...\"]")
 		return exitUsage
 	}
 	envName := args[0]
 	if strings.Contains(envName, "/") {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("rollback", envName, "environment must be a bare name"))
+		}
 		fmt.Fprintf(stderr, "deployctl rollback: environment must be a bare name, got %q\n", envName)
 		return exitUsage
 	}
@@ -40,12 +47,17 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	repoDir := fs.String("repo-dir", ".", "local checkout containing both release revisions")
 	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
 	owner := fs.String("owner", "", "identity recorded in the lock and history (default user@host)")
+	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
 	if err := fs.Parse(args[1:]); err != nil {
 		return exitUsage
 	}
 	if fs.NArg() > 0 {
 		fmt.Fprintf(stderr, "deployctl rollback: unexpected argument %q\n", fs.Arg(0))
 		return exitUsage
+	}
+	humanOut := io.Writer(stdout)
+	if jsonMode {
+		humanOut = io.Discard
 	}
 	if *to == "" {
 		fmt.Fprintln(stderr, "deployctl rollback: --to <version> is required")
@@ -66,6 +78,9 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 
 	dc, err := loadDeploymentContext(*repoDir, envName)
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("rollback", envName, err.Error()))
+		}
 		fmt.Fprintf(stderr, "✗ rollback %s: %v\n", envName, err)
 		return exitUsage
 	}
@@ -73,12 +88,18 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	if *from != "" && *from != fromRel.Metadata.Version {
 		fromRel, err = dc.loadRelease(*from)
 		if err != nil {
+			if jsonMode {
+				return emitJSON(stdout, usageErrorResult("rollback", envName, "load --from release: "+err.Error()))
+			}
 			fmt.Fprintf(stderr, "✗ rollback %s: load --from release: %v\n", envName, err)
 			return exitUsage
 		}
 	}
 	toRel, err := dc.loadRelease(*to)
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("rollback", envName, "load --to release: "+err.Error()))
+		}
 		fmt.Fprintf(stderr, "✗ rollback %s: load --to release: %v\n", envName, err)
 		return exitUsage
 	}
@@ -87,11 +108,17 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	// material must fail before any confirmation, not after.
 	fromBundle, err := prepareBundle(ctx, dc.RepoDir, fromRel)
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("rollback", envName, err.Error()))
+		}
 		fmt.Fprintf(stderr, "✗ rollback %s: %v\n", envName, err)
 		return exitUsage
 	}
 	toBundle, err := prepareBundle(ctx, dc.RepoDir, toRel)
 	if err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult("rollback", envName, err.Error()))
+		}
 		fmt.Fprintf(stderr, "✗ rollback %s: %v\n", envName, err)
 		return exitUsage
 	}
@@ -105,11 +132,11 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	sentence := fmt.Sprintf("rollback %s to %s", envName, toRel.Metadata.Version)
 	got := *confirm
 	if got == "" {
-		fmt.Fprintf(stdout, "Environment   %s\n", envName)
-		fmt.Fprintf(stdout, "Undoes        %s (%s)\n", fromRel.Metadata.Version, shortDigest(fromRel.Bundle.Digest))
-		fmt.Fprintf(stdout, "Restores      %s (%s)\n", toRel.Metadata.Version, shortDigest(toRel.Bundle.Digest))
-		fmt.Fprintf(stdout, "Authorization manual (emergency)\n\n")
-		fmt.Fprintf(stdout, "A recovery may run the failed release's rollback hook and the restored\nrelease's apply/verify on production. Type the sentence to confirm:\n  %s\n> ", sentence)
+		fmt.Fprintf(humanOut, "Environment   %s\n", envName)
+		fmt.Fprintf(humanOut, "Undoes        %s (%s)\n", fromRel.Metadata.Version, shortDigest(fromRel.Bundle.Digest))
+		fmt.Fprintf(humanOut, "Restores      %s (%s)\n", toRel.Metadata.Version, shortDigest(toRel.Bundle.Digest))
+		fmt.Fprintf(humanOut, "Authorization manual (emergency)\n\n")
+		fmt.Fprintf(humanOut, "A recovery may run the failed release's rollback hook and the restored\nrelease's apply/verify on production. Type the sentence to confirm:\n  %s\n> ", sentence)
 		reader := bufio.NewReader(os.Stdin)
 		line, rerr := reader.ReadString('\n')
 		if rerr != nil && line == "" {
@@ -119,13 +146,16 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		got = strings.TrimSpace(line)
 	}
 	if got != sentence {
+		if jsonMode {
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: "rollback", Outcome: outcomeRefused, Environment: envName, Message: fmt.Sprintf("confirmation does not match %q — nothing was executed, the target was not contacted", sentence)})
+		}
 		fmt.Fprintf(stderr, "✗ rollback aborted: confirmation does not match %q — nothing was executed, the target was not contacted\n", sentence)
 		return exitFailed
 	}
 
 	tgt, err := connect(ctx, dc.Target)
 	if err != nil {
-		return reportConnectFailure(err, "rollback", envName, stderr)
+		return reportConnectFailure(err, "rollback", envName, stderr, jsonMode, stdout)
 	}
 
 	ownerID := *owner
@@ -143,7 +173,11 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		Authorization:  lifecycle.RollbackManual,
 		Owner:          ownerID,
 	})
-	return reportRollback(rep, err, envName, stdout, stderr)
+	if jsonMode {
+		env, _ := rollbackResult(rep, err)
+		return emitJSON(stdout, env)
+	}
+	return reportRollback(rep, err, envName, humanOut, stderr)
 }
 
 func reportRollback(rep *lifecycle.RollbackReport, err error, envName string, stdout, stderr io.Writer) int {
