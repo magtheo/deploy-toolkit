@@ -532,6 +532,12 @@ func TestStatusFirstDeploymentAttemptHasNoRestoreTarget(t *testing.T) {
 // material unless overridden. Missing variables are simulated with an
 // empty value.
 func (f *cliFixture) useSSHTransport(t *testing.T, keyPEM, hostKeyLine string) {
+	f.useSSHTransportAt(t, keyPEM, hostKeyLine, "127.0.0.1", 1)
+}
+
+// useSSHTransportAt is useSSHTransport with an explicit host and port,
+// for tests that stand up a live in-process SSH server.
+func (f *cliFixture) useSSHTransportAt(t *testing.T, keyPEM, hostKeyLine, host string, port int) {
 	t.Helper()
 	dir := t.TempDir()
 	writeTarget := func() {
@@ -544,11 +550,11 @@ spec:
   transport:
     type: ssh
     hostFrom: DEPLOY_TEST_HOST
-    port: 1
+    port: %d
     user: deploy
     hostKeyFrom: DEPLOY_TEST_HOSTKEY
     credentialFrom: DEPLOY_TEST_KEY
-`, f.deployDir))
+`, f.deployDir, port))
 	}
 	writeTarget()
 	keyPath := filepath.Join(dir, "key.pem")
@@ -559,7 +565,7 @@ spec:
 	if hostKeyLine != "" {
 		writeFileCLIF(t, hostKeyPath, hostKeyLine)
 	}
-	t.Setenv("DEPLOY_TEST_HOST", "127.0.0.1")
+	t.Setenv("DEPLOY_TEST_HOST", host)
 	t.Setenv("DEPLOY_TEST_KEY", keyPath)
 	t.Setenv("DEPLOY_TEST_HOSTKEY", hostKeyPath)
 }
@@ -1246,6 +1252,7 @@ func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
 		{"rollback bad semver", []string{"rollback", "production", "--to", "NOT.A.VERSION", "--repo-dir", f.repoDir, "--confirm", "x"}, exitUsage, "usage-error"},
 		{"rollback json is non-interactive", []string{"rollback", "production", "--to", "1.0.0", "--repo-dir", f.repoDir}, exitUsage, "usage-error"},
 		{"resolve json is non-interactive", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir}, exitUsage, "usage-error"},
+		{"resolve selectors do not replace confirmation", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir, "attempt", "0123456789abcdef"}, exitUsage, "usage-error"},
 		{"resolve grammar before target", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir, "nonsense", "garbage"}, exitUsage, "usage-error"},
 	}
 	for _, tc := range tests {
@@ -1278,4 +1285,133 @@ func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
 	if data["remainingAttemptId"] != "0123456789abcdef" {
 		t.Errorf("held-lock refusal must name the remaining block: %v", data)
 	}
+}
+
+// Dead transport is infrastructure, not refusal: when the connection is
+// up but a read class cannot be answered, the preflight must report
+// infrastructure-failure (exit 3) — the same classification the engine
+// applies to its own reads — with exactly one JSON document. Each read
+// class is exercised individually by killing exactly that command on
+// the fake target.
+func TestJSONResolveDeadTransportPerReadClass(t *testing.T) {
+	tests := []struct {
+		name   string
+		failIf string
+		seed   func(t *testing.T, f *cliFixture)
+	}{
+		{"state read", "/state/", nil},
+		{"attempt read", "/attempts/", nil},
+		{"recovery read", "/recoveries/", nil},
+		// The lock precheck is only reached when SOMETHING is
+		// unresolved; seed an attempt marker so the reads succeed and
+		// the precheck is the next command to die.
+		{"lock precheck", "/.locks/", func(t *testing.T, f *cliFixture) { writeAttemptMarker(t, f, "1.0.0") }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCLIFixture(t)
+			if tc.seed != nil {
+				tc.seed(t, f)
+			}
+			keyPEM, hostKeyLine := validSSHMaterial(t)
+			key, _, _, _, err := gossh.ParseAuthorizedKey([]byte(hostKeyLine))
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := startFakeSSH(t, key, tc.failIf)
+			host, port := srv.hostPort()
+			f.useSSHTransportAt(t, keyPEM, srv.hostKey(), host, port)
+			code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+				"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
+			if code != exitInfra || doc["outcome"] != "infrastructure-failure" {
+				t.Fatalf("exit = %d outcome = %v (%s), want 3/infrastructure-failure", code, doc["outcome"], doc["message"])
+			}
+		})
+	}
+}
+
+// The blocked-state facts in resolve JSON come from the engine's
+// post-operation presence flags — not from the read-time marker ids:
+//
+//	full success            → NO remaining ids, recoveryRequired false
+//	half-cleared crash      → ONLY the surviving recovery id
+//	partial authorization   → remaining names the deliberate leftover
+//
+// These assert the exact JSON fields, so a stale id cannot survive CI.
+func TestResolveResultJSONBlockedFacts(t *testing.T) {
+	assertData := func(t *testing.T, env *resultEnvelope, want map[string]any) {
+		t.Helper()
+		raw, err := json.Marshal(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatal(err)
+		}
+		data, _ := doc["data"].(map[string]any)
+		for k, want := range want {
+			got, ok := data[k]
+			if want == nil {
+				if ok && got != "" && got != false && got != float64(0) {
+					t.Errorf("data.%s = %v, want absent", k, got)
+				}
+				continue
+			}
+			if got != want {
+				t.Errorf("data.%s = %v, want %v", k, got, want)
+			}
+		}
+	}
+
+	t.Run("full success exposes no remaining ids", func(t *testing.T) {
+		env, code := resolveResult(&lifecycle.ResolveReport{
+			Project: "my-app", Environment: "production",
+			ResolvedAttemptID: "0123456789abcdef", HistorySeq: 3,
+			AttemptPresentAfter: false, RecoveryPresentAfter: false,
+			AttemptMarkerID: "0123456789abcdef", RecoveryMarkerID: "fedcba9876543210",
+		}, nil, false)
+		if code != exitOK || env.Outcome != outcomeSuccess || env.RecoveryRequired {
+			t.Fatalf("outcome = %s recoveryRequired = %v code = %d", env.Outcome, env.RecoveryRequired, code)
+		}
+		assertData(t, env, map[string]any{
+			"remainingAttemptId": nil, "remainingRecoveryId": nil,
+			"resolvedAttemptId": "0123456789abcdef",
+		})
+	})
+
+	t.Run("half-cleared crash exposes only the surviving recovery id", func(t *testing.T) {
+		env, code := resolveResult(&lifecycle.ResolveReport{
+			Project: "my-app", Environment: "production",
+			ResolvedAttemptID:   "0123456789abcdef",
+			AttemptPresentAfter: false, RecoveryPresentAfter: true,
+			AttemptMarkerID: "0123456789abcdef", RecoveryMarkerID: "fedcba9876543210",
+			RecoveryRequired: true,
+		}, errors.New("clear recovery marker: transport died"), false)
+		if code != exitInfra || env.Outcome != outcomeInfraFailed || !env.RecoveryRequired {
+			t.Fatalf("outcome = %s recoveryRequired = %v code = %d", env.Outcome, env.RecoveryRequired, code)
+		}
+		assertData(t, env, map[string]any{
+			"remainingRecoveryId": "fedcba9876543210",
+			"remainingAttemptId":  nil,
+			"resolvedAttemptId":   "0123456789abcdef",
+		})
+	})
+
+	t.Run("partial authorization names the deliberate leftover", func(t *testing.T) {
+		env, code := resolveResult(&lifecycle.ResolveReport{
+			Project: "my-app", Environment: "production",
+			ResolvedRecoveryID: "fedcba9876543210", LeftAttemptID: "0123456789abcdef",
+			AttemptPresentAfter: true, RecoveryPresentAfter: false,
+			AttemptMarkerID: "0123456789abcdef", RecoveryMarkerID: "fedcba9876543210",
+		}, nil, false)
+		if code != exitOK || env.Outcome != outcomeSuccess {
+			t.Fatalf("outcome = %s code = %d", env.Outcome, code)
+		}
+		assertData(t, env, map[string]any{
+			"remainingAttemptId":  "0123456789abcdef",
+			"leftAttemptId":       "0123456789abcdef",
+			"remainingRecoveryId": nil,
+		})
+	})
 }

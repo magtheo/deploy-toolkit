@@ -193,10 +193,14 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	var err error
 	interactive := len(selectors) == 0 && *confirm == ""
 
-	// JSON mode is explicitly NON-interactive: a required confirmation
-	// without --confirm is a usage error, before any target access.
-	if jsonMode && interactive {
-		return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "--confirm (or explicit selectors) is required in --json mode; the interactive prompt is never read"))
+	// JSON mode is explicitly NON-interactive, UNCONDITIONALLY: the
+	// confirmation is required in machine mode even when explicit
+	// selectors narrow the scope. Selectors choose WHAT would be
+	// resolved; --confirm is the act of authorizing it. With --json and
+	// no --confirm we emit one structured usage error before any target
+	// access — stdin is never read, so automation can never block.
+	if jsonMode && *confirm == "" {
+		return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "--confirm is required in --json mode: selectors choose the scope, the confirmation authorizes it, and the interactive prompt is never read"))
 	}
 	if !interactive {
 		sentence, scope, err = parseResolveScope(envName, selectors, *confirm)
@@ -236,24 +240,57 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	st, serr := tgt.ReadState(ctx, project, env)
 	attempt, aerr := tgt.ReadAttempt(ctx, project, env)
 	recovery, rerr := tgt.ReadRecovery(ctx, project, env)
-	// The refusal documents carry the same marker facts the engine
-	// would report: what is on the target remains on the target.
+	// The preflight classifies EXACTLY as the engine does — the CLI
+	// must not erase the distinction the sentinels encode:
+	//
+	//   absent                → normal (nothing to resolve)
+	//   target.ErrEvidenceInvalid → refusal (exists, fails validation:
+	//                             untrustworthy evidence must be
+	//                             repaired, never resolved)
+	//   anything else         → infrastructure failure (we could not
+	//                             establish the facts at all — a dead
+	//                             transport is uncertainty, not policy)
+	//
+	// Refusal documents carry the same marker facts the engine would
+	// report: what is on the target remains on the target. Nothing has
+	// been removed at preflight time, so a successful read means the
+	// marker remains.
+	blockData := func() *resolveResultData {
+		return &resolveResultData{RemainingAttemptID: attemptIDOrEmpty(aerr, attempt), RemainingRecoveryID: recoveryIDOrEmpty(rerr, recovery)}
+	}
+	blocked := aerr == nil || rerr == nil
 	refuseJSON := func(format string, args ...any) int {
 		if jsonMode {
-			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: true, Message: fmt.Sprintf(format, args...), Data: &resolveResultData{RemainingAttemptID: attemptIDOrEmpty(aerr, attempt), RemainingRecoveryID: recoveryIDOrEmpty(rerr, recovery)}})
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: true, Message: fmt.Sprintf(format, args...), Data: blockData()})
 		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %s\n", envName, fmt.Sprintf(format, args...))
 		fmt.Fprintln(stderr, "  Unreadable evidence must be repaired, not resolved. Run `deployctl status`.")
 		return exitFailed
 	}
+	infraJSON := func(format string, args ...any) int {
+		if jsonMode {
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeInfraFailed, Project: project, Environment: envName, RecoveryRequired: blocked, Message: fmt.Sprintf(format, args...), Data: blockData()})
+		}
+		fmt.Fprintf(stderr, "✗ recovery resolve %s: %s\n", envName, fmt.Sprintf(format, args...))
+		return exitInfra
+	}
 	if serr != nil && !errors.Is(serr, target.ErrStateAbsent) {
-		return refuseJSON("observed state is unreadable: %v", serr)
+		if errors.Is(serr, target.ErrEvidenceInvalid) {
+			return refuseJSON("observed state exists but is invalid: %v", serr)
+		}
+		return infraJSON("cannot read the observed state: %v", serr)
 	}
 	if aerr != nil && !errors.Is(aerr, target.ErrAttemptAbsent) {
-		return refuseJSON("attempt marker is unreadable: %v", aerr)
+		if errors.Is(aerr, target.ErrEvidenceInvalid) {
+			return refuseJSON("attempt marker exists but is invalid: %v", aerr)
+		}
+		return infraJSON("cannot read the attempt marker: %v", aerr)
 	}
 	if rerr != nil && !errors.Is(rerr, target.ErrRecoveryAbsent) {
-		return refuseJSON("recovery marker is unreadable: %v", rerr)
+		if errors.Is(rerr, target.ErrEvidenceInvalid) {
+			return refuseJSON("recovery marker exists but is invalid: %v", rerr)
+		}
+		return infraJSON("cannot read the recovery marker: %v", rerr)
 	}
 	if aerr != nil && rerr != nil {
 		if jsonMode {
@@ -266,19 +303,14 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	// operation is active, the operator is not asked to authorize
 	// anything. (The engine enforces the lock itself; this keeps the
 	// human authorization honest.)
-	lockRefusalData := func() *resolveResultData {
-		return &resolveResultData{RemainingAttemptID: attemptIDOrEmpty(aerr, attempt), RemainingRecoveryID: recoveryIDOrEmpty(rerr, recovery)}
-	}
 	if held, lerr := lockHeld(ctx, tgt, dc); lerr != nil {
-		if jsonMode {
-			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: aerr == nil || rerr == nil, Message: "cannot establish whether an operation is active: " + lerr.Error(), Data: lockRefusalData()})
-		}
-		fmt.Fprintf(stderr, "✗ recovery resolve %s: cannot establish whether an operation is active: %v\n", envName, lerr)
-		fmt.Fprintln(stderr, "  Do not authorize a resolution while the lock state is unreadable. Repair access first.")
-		return exitFailed
+		// An unreadable LOCK is not a policy refusal — it is the same
+		// infrastructural uncertainty as an unreadable marker: we cannot
+		// establish whether an operation is active.
+		return infraJSON("cannot establish whether an operation is active: %v", lerr)
 	} else if held {
 		if jsonMode {
-			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: aerr == nil || rerr == nil, Message: "the environment lock is HELD — an operation may be executing; wait for it to finish first", Data: lockRefusalData()})
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: blocked, Message: "the environment lock is HELD — an operation may be executing; wait for it to finish first", Data: blockData()})
 		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: the environment lock is HELD — an operation may be executing.\n", envName)
 		fmt.Fprintln(stderr, "  Wait for it to finish and verify no deployment is in flight first.")

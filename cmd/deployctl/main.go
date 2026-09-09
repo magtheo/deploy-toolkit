@@ -79,14 +79,18 @@ happened), 2 usage/configuration error, 3 infrastructure failure. Exit
 codes are broad process categories; decisions are made from the REPORT —
 never from the exit code alone.
 
-Machine interface: every operational command accepts --json and then
-writes exactly ONE versioned document to stdout (deployctl.result/v1) —
-no human prose — carrying the semantic fields automation consumes:
+Machine interface: every operational command accepts the bare flag
+--json and then writes exactly ONE versioned document to stdout
+(deployctl.result/v1) — no human prose — carrying the semantic fields
+automation consumes:
 outcome (success | failure | refused | uncertain | infrastructure-failure
 | usage-error), committed, alreadyCurrent, recoveryRequired, safeToRetry,
 consequential/recovery boundary identity (attemptId, recoveryId,
 recoveryStarted), desired/observed releases with digests and operationId,
-lock state, marker facts (present/unreadable) and status state. A
+lock state, marker facts (present/unreadable) and status state. JSON
+mode is non-interactive: any required confirmation must arrive via
+--confirm (selectors choose the scope; the confirmation authorizes it) —
+stdin is never read. A
 determined failure records history and says so; an uncertain outcome says
 recoveryRequired: true and safeToRetry: false; an infrastructure failure
 before consequential work says safeToRetry: true.
@@ -125,7 +129,7 @@ Both require GITHUB_TOKEN.
 Deploy flags:
   --repo-dir .                  checkout containing the release revision (for the bundle)
   --owner identity              recorded in the lock and history (default user@host)
-  --json                        single deployctl.result/v1 document on stdout
+  --json                        single deployctl.result/v1 document on stdout (bare flag only; --json=<value> is not the machine interface)
 
 The deployment runs the full engine sequence — environment lock, staging,
 contract verification, preflight, migrate, apply, verify, observed-state
@@ -137,7 +141,7 @@ Rollback flags (manual/emergency recovery):
   --from <version>              version being undone (default: the pinned release)
   --repo-dir .                  checkout containing both release revisions
   --confirm "sentence"          typed confirmation; omit to be prompted
-  --json                        single deployctl.result/v1 document on stdout
+  --json                        single deployctl.result/v1 document on stdout (bare flag only; --json=<value> is not the machine interface)
 
 Requires typing exactly: rollback <env> to <version>. The confirmation gate
 precedes target contact: nothing — not even the connection — happens before
@@ -146,7 +150,7 @@ promotion with a reverse diff, not this command.
 
 Status flags:
   --repo-dir .                  checkout containing .deploy/
-  --json                        single deployctl.result/v1 document on stdout
+  --json                        single deployctl.result/v1 document on stdout (bare flag only; --json=<value> is not the machine interface)
 
 Recovery resolve flags:
   --repo-dir .                  checkout containing .deploy/

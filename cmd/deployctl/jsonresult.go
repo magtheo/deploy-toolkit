@@ -350,21 +350,25 @@ func resolveResult(rep *lifecycle.ResolveReport, err error, refused bool) (*resu
 	if rep != nil {
 		env.Project, env.Environment = rep.Project, rep.Environment
 		*data = resolveResultData{
-			NothingToResolve:    rep.NothingToResolve,
-			ResolvedRecoveryID:  rep.ResolvedRecoveryID,
-			ResolvedAttemptID:   rep.ResolvedAttemptID,
-			LeftRecoveryID:      rep.LeftRecoveryID,
-			LeftAttemptID:       rep.LeftAttemptID,
-			HistorySeq:          rep.HistorySeq,
-			RemainingRecoveryID: rep.RecoveryMarkerID,
-			RemainingAttemptID:  rep.AttemptMarkerID,
-			Observed:            observedRef(rep),
+			NothingToResolve:   rep.NothingToResolve,
+			ResolvedRecoveryID: rep.ResolvedRecoveryID,
+			ResolvedAttemptID:  rep.ResolvedAttemptID,
+			LeftRecoveryID:     rep.LeftRecoveryID,
+			LeftAttemptID:      rep.LeftAttemptID,
+			HistorySeq:         rep.HistorySeq,
+			Observed:           observedRef(rep),
 		}
-		if rep.LeftRecoveryID != "" {
-			data.RemainingRecoveryID = rep.LeftRecoveryID
+		// What REMAINS is an engine-owned fact (the *PresentAfter
+		// flags), not a restatement of the read-time marker ids: a
+		// successful resolution must expose no remaining ids, and a
+		// half-cleared target must expose only the survivor. The
+		// read-time ids name WHAT the remaining marker is; Left* names
+		// what was deliberately left by a partial authorization.
+		if rep.AttemptPresentAfter {
+			data.RemainingAttemptID = rep.AttemptMarkerID
 		}
-		if rep.LeftAttemptID != "" {
-			data.RemainingAttemptID = rep.LeftAttemptID
+		if rep.RecoveryPresentAfter {
+			data.RemainingRecoveryID = rep.RecoveryMarkerID
 		}
 		// The engine owns the blocked-state fact on EVERY path —
 		// including history-write and marker-clear failures.
@@ -421,9 +425,13 @@ var errInteractiveConfirmation = errors.New("interactive confirmation required")
 
 // wantsJSON reports whether --json was requested, even before flag
 // parsing: the earliest usage errors must still honor the machine mode.
+// Only the bare flag counts: --json=<value> is not the machine
+// interface (Go's boolean parser accepts such tokens, but they do not
+// select JSON mode — the two can never disagree in the other
+// direction, because a bare --json is the only way in).
 func wantsJSON(args []string) bool {
 	for _, a := range args {
-		if a == "--json" || strings.HasPrefix(a, "--json=") {
+		if a == "--json" {
 			return true
 		}
 	}
