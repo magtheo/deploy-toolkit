@@ -395,45 +395,79 @@ func resolveResult(rep *lifecycle.ResolveReport, err error, refused bool) (*resu
 
 // ---- argument normalization -------------------------------------------
 
-// splitFlagsAndValues partitions tokens into flag tokens (with their
-// values) and positional tokens, preserving order. Value flags consume
-// the following token; boolean flags consume nothing; "--flag=value" is
-// self-contained. Unknown flags are assumed to take a value ONLY when
-// they don't — the FlagSet rejects them either way, as a usage error.
-func splitFlagsAndValues(tokens []string, booleanFlags map[string]bool) (flags, positional []string) {
+// booleanCLI is the set of flags that take no value, across all
+// operational commands.
+var booleanCLI = map[string]bool{"json": true}
+
+func isFlagToken(tok string) bool {
+	return strings.HasPrefix(tok, "-") && tok != "-"
+}
+
+// lexArgs is the SINGLE authority on flag arity and machine-mode
+// detection, so the two interpretations can never diverge. It
+// partitions tokens into flag tokens (with their values) and positional
+// tokens, preserving order, and reports whether the bare --json flag
+// selected machine mode.
+//
+// A value flag (anything in valueFlags) consumes the following token as
+// its value ONLY when that token is not flag-shaped. A flag-shaped
+// token after a value flag is a MISSING VALUE — reported as
+// missingValue, which every command turns into a usage error — never a
+// quoted value, and in particular --json can never be consumed as a
+// value while simultaneously selecting machine mode. "--flag=value" is
+// self-contained. Unknown flags are passed through for the FlagSet to
+// reject as undefined, consuming a following non-flag token as their
+// prospective value.
+func lexArgs(tokens []string, valueFlags map[string]bool) (flags, positional []string, jsonMode bool, missingValue string) {
 	for i := 0; i < len(tokens); i++ {
 		tok := tokens[i]
-		if !strings.HasPrefix(tok, "-") || tok == "-" {
+		if !isFlagToken(tok) {
 			positional = append(positional, tok)
 			continue
 		}
 		name := strings.TrimLeft(tok, "-")
+		if tok == "--json" {
+			jsonMode = true
+		}
 		if strings.Contains(name, "=") {
 			flags = append(flags, tok)
 			continue
 		}
 		flags = append(flags, tok)
-		if !booleanFlags[name] && i+1 < len(tokens) {
+		if booleanCLI[name] {
+			continue
+		}
+		if valueFlags[name] {
+			if i+1 >= len(tokens) || isFlagToken(tokens[i+1]) {
+				// Missing value: record it and keep lexing — the
+				// remaining tokens still decide machine mode (a
+				// trailing --json must still select it), and the
+				// caller turns this into a usage error without
+				// ever parsing the flags.
+				if missingValue == "" {
+					missingValue = name
+				}
+				continue
+			}
+			i++
+			flags = append(flags, tokens[i])
+			continue
+		}
+		// Unknown flag: let the FlagSet reject it, but do not let it
+		// swallow a flag-shaped token on the way.
+		if i+1 < len(tokens) && !isFlagToken(tokens[i+1]) {
 			i++
 			flags = append(flags, tokens[i])
 		}
 	}
-	return flags, positional
+	return flags, positional, jsonMode, missingValue
 }
 
 var errInteractiveConfirmation = errors.New("interactive confirmation required")
 
-// wantsJSON reports whether --json was requested, even before flag
-// parsing: the earliest usage errors must still honor the machine mode.
-// Only the bare flag counts: --json=<value> is not the machine
-// interface (Go's boolean parser accepts such tokens, but they do not
-// select JSON mode — the two can never disagree in the other
-// direction, because a bare --json is the only way in).
-func wantsJSON(args []string) bool {
-	for _, a := range args {
-		if a == "--json" {
-			return true
-		}
+func envNameOr(positional []string) string {
+	if len(positional) > 0 {
+		return positional[0]
 	}
-	return false
+	return ""
 }

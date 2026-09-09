@@ -24,16 +24,30 @@ import (
 // recovery markers: during an active deployment or rollback both exist by
 // design, and the only safe instruction then is "wait, touch nothing".
 func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	jsonMode := wantsJSON(args)
 	rawStdout := stdout
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+	lexFlags, positional, jsonMode, missingValue := lexArgs(args, map[string]bool{"repo-dir": true})
+	if missingValue != "" {
 		if jsonMode {
-			return emitJSON(stdout, usageErrorResult("status", "", "usage: deployctl status <environment> [--repo-dir .]"))
+			return emitJSON(rawStdout, usageErrorResult(cmdStatus, envNameOr(positional), "--"+missingValue+" requires a value"))
+		}
+		fmt.Fprintf(stderr, "deployctl status: --%s requires a value\n", missingValue)
+		return exitUsage
+	}
+	if len(positional) == 0 {
+		if jsonMode {
+			return emitJSON(rawStdout, usageErrorResult(cmdStatus, "", "usage: deployctl status <environment> [--repo-dir .]"))
 		}
 		fmt.Fprintln(stderr, "usage: deployctl status <environment> [--repo-dir .]")
 		return exitUsage
 	}
-	envName := args[0]
+	if len(positional) > 1 {
+		if jsonMode {
+			return emitJSON(rawStdout, usageErrorResult(cmdStatus, positional[0], fmt.Sprintf("unexpected argument %q", positional[1])))
+		}
+		fmt.Fprintf(stderr, "deployctl status: unexpected argument %q\n", positional[1])
+		return exitUsage
+	}
+	envName := positional[0]
 	if strings.Contains(envName, "/") {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult("status", envName, "environment must be a bare name"))
@@ -45,17 +59,11 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	fs.SetOutput(io.Discard)
 	repoDir := fs.String("repo-dir", ".", "checkout containing .deploy/")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(lexFlags); err != nil {
 		if jsonMode {
-			return emitJSON(rawStdout, usageErrorResult(cmdStatus, envName, "invalid flags"))
+			return emitJSON(rawStdout, usageErrorResult(cmdStatus, envName, "invalid flags: "+err.Error()))
 		}
-		return exitUsage
-	}
-	if fs.NArg() > 0 {
-		if jsonMode {
-			return emitJSON(rawStdout, usageErrorResult(cmdStatus, envName, fmt.Sprintf("unexpected argument %q", fs.Arg(0))))
-		}
-		fmt.Fprintf(stderr, "deployctl status: unexpected argument %q\n", fs.Arg(0))
+		fmt.Fprintf(stderr, "deployctl status: %v\n", err)
 		return exitUsage
 	}
 

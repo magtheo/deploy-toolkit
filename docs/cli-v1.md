@@ -1,11 +1,19 @@
 # CLI Machine Interface v1 (`deployctl.result/v1`)
 
 > **Status: frozen.** This document is the compatibility promise for the
-> `deployctl` machine interface. It follows the same versioning policy as
-> [Consumer Contract v1](consumer-contract-v1.md): adding optional fields or
-> new enum values is compatible; removing, renaming or retyping anything
-> below, or tightening a previously-accepted document, requires `v2`
-> (`deployctl.result/v2`), accepted alongside v1 for a deprecation window.
+> `deployctl` machine interface. The versioning policy is deliberately
+> conservative, because consumers build exhaustive switches and state
+> machines on the enums below:
+>
+> | Change                                                         | Compatibility          |
+> | -------------------------------------------------------------- | ---------------------- |
+> | Adding an optional field                                       | compatible             |
+> | Adding a new command                                           | potentially compatible |
+> | Adding a value to `outcome`, `status.state`, `lock`, or `stages[].status` | **breaking** — these enums are closed; an unknown value must never enter a v1 automation's switch. Extension requires `v2`. |
+> | Removing, renaming, retyping, or tightening accepted documents | **breaking**           |
+>
+> Breaking changes require `v2` (`deployctl.result/v2`), accepted
+> alongside v1 for a deprecation window.
 
 Every operational command — `deploy`, `rollback`, `status`,
 `recovery resolve` — speaks two protocols over the same facts:
@@ -62,7 +70,7 @@ exactly ONE deployctl.result/v1 document on stdout
 | `outcome`           | always          | One of the outcome enum.                                                                                                                                      |
 | `project`           | when known      | Absent only on very early usage errors (before the project could be identified).                                                                              |
 | `environment`       | when known      | Same rule.                                                                                                                                                    |
-| `recoveryRequired`  | always          | The environment has an unresolved attempt/recovery marker, or a resolution left one. See the semantics section — **`false` never means “safe” by itself**.     |
+| `recoveryRequired`  | always          | The toolkit's **authoritative conclusion** that recovery or resolution is currently required. Raw marker presence is a separate fact, reported in `data.attempt` / `data.recovery` — `false` does **not** imply marker absence, especially while the environment is `locked` or `degraded`. See the semantics section. |
 | `safeToRetry`       | always          | `true` **only** when re-running the same command after the infrastructure problem is fixed is known-safe (no consequential work executed). `false` otherwise.  |
 | `message`           | always          | **Explicitly non-contractual.** Human-oriented prose. Never parse it, never branch on it, never assert on it in tests. All machine decisions come from the fields. |
 | `data`              | per command     | Command-specific shape. Absent only when there is nothing meaningful to report.                                                                               |
@@ -99,24 +107,49 @@ from the document, never from the exit code alone.
 
 ## Cross-command semantics
 
-### `recoveryRequired: false` does not mean “safe”
+### `recoveryRequired` is a classification, not a presence flag
 
-The field means exactly one thing: *the environment carries an unresolved
-attempt or recovery marker, or a resolution left one.* It does not
-assert that the observed state is correct, current, or healthy. In
-particular `status` `state: "degraded"` (evidence unreadable) claims
-**nothing** — even though `recoveryRequired` is `false`. Machine
-consumers must reason from the command-specific `data` plus the
-envelope, never from one boolean in isolation.
+`recoveryRequired: true` means Deploy Toolkit can **authoritatively
+conclude** that recovery or resolution is currently required: an
+attempt or recovery marker is unresolved and the toolkit has read it,
+or a resolution left one behind. Raw marker presence is reported
+separately in `data.attempt` / `data.recovery`.
+
+`recoveryRequired: false` does **not** imply marker absence. Two states
+make this deliberate:
+
+- `status` `state: "locked"` — an operation may be executing, and its
+  live attempt marker is expected. Starting recovery because a marker
+  exists would be exactly wrong; the only safe instruction is to wait.
+  `recoveryRequired` stays `false` while the marker fact is reported in
+  `data.attempt`.
+- `status` `state: "degraded"` — evidence exists but is unreadable; the
+  toolkit claims **nothing**, including neither requiring nor clearing
+  recovery.
+
+Machine consumers must reason from the command-specific `data` plus the
+envelope, never from one boolean in isolation. And in no case does
+`recoveryRequired: false` mean “the environment is safe”.
 
 ### Durable boundary identity
 
-When a deploy or rollback crosses the durable boundary (its marker
-written) but does not commit, the outcome is `uncertain` and `data`
-carries the identity needed for recovery: `attemptId` (deploy) or
-`recoveryId` + `recoveryStarted` (rollback). Automation must treat
-`uncertain` as “find the marker, resolve deliberately” — never as
-“rerun and see”.
+Two distinct things can happen after the durable boundary is crossed
+(the attempt/recovery marker written) and before the outcome is
+committed:
+
+- **Determined stage failure** — a lifecycle hook exited nonzero and the
+  engine recorded the outcome in durable history. The outcome is
+  `failure`, with `recoveryRequired: true` and the boundary identity in
+  `data`.
+- **Infrastructure failure** — the transport died or the toolkit lost
+  the ability to know. The outcome is `uncertain`, always
+  `recoveryRequired: true`, `safeToRetry: false`.
+
+In both cases `data` carries the identity needed for recovery:
+`attemptId` (deploy) or `recoveryId` + `recoveryStarted` (rollback).
+Automation must treat post-boundary `failure` and `uncertain` alike as
+“find the marker, resolve deliberately” — never as “rerun and
+see”.
 
 ### Evidence taxonomy (recovery resolve preflight)
 
@@ -152,8 +185,10 @@ absent means unset/zero, which for booleans means `false`.
 ```
 
 `stages[].status` is one of `ok | failed | skipped | infrastructure-error`.
-`name` values come from the consumer's own `project.yaml` hook names —
-the *shape* is contract, the values are the consumer's.
+`stages[].name` is the fixed lifecycle role declared in the consumer's
+`project.yaml` (`preflight`, `migrate`, `apply`, `verify`, `rollback`) —
+the consumer defines the argv *under* each role, not the role set. Stage
+names are non-contract (see below); the `status` enum is not.
 
 ### `rollback`
 
@@ -241,6 +276,14 @@ deployctl recovery resolve <env> [recovery <id>] [attempt <id>] --confirm "..." 
   before any target access.
 - Flags and positional selectors may be interleaved; both
   `--flag value` and `--flag=value` forms are accepted for value flags.
+- One argument lexer owns flag arity **and** machine-mode detection:
+  a value flag consumes the following token as its value only when that
+  token is not flag-shaped. A flag-shaped token after a value flag is a
+  missing value — a `usage-error` that executes nothing, in both
+  `--owner --json` and `--json --owner` orders. A bare `--json` can
+  therefore never be consumed as a value while simultaneously selecting
+  machine mode; audit identities and confirmations can never silently
+  become `--json`.
 
 ## Target connection contract
 

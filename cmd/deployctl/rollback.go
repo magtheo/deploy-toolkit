@@ -24,15 +24,29 @@ import (
 // automatic rollback after a failed deploy is Step 11 workflow wiring
 // that invokes the same engine with its own authorization.
 func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	jsonMode := wantsJSON(args)
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+	lexFlags, positional, jsonMode, missingValue := lexArgs(args, map[string]bool{"repo-dir": true, "owner": true, "to": true, "from": true, "confirm": true})
+	if missingValue != "" {
 		if jsonMode {
-			return emitJSON(stdout, usageErrorResult("rollback", "", "usage: deployctl rollback <environment> --to <version>"))
+			return emitJSON(stdout, usageErrorResult(cmdRollback, envNameOr(positional), "--"+missingValue+" requires a value"))
+		}
+		fmt.Fprintf(stderr, "deployctl rollback: --%s requires a value\n", missingValue)
+		return exitUsage
+	}
+	if len(positional) == 0 {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdRollback, "", "usage: deployctl rollback <environment> --to <version>"))
 		}
 		fmt.Fprintln(stderr, "usage: deployctl rollback <environment> --to <version> [--from <version>] [--repo-dir .] [--confirm \"...\"]")
 		return exitUsage
 	}
-	envName := args[0]
+	if len(positional) > 1 {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdRollback, positional[0], fmt.Sprintf("unexpected argument %q", positional[1])))
+		}
+		fmt.Fprintf(stderr, "deployctl rollback: unexpected argument %q\n", positional[1])
+		return exitUsage
+	}
+	envName := positional[0]
 	if strings.Contains(envName, "/") {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult("rollback", envName, "environment must be a bare name"))
@@ -48,17 +62,11 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
 	owner := fs.String("owner", "", "identity recorded in the lock and history (default user@host)")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(lexFlags); err != nil {
 		if jsonMode {
-			return emitJSON(stdout, usageErrorResult(cmdRollback, envName, "invalid flags"))
+			return emitJSON(stdout, usageErrorResult(cmdRollback, envName, "invalid flags: "+err.Error()))
 		}
-		return exitUsage
-	}
-	if fs.NArg() > 0 {
-		if jsonMode {
-			return emitJSON(stdout, usageErrorResult(cmdRollback, envName, fmt.Sprintf("unexpected argument %q", fs.Arg(0))))
-		}
-		fmt.Fprintf(stderr, "deployctl rollback: unexpected argument %q\n", fs.Arg(0))
+		fmt.Fprintf(stderr, "deployctl rollback: %v\n", err)
 		return exitUsage
 	}
 	// JSON mode is explicitly NON-interactive: CI must never block on a

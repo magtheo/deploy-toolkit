@@ -154,7 +154,18 @@ func canonicalResolveSentence(envName string, sc resolveScope) string {
 // sentence names. The engine re-reads those markers under the lock and
 // refuses on any mismatch.
 func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	jsonMode := wantsJSON(args)
+	_, _, jsonMode, missingValue := lexArgs(args[1:], map[string]bool{"repo-dir": true, "owner": true, "confirm": true})
+	if missingValue != "" {
+		if jsonMode {
+			envName := ""
+			if len(args) > 0 && !isFlagToken(args[0]) {
+				envName = args[0]
+			}
+			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "--"+missingValue+" requires a value"))
+		}
+		fmt.Fprintf(stderr, "deployctl recovery resolve: --%s requires a value\n", missingValue)
+		return exitUsage
+	}
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, "", "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>]"))
@@ -176,11 +187,11 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	owner := fs.String("owner", "", "identity recorded as resolution evidence (default user@host)")
 	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
-	// Go's flag parsing stops at the first positional token; split flags
-	// and positional selectors manually so both orders work. Value flags
-	// consume one token; boolean flags (json) consume none.
-	flagTokens, selectors := splitFlagsAndValues(args[1:], map[string]bool{"json": true})
-	if err := fs.Parse(flagTokens); err != nil {
+	// One lexer owns flag arity AND machine-mode detection: selectors
+	// and flags may interleave, a value flag can never swallow a
+	// flag-shaped token, and --json is machine mode only as a flag.
+	lexFlags, selectors, _, _ := lexArgs(args[1:], map[string]bool{"repo-dir": true, "owner": true, "confirm": true})
+	if err := fs.Parse(lexFlags); err != nil {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "invalid flags: "+err.Error()))
 		}

@@ -1439,3 +1439,56 @@ func TestResolveResultJSONBlockedFacts(t *testing.T) {
 		})
 	})
 }
+
+// A bare --json can never be consumed as a value while simultaneously
+// selecting machine mode. The shared lexer owns both flag arity and
+// JSON detection: a flag-shaped token after a value flag is a missing
+// value (usage-error, exit 2), in BOTH orders — and nothing is
+// executed, so the audit identity is never written as "--json".
+func TestJSONNeverConsumableAsValue(t *testing.T) {
+	t.Run("deploy --owner --json executes nothing", func(t *testing.T) {
+		f := newCLIFixture(t)
+		before := len(orderCLI(t, f))
+		code, doc := runJSON(t, "deploy", "production", "--repo-dir", f.repoDir, "--owner", "--json")
+		if code != exitUsage || doc["outcome"] != "usage-error" {
+			t.Fatalf("exit = %d outcome = %v, want 2/usage-error", code, doc["outcome"])
+		}
+		if doc["command"] != "deploy" || doc["environment"] != "production" {
+			t.Errorf("command = %v environment = %v", doc["command"], doc["environment"])
+		}
+		if len(orderCLI(t, f)) != before {
+			t.Error("hooks ran despite the missing flag value")
+		}
+		if f.attemptExists() {
+			t.Error("an attempt marker was written despite the missing flag value")
+		}
+	})
+
+	t.Run("resolve --owner --json authorizes nothing", func(t *testing.T) {
+		f := newCLIFixture(t)
+		writeAttemptMarker(t, f, "1.0.0")
+		code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+			"attempt", "0123456789abcdef",
+			"--confirm", "resolve production attempt 0123456789abcdef",
+			"--owner", "--json")
+		if code != exitUsage || doc["outcome"] != "usage-error" {
+			t.Fatalf("exit = %d outcome = %v, want 2/usage-error", code, doc["outcome"])
+		}
+		if !f.attemptExists() {
+			t.Error("the attempt marker was resolved despite the missing flag value")
+		}
+	})
+
+	t.Run("--json --owner is the same missing value", func(t *testing.T) {
+		f := newCLIFixture(t)
+		code, doc := runJSON(t, "deploy", "production", "--repo-dir", f.repoDir, "--json", "--owner")
+		if code != exitUsage || doc["outcome"] != "usage-error" {
+			t.Fatalf("exit = %d outcome = %v, want 2/usage-error", code, doc["outcome"])
+		}
+	})
+}
+
+func (f *cliFixture) attemptExists() bool {
+	_, err := os.Stat(f.attemptPath())
+	return err == nil
+}

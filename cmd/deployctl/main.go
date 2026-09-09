@@ -90,7 +90,9 @@ recoveryStarted), desired/observed releases with digests and operationId,
 lock state, marker facts (present/unreadable) and status state. JSON
 mode is non-interactive: any required confirmation must arrive via
 --confirm (selectors choose the scope; the confirmation authorizes it) —
-stdin is never read. A
+stdin is never read. A value flag never consumes a flag-shaped token as
+its value, so --json can never be swallowed while also selecting
+machine mode. A
 determined failure records history and says so; an uncertain outcome says
 recoveryRequired: true and safeToRetry: false; an infrastructure failure
 before consequential work says safeToRetry: true.

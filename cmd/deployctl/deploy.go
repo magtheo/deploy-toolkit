@@ -21,15 +21,29 @@ import (
 // REPORT — not the exit code — says whether the outcome is uncertain
 // (unresolved attempt/recovery marker) or nothing was executed.
 func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	jsonMode := wantsJSON(args)
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+	lexFlags, positional, jsonMode, missingValue := lexArgs(args, map[string]bool{"repo-dir": true, "owner": true})
+	if missingValue != "" {
 		if jsonMode {
-			return emitJSON(stdout, usageErrorResult("deploy", "", "usage: deployctl deploy <environment> [--repo-dir .] [--owner identity]"))
+			return emitJSON(stdout, usageErrorResult(cmdDeploy, envNameOr(positional), "--"+missingValue+" requires a value"))
+		}
+		fmt.Fprintf(stderr, "deployctl deploy: --%s requires a value\n", missingValue)
+		return exitUsage
+	}
+	if len(positional) == 0 {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdDeploy, "", "usage: deployctl deploy <environment> [--repo-dir .] [--owner identity]"))
 		}
 		fmt.Fprintln(stderr, "usage: deployctl deploy <environment> [--repo-dir .] [--owner identity]")
 		return exitUsage
 	}
-	envName := args[0]
+	if len(positional) > 1 {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdDeploy, positional[0], fmt.Sprintf("unexpected argument %q", positional[1])))
+		}
+		fmt.Fprintf(stderr, "deployctl deploy: unexpected argument %q\n", positional[1])
+		return exitUsage
+	}
+	envName := positional[0]
 	if strings.Contains(envName, "/") {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult("deploy", envName, "environment must be a bare name"))
@@ -42,17 +56,11 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	repoDir := fs.String("repo-dir", ".", "local checkout containing the release revision (for the bundle)")
 	owner := fs.String("owner", "", "identity recorded in the lock and history (default user@host)")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(lexFlags); err != nil {
 		if jsonMode {
-			return emitJSON(stdout, usageErrorResult(cmdDeploy, envName, "invalid flags"))
+			return emitJSON(stdout, usageErrorResult(cmdDeploy, envName, "invalid flags: "+err.Error()))
 		}
-		return exitUsage
-	}
-	if fs.NArg() > 0 {
-		if jsonMode {
-			return emitJSON(stdout, usageErrorResult(cmdDeploy, envName, fmt.Sprintf("unexpected argument %q", fs.Arg(0))))
-		}
-		fmt.Fprintf(stderr, "deployctl deploy: unexpected argument %q\n", fs.Arg(0))
+		fmt.Fprintf(stderr, "deployctl deploy: %v\n", err)
 		return exitUsage
 	}
 	humanOut := io.Writer(stdout)
