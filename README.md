@@ -139,13 +139,22 @@ command is not. `rollback` requires typing exactly
 path. Normal rollback of a healthy deployment is an ordinary promotion
 with a reverse diff, not `rollback`.
 
-Operational exit codes (deploy, rollback): `0` success, `1` reported
-outcome failure (determined — history records what happened), `2`
-usage/configuration error, `3` infrastructure failure. The failure
-**report** — never the exit code alone — distinguishes pre-execution
-failures (nothing ran), bookkeeping failures after a committed state, and
-uncertain outcomes (an attempt/recovery marker is unresolved). Automation
-keys on the reported recovery state, not on exit 3.
+Operational exit codes (deploy, rollback, status, recovery resolve):
+`0` success, `1` reported outcome failure (determined — history records
+what happened), `2` usage/configuration error, `3` infrastructure
+failure. The failure **report** — never the exit code alone —
+distinguishes pre-execution failures (nothing ran), bookkeeping failures
+after a committed state, and uncertain outcomes (an attempt/recovery
+marker is unresolved). Automation keys on the reported recovery state,
+not on exit 3.
+
+Every operational command accepts the bare `--json` flag and then writes
+exactly **one** `deployctl.result/v1` document to stdout on every
+terminal path — success, failure, refusal, uncertainty, infrastructure,
+or usage error — with no prose. Machine mode is non-interactive
+(`--confirm` required; stdin is never read). The frozen machine contract
+— envelope, outcome vocabulary, per-command data shapes and versioning
+policy — is [docs/cli-v1.md](docs/cli-v1.md).
 
 For SSH targets, the manifest names environment variables and the
 environment holds values: `credentialFrom` and `hostKeyFrom` name
