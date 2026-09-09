@@ -43,6 +43,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runRollback(context.Background(), args[1:], stdout, stderr)
 	case "status":
 		return runStatus(context.Background(), args[1:], stdout, stderr)
+	case "recovery":
+		return runRecovery(context.Background(), args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintf(stdout, "deployctl %s\n", version)
 		return 0
@@ -67,6 +69,7 @@ Usage:
   deployctl deploy <env> [flags]             deploy the release the environment pins
   deployctl rollback <env> [flags]           emergency/manual recovery: restore a previous release
   deployctl status <env> [flags]             report desired vs observed state and all recovery facts
+  deployctl recovery resolve <env> [flags]   explicitly resolve unresolved markers after manual verification
   deployctl version                          print version
 
 Operational exit codes (deploy, rollback): 0 success, 1 reported outcome
@@ -130,6 +133,21 @@ promotion with a reverse diff, not this command.
 
 Status flags:
   --repo-dir .                  checkout containing .deploy/
+
+Recovery resolve flags:
+  --repo-dir .                  checkout containing .deploy/
+  --owner identity              recorded as resolution evidence (default user@host)
+  --confirm "sentence"          typed confirmation; omit to be prompted
+
+Recovery resolve is the explicit end of an unresolved situation, for use
+ONLY after the target has been verified by hand. It executes no hooks and
+changes nothing about what is running: it records who resolved which
+markers against which observed state, then removes them (attempt first,
+recovery marker last). The typed confirmation names the exact marker ids
+(resolve <env> recovery <id> | resolve <env> attempt <id>); the engine
+re-reads them under the lock and refuses on any mismatch, on a held
+lock, or on unreadable evidence. With no markers unresolved it is an
+idempotent no-op.
 
 Status is read-only but uses the deploy credential to inspect the target.
 It fails closed: an unreadable lock, attempt marker, recovery marker or

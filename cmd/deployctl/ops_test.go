@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -851,5 +852,85 @@ func TestRollbackCommandDeterminedFailureRequiresRecovery(t *testing.T) {
 	}
 	if !strings.Contains(out, "RECOVERY REQUIRED") || !strings.Contains(out, "Recovery      UNRESOLVED") {
 		t.Errorf("status must classify the failed recovery:\n%s", out)
+	}
+}
+
+// The full recovery-resolve story at the CLI: a failed deploy blocks the
+// environment; the operator resolves it with a typed confirmation naming
+// the exact marker id; the block lifts; normal deployment resumes.
+func TestRecoveryResolveCommand(t *testing.T) {
+	f := newCLIFixture(t)
+	// Make verify fail, regenerate the release at the broken revision.
+	p := filepath.Join(f.repoDir, "deploy/verify.sh")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, append(raw, []byte("exit 1\n")...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitf(t, f.repoDir, "add", "-A")
+	gitf(t, f.repoDir, "commit", "-q", "-m", "break verify")
+	rev := gitf(t, f.repoDir, "rev-parse", "HEAD")
+	f.writeRelease(t, "1.0.0", rev)
+	if code, out, _ := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitFailed {
+		t.Fatalf("failing deploy exit = %d\n%s", code, out)
+	}
+	if _, err := os.Stat(f.attemptPath()); err != nil {
+		t.Fatal("fixture bug: expected the attempt marker")
+	}
+
+	// Unreadable observed state must be repaired, not resolved.
+	writeFileCLIF(t, f.statePath(), "{corrupt")
+	code, _, errOut := runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "x")
+	if code != exitFailed || !strings.Contains(errOut, "repaired, not resolved") {
+		t.Fatalf("corrupt state: exit = %d, stderr =\n%s", code, errOut)
+	}
+	os.Remove(f.statePath())
+
+	// Wrong confirmation: refused, nothing changed.
+	code, _, errOut = runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
+	if code != exitFailed || !strings.Contains(errOut, "nothing was changed") {
+		t.Fatalf("wrong confirmation: exit = %d, stderr =\n%s", code, errOut)
+	}
+	if _, err := os.Stat(f.attemptPath()); err != nil {
+		t.Fatal("a refused resolution must not remove the marker")
+	}
+
+	// The real sentence names the marker id that is actually there.
+	markerRaw, err := os.ReadFile(f.attemptPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		AttemptID string `json:"attemptId"`
+	}
+	if err := json.Unmarshal(markerRaw, &m); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"--confirm", "resolve production attempt "+m.AttemptID, "--owner", "operator")
+	if code != exitOK {
+		t.Fatalf("resolve exit = %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
+	}
+	if !strings.Contains(out, m.AttemptID) || !strings.Contains(out, "block is lifted") {
+		t.Errorf("stdout =\n%s", out)
+	}
+	if _, err := os.Stat(f.attemptPath()); !os.IsNotExist(err) {
+		t.Error("the marker must be gone after resolution")
+	}
+
+	// Resolving again immediately is a no-op.
+	code, out, _ = runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"--confirm", "resolve production attempt "+m.AttemptID)
+	if code != exitOK || !strings.Contains(out, "Nothing to resolve") {
+		t.Errorf("second resolve should be a no-op: exit = %d, stdout =\n%s", code, out)
+	}
+
+	// Normal operation resumes: the retry deploys again and fails at
+	// verify — as a normal determined failure, not a refusal.
+	code, out, _ = runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
+	if code != exitFailed || !strings.Contains(out, "RECOVERY REQUIRED") {
+		t.Fatalf("post-resolve deploy exit = %d, stdout =\n%s", code, out)
 	}
 }
