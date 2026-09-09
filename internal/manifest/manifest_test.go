@@ -300,3 +300,57 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return data
 }
+
+// The manifest pipeline accepts EXACTLY one YAML document. A second
+// document after `---` would otherwise be silently ignored by every
+// reader while its author believes it is part of the manifest — the
+// only place in the toolkit where extra input was silently dropped.
+func TestParseRejectsSecondDocument(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+	}{
+		{name: "second structured document", doc: validProject() + "---\nextra: document\n"},
+		{name: "second empty document", doc: validProject() + "---\n"},
+		{name: "second document only a comment", doc: validProject() + "---\n# trailing notes\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := Parse([]byte(c.doc), KindProject)
+			if err == nil || !strings.Contains(err.Error(), "YAML document") {
+				t.Fatalf("err = %v, want an exactly-one-document refusal", err)
+			}
+		})
+	}
+}
+
+func TestParseSingleDocumentEdges(t *testing.T) {
+	t.Run("leading --- marker is legal", func(t *testing.T) {
+		if _, err := Parse([]byte("---\n"+validProject()), KindProject); err != nil {
+			t.Fatalf("leading document marker rejected: %v", err)
+		}
+	})
+	t.Run("trailing comments and whitespace are legal", func(t *testing.T) {
+		if _, err := Parse([]byte(validProject()+"\n# release notes live elsewhere\n\n"), KindProject); err != nil {
+			t.Fatalf("trailing comments rejected: %v", err)
+		}
+	})
+	t.Run("empty input is refused as zero documents", func(t *testing.T) {
+		_, err := Parse([]byte(""), KindProject)
+		if err == nil || !strings.Contains(err.Error(), "YAML document") {
+			t.Fatalf("err = %v, want a zero-documents refusal", err)
+		}
+	})
+	t.Run("every kind still parses", func(t *testing.T) {
+		for kind, doc := range map[string]string{
+			KindProject:     validProject(),
+			KindRelease:     validRelease(),
+			KindEnvironment: validEnvironment(),
+			KindTarget:      validTarget(),
+		} {
+			if _, err := Parse([]byte(doc), kind); err != nil {
+				t.Errorf("%s: %v", kind, err)
+			}
+		}
+	})
+}
