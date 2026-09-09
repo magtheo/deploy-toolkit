@@ -142,6 +142,7 @@ func connect(ctx context.Context, mt *manifest.Target) (*target.Target, error) {
 // reportConnectFailure renders a failure that happened before any
 // lifecycle operation: nothing was executed and nothing is unresolved.
 func reportConnectFailure(err error, cmd, envName string, stderr io.Writer, jsonMode bool, stdout io.Writer) int {
+	display := strings.Replace(cmd, "-", " ", 1)
 	if jsonMode {
 		outcome := outcomeInfraFailed
 		if errors.Is(err, errTargetConfig) {
@@ -155,11 +156,11 @@ func reportConnectFailure(err error, cmd, envName string, stderr io.Writer, json
 		return emitJSON(stdout, env)
 	}
 	if errors.Is(err, errTargetConfig) {
-		fmt.Fprintf(stderr, "✗ %s %s: configuration error: %v\n", cmd, envName, err)
+		fmt.Fprintf(stderr, "✗ %s %s: configuration error: %v\n", display, envName, err)
 		fmt.Fprintln(stderr, "  Nothing was started; no lifecycle operation was executed.")
 		return exitUsage
 	}
-	fmt.Fprintf(stderr, "✗ %s %s: infrastructure failure: %v\n", cmd, envName, err)
+	fmt.Fprintf(stderr, "✗ %s %s: infrastructure failure: %v\n", display, envName, err)
 	fmt.Fprintln(stderr, "  The operation did not start: the target could not be reached.")
 	fmt.Fprintln(stderr, "  No lifecycle operation was executed; nothing is unresolved.")
 	return exitInfra

@@ -25,6 +25,7 @@ import (
 // design, and the only safe instruction then is "wait, touch nothing".
 func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	jsonMode := wantsJSON(args)
+	rawStdout := stdout
 	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult("status", "", "usage: deployctl status <environment> [--repo-dir .]"))
@@ -45,9 +46,15 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	repoDir := fs.String("repo-dir", ".", "checkout containing .deploy/")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
 	if err := fs.Parse(args[1:]); err != nil {
+		if jsonMode {
+			return emitJSON(rawStdout, usageErrorResult(cmdStatus, envName, "invalid flags"))
+		}
 		return exitUsage
 	}
 	if fs.NArg() > 0 {
+		if jsonMode {
+			return emitJSON(rawStdout, usageErrorResult(cmdStatus, envName, fmt.Sprintf("unexpected argument %q", fs.Arg(0))))
+		}
 		fmt.Fprintf(stderr, "deployctl status: unexpected argument %q\n", fs.Arg(0))
 		return exitUsage
 	}
@@ -65,7 +72,6 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		return reportConnectFailure(err, "status", envName, stderr, jsonMode, stdout)
 	}
 	humanOut := io.Writer(stdout)
-	rawStdout := stdout
 	if jsonMode {
 		humanOut = io.Discard
 	}

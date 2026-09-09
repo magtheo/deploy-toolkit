@@ -131,7 +131,7 @@ type deployResultData struct {
 }
 
 func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
-	env := &resultEnvelope{Schema: resultSchemaV1, Command: "deploy"}
+	env := &resultEnvelope{Schema: resultSchemaV1, Command: cmdDeploy}
 	data := &deployResultData{}
 	env.Data = data
 	failureStages := false
@@ -200,7 +200,7 @@ type rollbackResultData struct {
 }
 
 func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, int) {
-	env := &resultEnvelope{Schema: resultSchemaV1, Command: "rollback"}
+	env := &resultEnvelope{Schema: resultSchemaV1, Command: cmdRollback}
 	data := &rollbackResultData{}
 	env.Data = data
 	failureStages := false
@@ -290,7 +290,7 @@ type statusResultData struct {
 func statusResult(project, envName string, desired, observed *releaseRef, lock, stateMachine string, attempt, recovery *markerFact) *resultEnvelope {
 	env := &resultEnvelope{
 		Schema:      resultSchemaV1,
-		Command:     "status",
+		Command:     cmdStatus,
 		Outcome:     outcomeSuccess,
 		Message:     "state: " + stateMachine,
 		SafeToRetry: true,
@@ -314,37 +314,66 @@ func statusResult(project, envName string, desired, observed *releaseRef, lock, 
 
 // ---- recovery resolve --------------------------------------------------
 
+// Machine command-name enum: the Command field is one of these constants
+// on every path, never an arbitrary display string.
+const (
+	cmdDeploy          = "deploy"
+	cmdRollback        = "rollback"
+	cmdStatus          = "status"
+	cmdRecoveryResolve = "recovery-resolve"
+)
+
 type resolveResultData struct {
-	NothingToResolve   bool        `json:"nothingToResolve"`
-	ResolvedRecoveryID string      `json:"resolvedRecoveryId,omitempty"`
-	ResolvedAttemptID  string      `json:"resolvedAttemptId,omitempty"`
-	LeftRecoveryID     string      `json:"leftRecoveryId,omitempty"`
-	LeftAttemptID      string      `json:"leftAttemptId,omitempty"`
-	HistorySeq         int64       `json:"historySeq,omitempty"`
-	Observed           *releaseRef `json:"observed,omitempty"`
+	NothingToResolve    bool        `json:"nothingToResolve"`
+	ResolvedRecoveryID  string      `json:"resolvedRecoveryId,omitempty"`
+	ResolvedAttemptID   string      `json:"resolvedAttemptId,omitempty"`
+	LeftRecoveryID      string      `json:"leftRecoveryId,omitempty"`
+	LeftAttemptID       string      `json:"leftAttemptId,omitempty"`
+	RemainingRecoveryID string      `json:"remainingRecoveryId,omitempty"`
+	RemainingAttemptID  string      `json:"remainingAttemptId,omitempty"`
+	HistorySeq          int64       `json:"historySeq,omitempty"`
+	Observed            *releaseRef `json:"observed,omitempty"`
+}
+
+// observedRef projects what observed state the operator resolved against.
+func observedRef(rep *lifecycle.ResolveReport) *releaseRef {
+	if rep.ObservedRelease == "" && rep.ObservedOperationID == "" {
+		return nil
+	}
+	return &releaseRef{Version: rep.ObservedRelease, BundleDigest: rep.ObservedBundleDigest, OperationID: rep.ObservedOperationID}
 }
 
 func resolveResult(rep *lifecycle.ResolveReport, err error, refused bool) (*resultEnvelope, int) {
-	env := &resultEnvelope{Schema: resultSchemaV1, Command: "recovery-resolve"}
+	env := &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve}
 	data := &resolveResultData{}
 	env.Data = data
 	if rep != nil {
 		env.Project, env.Environment = rep.Project, rep.Environment
 		*data = resolveResultData{
-			NothingToResolve:   rep.NothingToResolve,
-			ResolvedRecoveryID: rep.ResolvedRecoveryID,
-			ResolvedAttemptID:  rep.ResolvedAttemptID,
-			LeftRecoveryID:     rep.LeftRecoveryID,
-			LeftAttemptID:      rep.LeftAttemptID,
-			HistorySeq:         rep.HistorySeq,
+			NothingToResolve:    rep.NothingToResolve,
+			ResolvedRecoveryID:  rep.ResolvedRecoveryID,
+			ResolvedAttemptID:   rep.ResolvedAttemptID,
+			LeftRecoveryID:      rep.LeftRecoveryID,
+			LeftAttemptID:       rep.LeftAttemptID,
+			HistorySeq:          rep.HistorySeq,
+			RemainingRecoveryID: rep.RecoveryMarkerID,
+			RemainingAttemptID:  rep.AttemptMarkerID,
+			Observed:            observedRef(rep),
 		}
-		if rep.LeftRecoveryID != "" || rep.LeftAttemptID != "" {
-			env.RecoveryRequired = true
+		if rep.LeftRecoveryID != "" {
+			data.RemainingRecoveryID = rep.LeftRecoveryID
 		}
+		if rep.LeftAttemptID != "" {
+			data.RemainingAttemptID = rep.LeftAttemptID
+		}
+		// The engine owns the blocked-state fact on EVERY path —
+		// including history-write and marker-clear failures.
+		env.RecoveryRequired = rep.RecoveryRequired
 	}
 	switch {
 	case err != nil && refused:
 		env.Outcome = outcomeRefused
+		env.RecoveryRequired = rep.RecoveryRequired
 		env.Message = "refused: " + err.Error()
 	case err != nil:
 		env.Outcome = outcomeInfraFailed

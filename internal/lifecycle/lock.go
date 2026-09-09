@@ -30,6 +30,7 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -62,6 +63,13 @@ type LockOwner struct {
 // hang finalization forever. Var for test overriding.
 var lockCleanupTimeout = 30 * time.Second
 
+// ErrEnvLockHeld marks the one lock-acquisition failure that is a REFUSAL
+// rather than an infrastructure problem: the lock directory already
+// exists, so an operation may be executing right now. Every other
+// acquisition failure (transport death, filesystem trouble) is
+// infrastructure.
+var ErrEnvLockHeld = errors.New("environment lock is held")
+
 // AcquireEnvLock creates the lock directory atomically. Callers must
 // Release it; Release failure is a hard error because a stuck lock blocks
 // every future deployment of the environment.
@@ -89,7 +97,7 @@ func AcquireEnvLock(ctx context.Context, tr transport.Transport, lockDir string,
 	if code != 0 {
 		held, _, heldErr := run("test", "-d", lockDir)
 		if heldErr == nil && held == 0 {
-			return nil, fmt.Errorf("environment lock %s is held by another deployment (a crashed runner leaves the lock; remove it manually after verifying no deployment is in flight)", lockDir)
+			return nil, fmt.Errorf("environment lock %s is held by another deployment (a crashed runner leaves the lock; remove it manually after verifying no deployment is in flight): %w", lockDir, ErrEnvLockHeld)
 		}
 		return nil, fmt.Errorf("lock: acquire %s: exit %d: %s", lockDir, code, stderr)
 	}

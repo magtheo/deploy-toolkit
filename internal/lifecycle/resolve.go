@@ -51,6 +51,20 @@ type ResolveReport struct {
 	// design.
 	LeftRecoveryID string
 	LeftAttemptID  string
+	// AttemptPresentAfter / RecoveryPresentAfter are the engine-owned
+	// blocked-state facts, set as soon as the under-lock reads land and
+	// updated after each successful clear — so EVERY return path,
+	// including history-write and marker-clear failures, truthfully
+	// says what still lies on the target. AttemptMarkerID /
+	// RecoveryMarkerID name what was present at read time ("" if
+	// absent) so a failed resolution can name the remaining block.
+	AttemptPresentAfter  bool
+	RecoveryPresentAfter bool
+	AttemptMarkerID      string
+	RecoveryMarkerID     string
+	// RecoveryRequired: after this invocation, does ANY marker still
+	// block normal operation? Maintained on every return path.
+	RecoveryRequired bool
 	// Observed records what the target claimed at resolution time — the
 	// state the operator verified against, preserved as evidence.
 	ObservedRelease      string
@@ -125,7 +139,10 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 		Release:     "resolve",
 	})
 	if err != nil {
-		return rep, refuseResolve("acquire environment lock: %v", err)
+		if errors.Is(err, ErrEnvLockHeld) {
+			return rep, refuseResolve("acquire environment lock: %v", err)
+		}
+		return rep, fmt.Errorf("acquire environment lock: %w", err)
 	}
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
@@ -137,11 +154,15 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 
 	// Observed state must be trustworthy before anything is resolved.
 	// Absent is a normal, resolvable situation — the failed FIRST deploy
-	// leaves no state at all — but anything unreadable or invalid fails
-	// closed.
+	// leaves no state at all. INVALID evidence (exists, fails strict
+	// validation) is a refusal: nothing may be authorized against facts
+	// that cannot be trusted. A transport failure is infrastructure.
 	st, err := in.Target.ReadState(ctx, rep.Project, rep.Environment)
 	if err != nil && !errors.Is(err, target.ErrStateAbsent) {
-		return rep, fmt.Errorf("read observed state (unreadable evidence must be repaired, not resolved): %w", err)
+		if errors.Is(err, target.ErrEvidenceInvalid) {
+			return rep, refuseResolve("observed state is invalid: %v", err)
+		}
+		return rep, fmt.Errorf("read observed state: %w", err)
 	}
 	if st.Current != nil {
 		rep.ObservedRelease = st.Current.Release
@@ -152,13 +173,32 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	attempt, aerr := in.Target.ReadAttempt(ctx, rep.Project, rep.Environment)
 	attemptPresent := aerr == nil
 	if aerr != nil && !errors.Is(aerr, target.ErrAttemptAbsent) {
-		return rep, fmt.Errorf("read attempt marker (unreadable evidence must be repaired, not resolved): %w", aerr)
+		if errors.Is(aerr, target.ErrEvidenceInvalid) {
+			return rep, refuseResolve("attempt marker is invalid: %v", aerr)
+		}
+		return rep, fmt.Errorf("read attempt marker: %w", aerr)
 	}
 	recovery, rerr := in.Target.ReadRecovery(ctx, rep.Project, rep.Environment)
 	recoveryPresent := rerr == nil
 	if rerr != nil && !errors.Is(rerr, target.ErrRecoveryAbsent) {
-		return rep, fmt.Errorf("read recovery marker (unreadable evidence must be repaired, not resolved): %w", rerr)
+		if errors.Is(rerr, target.ErrEvidenceInvalid) {
+			return rep, refuseResolve("recovery marker is invalid: %v", rerr)
+		}
+		return rep, fmt.Errorf("read recovery marker: %w", rerr)
 	}
+
+	// The blocked-state facts exist from the moment the reads land; the
+	// clears below update them, and every failure path leaves them
+	// truthful. RecoveryRequired is finalized on every return.
+	rep.AttemptPresentAfter = attemptPresent
+	rep.RecoveryPresentAfter = recoveryPresent
+	if attemptPresent {
+		rep.AttemptMarkerID = attempt.AttemptID
+	}
+	if recoveryPresent {
+		rep.RecoveryMarkerID = recovery.RecoveryID
+	}
+	defer func() { rep.RecoveryRequired = rep.AttemptPresentAfter || rep.RecoveryPresentAfter }()
 
 	if !attemptPresent && !recoveryPresent {
 		rep.NothingToResolve = true
@@ -236,12 +276,14 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 			return rep, fmt.Errorf("clear attempt marker %s: %w", attempt.AttemptID, cerr)
 		}
 		rep.ResolvedAttemptID = attempt.AttemptID
+		rep.AttemptPresentAfter = false
 	}
 	if in.ConfirmRecoveryID != "" {
 		if cerr := in.Target.ClearRecovery(ctx, rep.Project, rep.Environment); cerr != nil {
 			return rep, fmt.Errorf("clear recovery marker %s: %w", recovery.RecoveryID, cerr)
 		}
 		rep.ResolvedRecoveryID = recovery.RecoveryID
+		rep.RecoveryPresentAfter = false
 	}
 	// Facts confirmed for removal but left by a partial authorization
 	// keep blocking; name them so the operator sees the block is not

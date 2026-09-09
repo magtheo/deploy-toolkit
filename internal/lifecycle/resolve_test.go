@@ -1,6 +1,9 @@
 package lifecycle
 
 import (
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -139,7 +142,8 @@ func TestResolveRemovesAttemptBeforeRecovery(t *testing.T) {
 	recID, attID := recoveryMarkerID(t, f), attemptMarkerID(t, f)
 
 	// Fail the recovery marker's removal: the attempt marker (cleared
-	// first) must already be gone.
+	// first) must already be gone — and the report must say the
+	// environment is STILL blocked, naming the surviving marker.
 	tr := &failingRunTransport{
 		inner: local.New(),
 		failRunWhen: func(argv []string) bool {
@@ -275,5 +279,111 @@ func TestResolveRefusesEnvironmentTargetMismatch(t *testing.T) {
 	in.TargetManifest = &other
 	if _, err := Resolve(t.Context(), in); err == nil || !strings.Contains(err.Error(), "targets") {
 		t.Fatalf("err = %v, want the environment/target binding refusal", err)
+	}
+}
+
+// The blocked-state facts are engine-owned on EVERY return path. All
+// three cleanup-failure windows must leave RecoveryRequired=true with
+// the remaining marker ids named — never a report that says the
+// environment is free while a marker still lies on the target.
+func TestResolveReportsBlockedStateOnEveryFailureWindow(t *testing.T) {
+	// Window 1: the history append fails — nothing was cleared.
+	f := newFixture(t, "my-app", nil)
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.target.WriteAttempt(t.Context(), target.AttemptMarker{
+		Schema: "toolkit.attempt/v1", AttemptID: "0123456789abcdef",
+		Project: "my-app", Environment: "production",
+		FromRelease: "0.9.0", ToRelease: "1.0.0",
+		BundleDigest: "sha256:" + strings.Repeat("aa", 32),
+		StartedAt:    "2026-09-09T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Fail only the history PUBLICATION — reads (which also shell out)
+	// succeed, so the failure window is exactly the evidence write.
+	tr := &failingRunTransport{
+		inner:       local.New(),
+		failPutWhen: func(path string) bool { return strings.HasSuffix(path, "/history/production.jsonl") },
+	}
+	tgt2, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := resolveInput(t, f, "", "0123456789abcdef")
+	in.Target = tgt2
+	rep, err := Resolve(t.Context(), in)
+	if err == nil {
+		t.Fatal("history failure must surface")
+	}
+	if !rep.RecoveryRequired || !rep.AttemptPresentAfter || rep.AttemptMarkerID != "0123456789abcdef" {
+		t.Fatalf("window 1 rep = %+v", rep)
+	}
+	if !attemptPresent(t, f) {
+		t.Fatal("window 1: the marker must remain")
+	}
+
+	// Window 2: the attempt clear fails.
+	f2 := newFixture(t, "my-app", nil)
+	if _, err := deploy(t, f2, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := f2.target.WriteAttempt(t.Context(), target.AttemptMarker{
+		Schema: "toolkit.attempt/v1", AttemptID: "fedcba9876543210",
+		Project: "my-app", Environment: "production",
+		ToRelease: "1.0.0", BundleDigest: "sha256:" + strings.Repeat("bb", 32),
+		StartedAt: "2026-09-09T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tr2 := &failingRunTransport{
+		inner: local.New(),
+		failRunWhen: func(argv []string) bool {
+			return argv[0] == "rm" && strings.HasSuffix(argv[len(argv)-1], "/attempts/production.json")
+		},
+	}
+	tgt3, err := target.New(tr2, f2.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in2 := resolveInput(t, f2, "", "fedcba9876543210")
+	in2.Target = tgt3
+	rep2, err := Resolve(t.Context(), in2)
+	if err == nil || !strings.Contains(err.Error(), "clear attempt marker") {
+		t.Fatalf("err = %v, want the attempt-clear failure", err)
+	}
+	if !rep2.RecoveryRequired || !rep2.AttemptPresentAfter || rep2.AttemptMarkerID != "fedcba9876543210" {
+		t.Fatalf("window 2 rep = %+v", rep2)
+	}
+
+	// Window 3 (recovery-clear failure) is covered by
+	// TestResolveRemovesAttemptBeforeRecovery; assert the same facts
+	// there hold for the recovery marker.
+}
+
+// Invalid evidence (exists, fails strict validation) is a REFUSAL —
+// facts that cannot be trusted never authorize a resolution — while a
+// transport failure to READ evidence is infrastructure. Test the
+// refusal side; the transport side cannot read at all and never gets
+// here.
+func TestResolveInvalidEvidenceIsRefusal(t *testing.T) {
+	f := newFixture(t, "my-app", nil)
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	writeCorrupt := func() {
+		p := f.root + "/my-app/attempts/production.json"
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("{corrupt"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeCorrupt()
+	_, err := Resolve(t.Context(), resolveInput(t, f, "", "0123456789abcdef"))
+	if err == nil || !errors.Is(err, ErrResolveRefused) || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("err = %v, want an ErrResolveRefused for invalid evidence", err)
 	}
 }

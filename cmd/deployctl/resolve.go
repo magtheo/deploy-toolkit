@@ -176,12 +176,10 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	owner := fs.String("owner", "", "identity recorded as resolution evidence (default user@host)")
 	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
-	jsonFlag := jsonMode
 	// Go's flag parsing stops at the first positional token; split flags
 	// and positional selectors manually so both orders work. Value flags
 	// consume one token; boolean flags (json) consume none.
 	flagTokens, selectors := splitFlagsAndValues(args[1:], map[string]bool{"json": true})
-	_ = jsonFlag
 	if err := fs.Parse(flagTokens); err != nil {
 		return exitUsage
 	}
@@ -194,14 +192,20 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	var sentence string
 	var err error
 	interactive := len(selectors) == 0 && *confirm == ""
+
+	// JSON mode is explicitly NON-interactive: a required confirmation
+	// without --confirm is a usage error, before any target access.
+	if jsonMode && interactive {
+		return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "--confirm (or explicit selectors) is required in --json mode; the interactive prompt is never read"))
+	}
 	if !interactive {
 		sentence, scope, err = parseResolveScope(envName, selectors, *confirm)
 		if err != nil {
 			if jsonMode {
 				if errors.Is(err, errScopeMismatch) {
-					return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: "recovery-resolve", Outcome: outcomeRefused, Environment: envName, Message: err.Error()})
+					return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Environment: envName, Message: err.Error()})
 				}
-				return emitJSON(stdout, usageErrorResult("recovery-resolve", envName, err.Error()))
+				return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, err.Error()))
 			}
 			fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
 			if errors.Is(err, errScopeMismatch) {
@@ -214,14 +218,14 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	dc, err := loadDeploymentContext(*repoDir, envName)
 	if err != nil {
 		if jsonMode {
-			return emitJSON(stdout, usageErrorResult("recovery-resolve", envName, err.Error()))
+			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, err.Error()))
 		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
 		return exitUsage
 	}
 	tgt, err := connect(ctx, dc.Target)
 	if err != nil {
-		return reportConnectFailure(err, "recovery resolve", envName, stderr, jsonMode, stdout)
+		return reportConnectFailure(err, cmdRecoveryResolve, envName, stderr, jsonMode, stdout)
 	}
 
 	project, env := dc.Release.Metadata.Project, dc.Env.Metadata.Name
@@ -232,20 +236,24 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	st, serr := tgt.ReadState(ctx, project, env)
 	attempt, aerr := tgt.ReadAttempt(ctx, project, env)
 	recovery, rerr := tgt.ReadRecovery(ctx, project, env)
-	if serr != nil && !errors.Is(serr, target.ErrStateAbsent) {
-		fmt.Fprintf(stderr, "✗ recovery resolve %s: observed state is unreadable: %v\n", envName, serr)
+	// The refusal documents carry the same marker facts the engine
+	// would report: what is on the target remains on the target.
+	refuseJSON := func(format string, args ...any) int {
+		if jsonMode {
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: true, Message: fmt.Sprintf(format, args...), Data: &resolveResultData{RemainingAttemptID: attemptIDOrEmpty(aerr, attempt), RemainingRecoveryID: recoveryIDOrEmpty(rerr, recovery)}})
+		}
+		fmt.Fprintf(stderr, "✗ recovery resolve %s: %s\n", envName, fmt.Sprintf(format, args...))
 		fmt.Fprintln(stderr, "  Unreadable evidence must be repaired, not resolved. Run `deployctl status`.")
 		return exitFailed
+	}
+	if serr != nil && !errors.Is(serr, target.ErrStateAbsent) {
+		return refuseJSON("observed state is unreadable: %v", serr)
 	}
 	if aerr != nil && !errors.Is(aerr, target.ErrAttemptAbsent) {
-		fmt.Fprintf(stderr, "✗ recovery resolve %s: attempt marker is unreadable: %v\n", envName, aerr)
-		fmt.Fprintln(stderr, "  Unreadable evidence must be repaired, not resolved. Run `deployctl status`.")
-		return exitFailed
+		return refuseJSON("attempt marker is unreadable: %v", aerr)
 	}
 	if rerr != nil && !errors.Is(rerr, target.ErrRecoveryAbsent) {
-		fmt.Fprintf(stderr, "✗ recovery resolve %s: recovery marker is unreadable: %v\n", envName, rerr)
-		fmt.Fprintln(stderr, "  Unreadable evidence must be repaired, not resolved. Run `deployctl status`.")
-		return exitFailed
+		return refuseJSON("recovery marker is unreadable: %v", rerr)
 	}
 	if aerr != nil && rerr != nil {
 		if jsonMode {
@@ -258,11 +266,20 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	// operation is active, the operator is not asked to authorize
 	// anything. (The engine enforces the lock itself; this keeps the
 	// human authorization honest.)
+	lockRefusalData := func() *resolveResultData {
+		return &resolveResultData{RemainingAttemptID: attemptIDOrEmpty(aerr, attempt), RemainingRecoveryID: recoveryIDOrEmpty(rerr, recovery)}
+	}
 	if held, lerr := lockHeld(ctx, tgt, dc); lerr != nil {
+		if jsonMode {
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: aerr == nil || rerr == nil, Message: "cannot establish whether an operation is active: " + lerr.Error(), Data: lockRefusalData()})
+		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: cannot establish whether an operation is active: %v\n", envName, lerr)
 		fmt.Fprintln(stderr, "  Do not authorize a resolution while the lock state is unreadable. Repair access first.")
 		return exitFailed
 	} else if held {
+		if jsonMode {
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: aerr == nil || rerr == nil, Message: "the environment lock is HELD — an operation may be executing; wait for it to finish first", Data: lockRefusalData()})
+		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: the environment lock is HELD — an operation may be executing.\n", envName)
 		fmt.Fprintln(stderr, "  Wait for it to finish and verify no deployment is in flight first.")
 		return exitFailed
@@ -300,6 +317,9 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		got := strings.TrimSpace(line)
 		scope, err = parseResolveSentence(envName, got)
 		if err != nil {
+			if jsonMode {
+				return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, Message: err.Error() + " — nothing was changed"})
+			}
 			fmt.Fprintf(stderr, "✗ resolve aborted: %v — nothing was changed\n", err)
 			return exitFailed
 		}
@@ -318,6 +338,9 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 			got = strings.TrimSpace(line)
 		}
 		if got != sentence {
+			if jsonMode {
+				return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, Message: fmt.Sprintf("confirmation does not match %q — nothing was changed", sentence)})
+			}
 			fmt.Fprintf(stderr, "✗ resolve aborted: confirmation does not match %q — nothing was changed\n", sentence)
 			return exitFailed
 		}
@@ -380,6 +403,20 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 func mustEnvelope(env *resultEnvelope, code int) *resultEnvelope {
 	_ = code
 	return env
+}
+
+func attemptIDOrEmpty(err error, m target.AttemptMarker) string {
+	if err == nil {
+		return m.AttemptID
+	}
+	return ""
+}
+
+func recoveryIDOrEmpty(err error, m target.RecoveryMarker) string {
+	if err == nil {
+		return m.RecoveryID
+	}
+	return ""
 }
 
 func observedLine(st target.State, stateErr error) string {

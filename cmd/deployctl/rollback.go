@@ -49,28 +49,49 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 	owner := fs.String("owner", "", "identity recorded in the lock and history (default user@host)")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
 	if err := fs.Parse(args[1:]); err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdRollback, envName, "invalid flags"))
+		}
 		return exitUsage
 	}
 	if fs.NArg() > 0 {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdRollback, envName, fmt.Sprintf("unexpected argument %q", fs.Arg(0))))
+		}
 		fmt.Fprintf(stderr, "deployctl rollback: unexpected argument %q\n", fs.Arg(0))
 		return exitUsage
+	}
+	// JSON mode is explicitly NON-interactive: CI must never block on a
+	// terminal. A required confirmation without --confirm is a usage
+	// error, emitted before anything else happens.
+	if jsonMode && *confirm == "" {
+		return emitJSON(stdout, usageErrorResult(cmdRollback, envName, "--confirm is required in --json mode; the interactive prompt is never read"))
 	}
 	humanOut := io.Writer(stdout)
 	if jsonMode {
 		humanOut = io.Discard
 	}
 	if *to == "" {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdRollback, envName, "--to <version> is required"))
+		}
 		fmt.Fprintln(stderr, "deployctl rollback: --to <version> is required")
 		return exitUsage
 	}
 	// Versions become release paths: validate them as strict SemVer
 	// before they feed into filesystem path construction.
 	if err := target.CheckVersion(*to); err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdRollback, envName, "--to: "+err.Error()))
+		}
 		fmt.Fprintf(stderr, "deployctl rollback: --to: %v\n", err)
 		return exitUsage
 	}
 	if *from != "" {
 		if err := target.CheckVersion(*from); err != nil {
+			if jsonMode {
+				return emitJSON(stdout, usageErrorResult(cmdRollback, envName, "--from: "+err.Error()))
+			}
 			fmt.Fprintf(stderr, "deployctl rollback: --from: %v\n", err)
 			return exitUsage
 		}

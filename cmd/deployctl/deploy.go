@@ -43,9 +43,15 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	owner := fs.String("owner", "", "identity recorded in the lock and history (default user@host)")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
 	if err := fs.Parse(args[1:]); err != nil {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdDeploy, envName, "invalid flags"))
+		}
 		return exitUsage
 	}
 	if fs.NArg() > 0 {
+		if jsonMode {
+			return emitJSON(stdout, usageErrorResult(cmdDeploy, envName, fmt.Sprintf("unexpected argument %q", fs.Arg(0))))
+		}
 		fmt.Fprintf(stderr, "deployctl deploy: unexpected argument %q\n", fs.Arg(0))
 		return exitUsage
 	}

@@ -1228,3 +1228,54 @@ func mustRead(t *testing.T, path string) []byte {
 	}
 	return raw
 }
+
+// Negative JSON contract: every error path emits exactly one valid
+// deployctl.result/v1 document — usage errors, confirmation refusals,
+// held locks, corrupt evidence — never prose on stdout.
+func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
+	f := newCLIFixture(t)
+
+	tests := []struct {
+		name    string
+		args    []string
+		code    int
+		outcome string
+	}{
+		{"deploy unknown flag", []string{"deploy", "production", "--repo-dir", f.repoDir, "--bogus"}, exitUsage, "usage-error"},
+		{"rollback missing --to", []string{"rollback", "production", "--repo-dir", f.repoDir}, exitUsage, "usage-error"},
+		{"rollback bad semver", []string{"rollback", "production", "--to", "NOT.A.VERSION", "--repo-dir", f.repoDir, "--confirm", "x"}, exitUsage, "usage-error"},
+		{"rollback json is non-interactive", []string{"rollback", "production", "--to", "1.0.0", "--repo-dir", f.repoDir}, exitUsage, "usage-error"},
+		{"resolve json is non-interactive", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir}, exitUsage, "usage-error"},
+		{"resolve grammar before target", []string{"recovery", "resolve", "production", "--repo-dir", f.repoDir, "nonsense", "garbage"}, exitUsage, "usage-error"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			code, doc := runJSON(t, tc.args...)
+			if code != tc.code || doc["outcome"] != tc.outcome {
+				t.Fatalf("exit = %d outcome = %v, want %d/%s", code, doc["outcome"], tc.code, tc.outcome)
+			}
+		})
+	}
+
+	// Corrupt evidence: refused, and the block is stated.
+	writeFileCLIF(t, f.statePath(), "{corrupt")
+	code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
+	if code != exitFailed || doc["outcome"] != "refused" {
+		t.Fatalf("corrupt state: exit = %d outcome = %v", code, doc["outcome"])
+	}
+
+	// Held lock: refused, environment named.
+	os.Remove(f.statePath())
+	writeAttemptMarker(t, f, "1.0.0")
+	writeFileCLIF(t, f.lockPath(), "")
+	code, doc = runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
+	if code != exitFailed || doc["outcome"] != "refused" {
+		t.Fatalf("held lock: exit = %d outcome = %v", code, doc["outcome"])
+	}
+	data := doc["data"].(map[string]any)
+	if data["remainingAttemptId"] != "0123456789abcdef" {
+		t.Errorf("held-lock refusal must name the remaining block: %v", data)
+	}
+}

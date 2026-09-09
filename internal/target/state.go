@@ -25,6 +25,15 @@ var digestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // not a failure.
 var ErrStateAbsent = errors.New("observed state: no deployment recorded")
 
+// ErrEvidenceInvalid marks strict-validation failures on durable target
+// files (state snapshot, attempt/recovery markers): the file EXISTS and
+// was read, but does not decode or validate. This is structurally
+// different from absence (normal), corruption-by-transport (an error
+// mid-read surfaces as a transport error) — invalid evidence fails
+// closed and, for recovery operations, is classifiable as a refusal to
+// act rather than an infrastructure failure.
+var ErrEvidenceInvalid = errors.New("evidence failed strict validation")
+
 // operationIDPattern pins the operationId shape: which kind of lifecycle
 // operation committed this observation, and that operation's durable ID
 // (attempt or recovery marker id). Empty means "committed before the
@@ -135,10 +144,10 @@ func (t *Target) ReadState(ctx context.Context, project, env string) (State, err
 	}
 	var st State
 	if err := decodeStrictJSON(raw, &st); err != nil {
-		return State{}, fmt.Errorf("%s: %w", path, err)
+		return State{}, fmt.Errorf("%s: %w: %w", path, err, ErrEvidenceInvalid)
 	}
 	if err := validateState(st, project, env); err != nil {
-		return State{}, fmt.Errorf("%s: %w", path, err)
+		return State{}, fmt.Errorf("%s: %w: %w", path, err, ErrEvidenceInvalid)
 	}
 	return st, nil
 }

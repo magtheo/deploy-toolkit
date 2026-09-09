@@ -109,10 +109,10 @@ func (t *Target) ReadRecovery(ctx context.Context, project, env string) (Recover
 	}
 	var m RecoveryMarker
 	if err := decodeStrictJSON(raw, &m); err != nil {
-		return RecoveryMarker{}, fmt.Errorf("%s: %w", path, err)
+		return RecoveryMarker{}, fmt.Errorf("%s: %w: %w", path, err, ErrEvidenceInvalid)
 	}
 	if err := validateRecovery(m, project, env); err != nil {
-		return RecoveryMarker{}, fmt.Errorf("%s: %w", path, err)
+		return RecoveryMarker{}, fmt.Errorf("%s: %w: %w", path, err, ErrEvidenceInvalid)
 	}
 	return m, nil
 }

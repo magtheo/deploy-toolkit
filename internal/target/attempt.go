@@ -96,10 +96,10 @@ func (t *Target) ReadAttempt(ctx context.Context, project, env string) (AttemptM
 	}
 	var m AttemptMarker
 	if err := decodeStrictJSON(raw, &m); err != nil {
-		return AttemptMarker{}, fmt.Errorf("%s: %w", path, err)
+		return AttemptMarker{}, fmt.Errorf("%s: %w: %w", path, err, ErrEvidenceInvalid)
 	}
 	if err := validateAttempt(m, project, env); err != nil {
-		return AttemptMarker{}, fmt.Errorf("%s: %w", path, err)
+		return AttemptMarker{}, fmt.Errorf("%s: %w: %w", path, err, ErrEvidenceInvalid)
 	}
 	return m, nil
 }
