@@ -143,25 +143,23 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 		Authorization:  lifecycle.RollbackManual,
 		Owner:          ownerID,
 	})
-	return reportRollback(ctx, rep, err, tgt, envName, stdout, stderr)
+	return reportRollback(rep, err, envName, stdout, stderr)
 }
 
-func reportRollback(ctx context.Context, rep *lifecycle.RollbackReport, err error, tgt *target.Target, envName string, stdout, stderr io.Writer) int {
+func reportRollback(rep *lifecycle.RollbackReport, err error, envName string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "✗ rollback %s: infrastructure failure: %v\n", envName, err)
 		switch {
 		case rep != nil && rep.Committed:
-			fmt.Fprintln(stderr, "  The observed state IS committed — the recovery itself succeeded.")
-			fmt.Fprintln(stderr, "  What failed is bookkeeping (marker/history cleanup): the leftover")
-			fmt.Fprintln(stderr, "  marker still blocks normal operation. Run `deployctl status` and")
-			fmt.Fprintln(stderr, "  follow its guidance.")
+			fmt.Fprintln(stderr, "  The observed state is committed; the recovery itself succeeded.")
+			fmt.Fprintln(stderr, "  Post-commit bookkeeping failed. Run `deployctl status` before")
+			fmt.Fprintln(stderr, "  taking another action.")
 		case rep != nil && rep.AlreadyRecovered:
-			fmt.Fprintln(stderr, "  The recovery IS already committed (observed state carries its")
-			fmt.Fprintln(stderr, "  operationId); what failed is marker cleanup, which still blocks")
-			fmt.Fprintln(stderr, "  normal operation. Run `deployctl status` and follow its guidance.")
-		case rep != nil && hasUnresolvedMarkers(ctx, tgt, rep.Project, rep.Environment):
-			fmt.Fprintln(stderr, "  The outcome is UNCERTAIN: consequential recovery work may have")
-			fmt.Fprintln(stderr, "  executed (an attempt or recovery marker is unresolved).")
+			fmt.Fprintln(stderr, "  The recovery is already committed (observed state carries its")
+			fmt.Fprintln(stderr, "  operationId); post-commit bookkeeping failed. Run")
+			fmt.Fprintln(stderr, "  `deployctl status` before taking another action.")
+		case rep != nil && rep.RecoveryStarted:
+			fmt.Fprintf(stderr, "  The outcome is UNCERTAIN: consequential recovery work may have\n  executed (recovery %s is unresolved).\n", orUnknown(rep.RecoveryID))
 			fmt.Fprintln(stderr, "  Do not retry. Run `deployctl status` and follow the recovery guidance.")
 		default:
 			fmt.Fprintln(stderr, "  No consequential work was executed — nothing was applied to the target.")

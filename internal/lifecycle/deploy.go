@@ -51,8 +51,19 @@ type Report struct {
 	Committed        bool // observed state advanced (verify succeeded)
 	AlreadyCurrent   bool // desired release+digest already observed; nothing consequential ran
 	RecoveryRequired bool // an unresolved attempt marker exists; explicit recovery is needed
-	HistorySeq       int64
-	FailureReason    string
+	// ConsequentialStarted is the durable-boundary fact: the attempt
+	// marker was successfully persisted, so migrate/apply/verify may
+	// have begun executing. An infrastructure error with this flag set
+	// leaves the outcome UNKNOWN — it must be classified as uncertain,
+	// never as safe-to-rerun. It is set immediately after the marker
+	// write succeeds, so callers never reconstruct the boundary by
+	// re-reading the target over a transport that may itself be dead.
+	ConsequentialStarted bool
+	// AttemptID is the identity of the attempt marker this invocation
+	// wrote ("" until the boundary is crossed).
+	AttemptID     string
+	HistorySeq    int64
+	FailureReason string
 }
 
 // DeployInput carries the desired state (parsed through the manifest
@@ -314,6 +325,7 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	if observed.Current != nil {
 		fromRelease = observed.Current.Release
 	}
+	rep.AttemptID = attemptID
 	if err := in.Target.WriteAttempt(ctx, target.AttemptMarker{
 		AttemptID:    attemptID,
 		Project:      rep.Project,
@@ -325,6 +337,7 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}); err != nil {
 		return failInfra("attempt marker could not be persisted; refusing consequential work", err)
 	}
+	rep.ConsequentialStarted = true
 
 	// Migration hooks follow the release's declared migration semantics:
 	// mode none means no migration runs even if a hook is declared.

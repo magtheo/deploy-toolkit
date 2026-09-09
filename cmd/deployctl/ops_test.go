@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,7 @@ import (
 	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/magtheo/deploy-toolkit/internal/bundle"
+	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
 )
 
 // cliFixture is a full consumer repository: hooks, .deploy manifests and
@@ -650,5 +652,151 @@ func TestRollbackConfirmationPrecedesConnection(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "nothing was executed, the target was not contacted") {
 		t.Errorf("stderr =\n%s", errOut)
+	}
+}
+
+// ---- infrastructure classification comes from the engine's own
+// durable-boundary fact, never from re-reading the target ---------------
+
+func reportDeployOut(rep *lifecycle.Report) string {
+	var buf bytes.Buffer
+	reportDeploy(rep, errors.New("ssh connection died"), &buf, &buf)
+	return buf.String()
+}
+
+func TestDeployInfraClassification(t *testing.T) {
+	tests := []struct {
+		name    string
+		rep     *lifecycle.Report
+		want    []string
+		notWant []string
+	}{
+		{
+			name:    "boundary crossed — uncertain, never safe to rerun",
+			rep:     &lifecycle.Report{Project: "my-app", Environment: "production", ConsequentialStarted: true, AttemptID: "0123456789abcdef"},
+			want:    []string{"UNCERTAIN", "0123456789abcdef", "Do not retry"},
+			notWant: []string{"can simply", "No consequential work"},
+		},
+		{
+			name:    "pre-boundary — rerun after repair is safe",
+			rep:     &lifecycle.Report{Project: "my-app", Environment: "production"},
+			want:    []string{"No consequential work was executed"},
+			notWant: []string{"UNCERTAIN"},
+		},
+		{
+			name:    "committed — bookkeeping, not uncertain",
+			rep:     &lifecycle.Report{Project: "my-app", Environment: "production", Committed: true},
+			want:    []string{"Post-commit bookkeeping failed"},
+			notWant: []string{"UNCERTAIN"},
+		},
+		{
+			name:    "nil report — nothing started",
+			rep:     nil,
+			want:    []string{"No consequential work was executed"},
+			notWant: []string{"UNCERTAIN"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out := reportDeployOut(tc.rep)
+			for _, w := range tc.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("output missing %q:\n%s", w, out)
+				}
+			}
+			for _, n := range tc.notWant {
+				if strings.Contains(out, n) {
+					t.Errorf("output must not contain %q:\n%s", n, out)
+				}
+			}
+		})
+	}
+}
+
+func TestRollbackInfraClassification(t *testing.T) {
+	var buf bytes.Buffer
+	reportRollback(&lifecycle.RollbackReport{Project: "my-app", Environment: "production", RecoveryStarted: true, RecoveryID: "0123456789abcdef"}, errors.New("ssh connection died"), "production", &buf, &buf)
+	out := buf.String()
+	for _, w := range []string{"UNCERTAIN", "0123456789abcdef", "Do not retry"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("missing %q:\n%s", w, out)
+		}
+	}
+	if strings.Contains(out, "can simply") {
+		t.Errorf("uncertain outcome must not suggest rerunning:\n%s", out)
+	}
+
+	buf.Reset()
+	reportRollback(&lifecycle.RollbackReport{AlreadyRecovered: true}, errors.New("cleanup failed"), "production", &buf, &buf)
+	if out = buf.String(); !strings.Contains(out, "bookkeeping failed") || strings.Contains(out, "UNCERTAIN") {
+		t.Errorf("already-recovered cleanup failure misclassified:\n%s", out)
+	}
+}
+
+// ---- status guidance must obey the classification precedence ----------
+
+func writeAttemptMarker(t *testing.T, f *cliFixture, from string) {
+	t.Helper()
+	writeFileCLIF(t, f.attemptPath(), fmt.Sprintf(`{"schema":"toolkit.attempt/v1","attemptId":"0123456789abcdef","project":"my-app","environment":"production","fromRelease":%q,"toRelease":"2.0.0","bundleDigest":%q,"startedAt":"2026-09-09T00:00:00Z"}`, from, fakeDigest))
+}
+
+func writeRecoveryMarkerCLIF(t *testing.T, f *cliFixture) {
+	t.Helper()
+	writeFileCLIF(t, f.recoveryPath(), fmt.Sprintf(`{"schema":"toolkit.recovery/v1","recoveryId":"0123456789abcdef","sourceAttemptId":"","project":"my-app","environment":"production","fromRelease":"2.0.0","fromBundleDigest":%q,"toRelease":"1.0.0","toBundleDigest":%q,"authorization":"manual","startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest, fakeDigest))
+}
+
+// In every combination where a higher-priority fact outranks the attempt
+// marker, no rollback command may be printed: an operator following the
+// FIRST instruction status emits must never touch recovery state.
+func TestStatusGuidanceObeyesClassificationPrecedence(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(t *testing.T, f *cliFixture)
+		want    string
+		notWant string
+	}{
+		{
+			name: "lock + attempt",
+			setup: func(t *testing.T, f *cliFixture) {
+				writeAttemptMarker(t, f, "1.0.0")
+				writeFileCLIF(t, f.lockPath(), "")
+			},
+			want:    "Wait for the active operation",
+			notWant: "deployctl rollback",
+		},
+		{
+			name: "recovery + attempt",
+			setup: func(t *testing.T, f *cliFixture) {
+				writeAttemptMarker(t, f, "1.0.0")
+				writeRecoveryMarkerCLIF(t, f)
+			},
+			want:    "Normal deployment AND recovery are blocked",
+			notWant: "deployctl rollback",
+		},
+		{
+			name: "degraded + attempt",
+			setup: func(t *testing.T, f *cliFixture) {
+				writeAttemptMarker(t, f, "1.0.0")
+				writeFileCLIF(t, f.recoveryPath(), "{corrupt")
+			},
+			want:    "EVIDENCE UNREADABLE",
+			notWant: "deployctl rollback",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCLIFixture(t)
+			tc.setup(t, f)
+			code, out, _ := runCLI("status", "production", "--repo-dir", f.repoDir)
+			if code != exitOK {
+				t.Fatalf("status exit = %d", code)
+			}
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("output missing %q:\n%s", tc.want, out)
+			}
+			if strings.Contains(out, tc.notWant) {
+				t.Errorf("output must not contain %q:\n%s", tc.notWant, out)
+			}
+		})
 	}
 }

@@ -136,16 +136,12 @@ func runStatus(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		observed:      st.Current,
 		stateAbsent:   stateAbsent,
 	}))
-	if attemptPresent {
-		// attemptTargetRelease comes from the marker itself, never from
-		// desired state or a fallback: the attempt knows where it
-		// started, and only that origin is a safe restore target.
-		printAttemptGuidance(attempt.FromRelease, env, stdout)
-	}
 	printGuidance(stdout, guidanceFacts{
 		degraded: degraded,
 		lock:     lock,
 		recovery: recoveryPresent,
+		attempt:  attemptPresent,
+		from:     attempt.FromRelease,
 		env:      env,
 	})
 	return exitOK
@@ -191,9 +187,18 @@ type guidanceFacts struct {
 	degraded bool
 	lock     bool
 	recovery bool
+	attempt  bool
+	from     string
 	env      string
 }
 
+// printGuidance owns exactly the same precedence as classifyState —
+// degraded, lock, recovery, attempt — so classification and instruction
+// cannot drift apart. Attempt rollback guidance appears ONLY when no
+// higher-priority fact says otherwise: suggesting a rollback while an
+// operation is in flight, while a recovery is unresolved, or while
+// evidence is unreadable would tell the operator to do exactly the
+// wrong thing.
 func printGuidance(stdout io.Writer, f guidanceFacts) {
 	switch {
 	case f.degraded:
@@ -215,6 +220,8 @@ func printGuidance(stdout io.Writer, f guidanceFacts) {
 		fmt.Fprintln(stdout, "     path cleans up the markers without executing hooks.")
 		fmt.Fprintln(stdout, "  3. Otherwise resolve the markers explicitly after verifying, then start a")
 		fmt.Fprintln(stdout, "     fresh recovery.")
+	case f.attempt:
+		printAttemptGuidance(f.from, f.env, stdout)
 	}
 }
 
@@ -243,6 +250,13 @@ func lockHeld(ctx context.Context, tgt *target.Target, dc *deploymentContext) (b
 		return false, err
 	}
 	return tgt.Exists(ctx, path)
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "(id unknown)"
+	}
+	return s
 }
 
 func orNone(s string) string {

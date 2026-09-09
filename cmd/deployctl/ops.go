@@ -153,22 +153,14 @@ func reportConnectFailure(err error, cmd, envName string, stderr io.Writer) int 
 	return exitInfra
 }
 
-// hasUnresolvedMarkers reports whether an attempt or recovery marker is
-// readable on the target. Used to classify an engine infrastructure
-// failure: the durable markers — not internal bookkeeping — decide
-// whether the consequential boundary may have been crossed. The engine
-// writes the marker before the first consequential stage, so an error
-// with no marker present means no consequential work was executed.
-func hasUnresolvedMarkers(ctx context.Context, tgt *target.Target, project, env string) bool {
-	if tgt == nil {
-		return false
-	}
-	if _, err := tgt.ReadAttempt(ctx, project, env); err == nil {
-		return true
-	}
-	_, err := tgt.ReadRecovery(ctx, project, env)
-	return err == nil
-}
+// hasUnresolvedMarkers has been removed deliberately: after an
+// infrastructure failure the markers must be read over the same
+// transport that just failed (or with the same context that was
+// cancelled), and a read error is not absence. The engine reports the
+// durable boundary itself — Report.ConsequentialStarted /
+// RollbackReport.RecoveryStarted — set immediately after the marker
+// write succeeds. Never infer the boundary by probing the target after
+// the fact.
 
 // prepareBundle is the prepare side at the command line: build the
 // canonical bundle for a release's pinned revision from a local checkout

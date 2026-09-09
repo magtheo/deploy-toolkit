@@ -243,3 +243,142 @@ func TestDeployHistoryWriteFailureAfterCommitIsExplicit(t *testing.T) {
 		t.Error("retry must not re-commit")
 	}
 }
+
+// The durable boundary must be reported by the ENGINE, never
+// reconstructed by probing the target after the failure: the probe
+// would travel over the same transport that just died (or the same
+// context that was cancelled), and a read error is not absence.
+func TestDeployInfraErrorCarriesDurableBoundary(t *testing.T) {
+	// Transport loss during apply — AFTER the marker write. The
+	// outcome is unknown; the report says so via ConsequentialStarted.
+	f := newFixture(t, "my-app", nil)
+	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+	tr := &failingRunTransport{
+		inner:    local.New(),
+		failWhen: func(argv0 string) bool { return strings.Contains(argv0, "apply.sh") },
+	}
+	tgt, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Deploy(t.Context(), DeployInput{
+		Target: tgt, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "1.0.0"), Release: rel, Bundle: bundleBytes, Owner: "test",
+	})
+	if err == nil || rep == nil {
+		t.Fatalf("rep, err = %+v, %v; want an infrastructure error with its report", rep, err)
+	}
+	if !rep.ConsequentialStarted {
+		t.Error("ConsequentialStarted = false, but the attempt marker was persisted before apply")
+	}
+	if rep.AttemptID == "" {
+		t.Error("AttemptID must be reported once the marker is written")
+	}
+	if rep.Committed {
+		t.Error("an interrupted apply must not report Committed")
+	}
+
+	// Transport loss during preflight — BEFORE the marker write: the
+	// boundary was NOT crossed; a rerun after infra repair is safe.
+	f2 := newFixture(t, "my-app", nil)
+	rel2, bundleBytes2 := f2.preparedBytes(t, "my-app", "1.0.0")
+	tr2 := &failingRunTransport{
+		inner:    local.New(),
+		failWhen: func(argv0 string) bool { return strings.Contains(argv0, "preflight.sh") },
+	}
+	tgt2, err := target.New(tr2, f2.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep2, err := Deploy(t.Context(), DeployInput{
+		Target: tgt2, TargetManifest: f2.targetManifest(),
+		Environment: f2.environment("my-app", "1.0.0"), Release: rel2, Bundle: bundleBytes2, Owner: "test",
+	})
+	if err == nil || rep2 == nil {
+		t.Fatalf("rep2, err = %+v, %v; want an infrastructure error with its report", rep2, err)
+	}
+	if rep2.ConsequentialStarted || rep2.AttemptID != "" {
+		t.Errorf("pre-boundary failure must not claim the boundary: %+v", rep2)
+	}
+}
+
+func TestRollbackInfraErrorCarriesDurableBoundary(t *testing.T) {
+	// Standard emergency shape: 1.0.0 healthy, 2.0.0 failed verify and
+	// left its attempt marker; the recovery restores 1.0.0.
+	f := newFixture(t, "my-app", versionTaggedHooks)
+	revA := f.revision
+	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB := secondRevision(t, f)
+	relB, bytesB := f.preparedBytesAt(t, revB, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "2.0.0"), Release: relB, Bundle: bytesB, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Transport dies during the from-release rollback hook — AFTER the
+	// recovery marker write. Uncertain, by the engine's own word.
+	tr := &failingRunTransport{
+		inner: local.New(),
+		failRunWhen: func(argv []string) bool {
+			return strings.Contains(argv[0], "rollback.sh")
+		},
+	}
+	tgt, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := rollbackInput(t, f, revB, "2.0.0", revA, "1.0.0", RollbackRecovery)
+	in.Target = tgt
+	rep, err := Rollback(t.Context(), in)
+	if err == nil || rep == nil {
+		t.Fatalf("rep, err = %+v, %v; want an infrastructure error with its report", rep, err)
+	}
+	if !rep.RecoveryStarted {
+		t.Error("RecoveryStarted = false, but the recovery marker was persisted before the rollback hook")
+	}
+	if rep.RecoveryID == "" {
+		t.Error("the recovery id must be reported once the marker is written")
+	}
+	if rep.Committed {
+		t.Error("an interrupted recovery must not report Committed")
+	}
+
+	// Transport dies during the To-release preflight — BEFORE the
+	// marker write: pre-boundary, retryable after infra repair.
+	f2 := newFixture(t, "my-app", versionTaggedHooks)
+	revA2 := f2.revision
+	if _, err := deploy(t, f2, "my-app", "1.0.0", nil); err != nil {
+		t.Fatal(err)
+	}
+	revB2 := secondRevision(t, f2)
+	relB2, bytesB2 := f2.preparedBytesAt(t, revB2, "my-app", "2.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f2.target, TargetManifest: f2.targetManifest(),
+		Environment: f2.environment("my-app", "2.0.0"), Release: relB2, Bundle: bytesB2, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tr2 := &failingRunTransport{
+		inner: local.New(),
+		failRunWhen: func(argv []string) bool {
+			return strings.Contains(argv[0], "preflight.sh")
+		},
+	}
+	tgt2, err := target.New(tr2, f2.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in2 := rollbackInput(t, f2, revB2, "2.0.0", revA2, "1.0.0", RollbackRecovery)
+	in2.Target = tgt2
+	rep2, err := Rollback(t.Context(), in2)
+	if err == nil || rep2 == nil {
+		t.Fatalf("rep2, err = %+v, %v; want an infrastructure error with its report", rep2, err)
+	}
+	if rep2.RecoveryStarted || rep2.RecoveryID != "" {
+		t.Errorf("pre-boundary failure must not claim the boundary: %+v", rep2)
+	}
+}

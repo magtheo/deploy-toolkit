@@ -73,8 +73,11 @@ type RollbackReport struct {
 	StagedTo         target.StageStatus
 	Stages           []StageResult
 	Committed        bool // observed state advanced to the To release
-	// RecoveryID is the id of the recovery marker this invocation wrote
-	// ("" when it only resolved an existing situation).
+	// RecoveryID is the id of the recovery this invocation reconciled:
+	// its own marker's id on the emergency path, or the pre-existing
+	// marker's id on the proven-committed (self-heal) path — not
+	// necessarily empty there. It is "" only when nothing was
+	// reconciled.
 	RecoveryID string
 	// RecoveryResolved: the deployment attempt marker being recovered was
 	// cleared at the trusted terminal (or by the self-heal path).
@@ -90,8 +93,16 @@ type RollbackReport struct {
 	// recovery marker exists and repeating consequential rollback work is
 	// not known-safe.
 	RecoveryRequired bool
-	HistorySeq       int64
-	FailureReason    string
+	// RecoveryStarted is the durable-boundary fact: the recovery marker
+	// was successfully persisted, so the rollback hook and the restored
+	// release's apply/verify may have begun. An infrastructure error
+	// with this flag set leaves the outcome UNKNOWN — uncertain, never
+	// safe-to-rerun — regardless of whether a later target read can
+	// still see the marker. Set immediately after the marker write
+	// succeeds.
+	RecoveryStarted bool
+	HistorySeq      int64
+	FailureReason   string
 }
 
 // Rollback is the explicit recovery operation. It is deliberately NOT a
@@ -115,8 +126,9 @@ type RollbackReport struct {
 //	  → From-release ROLLBACK hook (if its migration ran and hook declared)
 //	  → To-release APPLY → VERIFY (mandatory)
 //	  → COMMIT observed state = To release, signed recovery:<recoveryId>
-//	  → CLEAR attempt marker, then recovery marker (trusted terminal)
-//	  → APPEND structured rollback outcome
+//	  → CLEAR attempt marker, RECORD the rollback outcome, CLEAR the
+//	    recovery marker (evidence survives the last breadcrumb removed;
+//	    trusted terminal)
 //	  → RELEASE lock
 //
 // Failure semantics mirror Deploy's, one notch stricter: everything before
@@ -438,6 +450,7 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	}
 	rep.RecoveryID = recoveryID
 	rep.RecoveryMarkerCreated = true
+	rep.RecoveryStarted = true
 
 	// From-release ROLLBACK hook: undoes From-specific consequences —
 	// above all its own migration. It runs only if the failed release's

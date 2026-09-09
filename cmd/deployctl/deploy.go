@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
-	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
 // runDeploy executes a deployment of the release the environment pins.
@@ -70,10 +69,10 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 		Bundle:         bundleBytes,
 		Owner:          ownerID,
 	})
-	return reportDeploy(ctx, rep, err, tgt, stdout, stderr)
+	return reportDeploy(rep, err, stdout, stderr)
 }
 
-func reportDeploy(ctx context.Context, rep *lifecycle.Report, err error, tgt *target.Target, stdout, stderr io.Writer) int {
+func reportDeploy(rep *lifecycle.Report, err error, stdout, stderr io.Writer) int {
 	if err != nil {
 		env := "?"
 		if rep != nil {
@@ -82,13 +81,15 @@ func reportDeploy(ctx context.Context, rep *lifecycle.Report, err error, tgt *ta
 		fmt.Fprintf(stderr, "✗ deploy %s: infrastructure failure: %v\n", env, err)
 		switch {
 		case rep != nil && rep.Committed:
-			fmt.Fprintln(stderr, "  The observed state IS committed — the deployment itself succeeded.")
-			fmt.Fprintln(stderr, "  What failed is bookkeeping (marker/history cleanup): the leftover")
-			fmt.Fprintln(stderr, "  marker still blocks normal operation. Run `deployctl status` and")
-			fmt.Fprintln(stderr, "  follow its guidance.")
-		case rep != nil && hasUnresolvedMarkers(ctx, tgt, rep.Project, rep.Environment):
-			fmt.Fprintln(stderr, "  The outcome is UNCERTAIN: consequential deployment work may have")
-			fmt.Fprintln(stderr, "  executed (an attempt or recovery marker is unresolved).")
+			fmt.Fprintln(stderr, "  The observed state is committed; the deployment itself succeeded.")
+			fmt.Fprintln(stderr, "  Post-commit bookkeeping failed. Run `deployctl status` before")
+			fmt.Fprintln(stderr, "  taking another action.")
+		case rep != nil && rep.ConsequentialStarted:
+			id := rep.AttemptID
+			if id == "" {
+				id = "(id unknown)"
+			}
+			fmt.Fprintf(stderr, "  The outcome is UNCERTAIN: consequential deployment work may have\n  executed (attempt %s is unresolved).\n", id)
 			fmt.Fprintln(stderr, "  Do not retry. Run `deployctl status` and follow the recovery guidance.")
 		default:
 			fmt.Fprintln(stderr, "  No consequential work was executed — nothing was applied to the target.")
