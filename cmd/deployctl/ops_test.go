@@ -1699,11 +1699,14 @@ func TestCorruptEvidenceIsRefusalNotInfra(t *testing.T) {
 			if code != exitFailed {
 				t.Fatalf("human exit = %d", code)
 			}
-			if !strings.Contains(errOut, "invalid") || !strings.Contains(errOut, "repair") {
-				t.Errorf("human stderr lacks repair guidance:\n%s", errOut)
+			if !strings.Contains(errOut, "invalid") || !strings.Contains(errOut, "verify") {
+				t.Errorf("human stderr lacks inspect-and-verify guidance:\n%s", errOut)
 			}
-			if strings.Contains(errOut, "simply") || strings.Contains(errOut, "infrastructure failure") {
-				t.Errorf("human stderr misclassifies a refusal:\n%s", errOut)
+			if !strings.Contains(errOut, "Do NOT edit") {
+				t.Errorf("human stderr must forbid hand-editing observed state:\n%s", errOut)
+			}
+			if strings.Contains(errOut, "repair the damaged file by hand") || strings.Contains(errOut, "simply") || strings.Contains(errOut, "infrastructure failure") {
+				t.Errorf("human stderr misclassifies a refusal or invites hand-editing:\n%s", errOut)
 			}
 		})
 	}
