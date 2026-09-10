@@ -31,8 +31,13 @@ type StageResult struct {
 	// target, and no exit code exists. Evidence renders this as an
 	// infrastructure error, never as an exit code.
 	InfraError bool
-	Stdout     []byte
-	Stderr     []byte
+	// Unknown marks a stage whose execution fate is RunUnknown: the
+	// process may still be running and no exit code will ever arrive.
+	// This — not arbitrary transport trouble — is the fact that forces
+	// the environment lock to be retained.
+	Unknown bool
+	Stdout  []byte
+	Stderr  []byte
 }
 
 // Report describes one deployment attempt. A completed attempt with a
@@ -64,6 +69,14 @@ type Report struct {
 	AttemptID     string
 	HistorySeq    int64
 	FailureReason string
+	// LockRetained records that the invocation deliberately did NOT
+	// release its acquired environment lock because a lifecycle hook's
+	// execution fate was RunUnknown — the hook process may still be
+	// running. This is a controlled crash: the environment stays locked
+	// pending human verification of the target, exactly as after a
+	// controller crash. It is never set for a lock-release ATTEMPT that
+	// failed (that surfaces as a joined error, a different situation).
+	LockRetained bool
 }
 
 // DeployInput carries the desired state (parsed through the manifest
@@ -133,7 +146,15 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	if err != nil {
 		return rep, err
 	}
+	// releaseLock is lifecycle-local retain state: the lock is released
+	// on every return path EXCEPT when a hook's execution fate was
+	// RunUnknown. EnvLock.Release stays literal — "attempt to remove the
+	// lock" — and is simply never called for a deliberate retention.
+	releaseLock := true
 	defer func() {
+		if !releaseLock {
+			return
+		}
 		// Cleanup must survive a cancelled deploy context but must not run
 		// unbounded: a fresh, bounded context. Lock-release failure is a
 		// hard failure — the environment is blocked until an operator
@@ -313,8 +334,17 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}
 
 	// Exit codes are hook outcomes; Run errors are infrastructure errors.
+	// A RunUnknown fate additionally retains the environment lock — for
+	// EVERY hook, including preflight: the hook-execution boundary and
+	// the durable attempt boundary are different, and a possibly-still-
+	// running preflight process is exactly what the lock exists to guard.
 	runStage := func(name string, step *manifest.LifecycleStep) (StageResult, error) {
-		return runStageStep(ctx, in.Target.Transport(), name, releaseDir, henv, step)
+		sr, err := runStageStep(ctx, in.Target.Transport(), name, releaseDir, henv, step)
+		if sr.Unknown {
+			releaseLock = false
+			rep.LockRetained = true
+		}
+		return sr, err
 	}
 
 	// Staging is non-impacting; preflight decides whether the staged
@@ -363,6 +393,11 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	sr, ierr = runStage("migrate", migrateStep)
 	rep.Stages = append(rep.Stages, sr)
 	if ierr != nil {
+		if sr.Unknown {
+			// The attempt marker exists (written before this stage), so
+			// recovery is required as a matter of fact, not of caution.
+			rep.RecoveryRequired = true
+		}
 		return failInfra("migrate could not be executed", ierr)
 	}
 	if sr.Failed {
@@ -372,6 +407,9 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	sr, ierr = runStage("apply", stagedProject.Lifecycle.Apply)
 	rep.Stages = append(rep.Stages, sr)
 	if ierr != nil {
+		if sr.Unknown {
+			rep.RecoveryRequired = true
+		}
 		return failInfra("apply could not be executed", ierr)
 	}
 	if sr.Failed {
@@ -381,6 +419,9 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	sr, ierr = runStage("verify", stagedProject.Lifecycle.Verify)
 	rep.Stages = append(rep.Stages, sr)
 	if ierr != nil {
+		if sr.Unknown {
+			rep.RecoveryRequired = true
+		}
 		return failInfra("verify could not be executed", ierr)
 	}
 	if sr.Failed {

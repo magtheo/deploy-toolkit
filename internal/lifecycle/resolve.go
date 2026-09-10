@@ -140,7 +140,10 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	})
 	if err != nil {
 		if errors.Is(err, ErrEnvLockHeld) {
-			return rep, refuseResolve("acquire environment lock: %v", err)
+			// Refusal classification, but keep BOTH sentinels
+			// reachable: the held-lock fact must survive for callers
+			// that classify by errors.Is.
+			return rep, fmt.Errorf("acquire environment lock: %w: %w", err, ErrResolveRefused)
 		}
 		return rep, fmt.Errorf("acquire environment lock: %w", err)
 	}

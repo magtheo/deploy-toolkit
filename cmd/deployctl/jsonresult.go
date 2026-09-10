@@ -121,14 +121,20 @@ func usageErrorResult(command, envName, message string) *resultEnvelope {
 // ---- deploy ------------------------------------------------------------
 
 type deployResultData struct {
-	Committed            bool           `json:"committed"`
-	AlreadyCurrent       bool           `json:"alreadyCurrent"`
-	ConsequentialStarted bool           `json:"consequentialStarted"`
-	AttemptID            string         `json:"attemptId,omitempty"`
-	Version              string         `json:"version,omitempty"`
-	BundleDigest         string         `json:"bundleDigest,omitempty"`
-	FailureReason        string         `json:"failureReason,omitempty"`
-	Stages               []stageOutcome `json:"stages,omitempty"`
+	Committed            bool `json:"committed"`
+	AlreadyCurrent       bool `json:"alreadyCurrent"`
+	ConsequentialStarted bool `json:"consequentialStarted"`
+	// LockRetained (compatible v1 extension): the invocation
+	// deliberately did not release its acquired environment lock
+	// because a lifecycle hook's execution fate could not be
+	// established. Verify the target, remove the lock by hand, then
+	// resolve any marker; see cli-v1.md.
+	LockRetained  bool           `json:"lockRetained,omitempty"`
+	AttemptID     string         `json:"attemptId,omitempty"`
+	Version       string         `json:"version,omitempty"`
+	BundleDigest  string         `json:"bundleDigest,omitempty"`
+	FailureReason string         `json:"failureReason,omitempty"`
+	Stages        []stageOutcome `json:"stages,omitempty"`
 }
 
 func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
@@ -142,6 +148,7 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 			Committed:            rep.Committed,
 			AlreadyCurrent:       rep.AlreadyCurrent,
 			ConsequentialStarted: rep.ConsequentialStarted,
+			LockRetained:         rep.LockRetained,
 			AttemptID:            rep.AttemptID,
 			Version:              rep.Version,
 			BundleDigest:         rep.BundleDigest,
@@ -181,6 +188,17 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 			env.RecoveryRequired = true
 			env.SafeToRetry = false
 			env.Message = "outcome uncertain: consequential deployment work may have executed (attempt " + orNone(rep.AttemptID) + " unresolved)"
+			if rep.LockRetained {
+				env.Message += " — the environment lock was deliberately retained because a hook's execution fate could not be established; verify the target, remove the lock, then resolve the attempt"
+			}
+		case rep != nil && rep.LockRetained:
+			// Pre-boundary unknown fate: still possibly-running work,
+			// so the lock survives and retrying is NOT safe — but no
+			// attempt marker exists, so this is infrastructure-failure
+			// shape, not uncertain.
+			env.Outcome = outcomeInfraFailed
+			env.SafeToRetry = false
+			env.Message = "infrastructure failure: a lifecycle hook's execution fate could not be established — the environment lock was deliberately retained; verify no hook is still executing, remove the lock, then retry deliberately: " + err.Error()
 		default:
 			env.Outcome = outcomeInfraFailed
 			env.SafeToRetry = true
@@ -205,14 +223,16 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 // ---- rollback ----------------------------------------------------------
 
 type rollbackResultData struct {
-	Committed            bool           `json:"committed"`
-	AlreadyRecovered     bool           `json:"alreadyRecovered"`
-	ConsequentialStarted bool           `json:"recoveryStarted"`
-	RecoveryID           string         `json:"recoveryId,omitempty"`
-	FromVersion          string         `json:"fromVersion,omitempty"`
-	ToVersion            string         `json:"toVersion,omitempty"`
-	FailureReason        string         `json:"failureReason,omitempty"`
-	Stages               []stageOutcome `json:"stages,omitempty"`
+	Committed            bool `json:"committed"`
+	AlreadyRecovered     bool `json:"alreadyRecovered"`
+	ConsequentialStarted bool `json:"recoveryStarted"`
+	// LockRetained (compatible v1 extension): mirror of deploy.
+	LockRetained  bool           `json:"lockRetained,omitempty"`
+	RecoveryID    string         `json:"recoveryId,omitempty"`
+	FromVersion   string         `json:"fromVersion,omitempty"`
+	ToVersion     string         `json:"toVersion,omitempty"`
+	FailureReason string         `json:"failureReason,omitempty"`
+	Stages        []stageOutcome `json:"stages,omitempty"`
 }
 
 func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, int) {
@@ -226,6 +246,7 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 			Committed:            rep.Committed,
 			AlreadyRecovered:     rep.AlreadyRecovered,
 			ConsequentialStarted: rep.RecoveryStarted,
+			LockRetained:         rep.LockRetained,
 			RecoveryID:           rep.RecoveryID,
 			FromVersion:          rep.FromVersion,
 			ToVersion:            rep.ToVersion,
@@ -260,7 +281,16 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 		case rep != nil && rep.RecoveryStarted:
 			env.Outcome = outcomeUncertain
 			env.RecoveryRequired = true
+			env.SafeToRetry = false
 			env.Message = "outcome uncertain: consequential recovery work may have executed (recovery " + orNone(rep.RecoveryID) + " unresolved)"
+			if rep.LockRetained {
+				env.Message += " — the environment lock was deliberately retained because a hook's execution fate could not be established; verify the target, remove the lock, then resolve the recovery"
+			}
+		case rep != nil && rep.LockRetained:
+			// Pre-boundary unknown fate (mirror of deploy).
+			env.Outcome = outcomeInfraFailed
+			env.SafeToRetry = false
+			env.Message = "infrastructure failure: a lifecycle hook's execution fate could not be established — the environment lock was deliberately retained; verify no hook is still executing, remove the lock, then retry deliberately: " + err.Error()
 		default:
 			env.Outcome = outcomeInfraFailed
 			env.SafeToRetry = true

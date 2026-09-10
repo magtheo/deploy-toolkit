@@ -92,7 +92,11 @@ func runStageStep(ctx context.Context, tr transport.Transport, name, dir string,
 	}
 	res, err := tr.Run(ctx, transport.RunRequest{Argv: step.Argv, Dir: dir, Env: henv})
 	if err != nil {
-		return StageResult{Name: name, Failed: true, InfraError: true}, err
+		// Fate, not error identity, decides safety: RunUnknown means
+		// the hook process may still be running (cancellation,
+		// transport loss, bounded pipe wait). StartError and
+		// validation failures are known non-running fates.
+		return StageResult{Name: name, Failed: true, InfraError: true, Unknown: res.Fate == transport.RunUnknown}, err
 	}
 	return StageResult{
 		Name:     name,

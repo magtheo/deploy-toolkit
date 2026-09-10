@@ -151,6 +151,51 @@ Automation must treat post-boundary `failure` and `uncertain` alike as
 “find the marker, resolve deliberately” — never as “rerun and
 see”.
 
+### `lockRetained` (v1 additive extension)
+
+Deploy and rollback may emit `data.lockRetained: true`. Per the
+versioning policy this is a **compatible** addition (an optional
+field); v1 automations that do not know it see it as absent.
+
+```text
+lockRetained = true
+
+The invocation deliberately did NOT release its acquired
+environment lock because a lifecycle hook's execution fate
+could not be established (context cancellation, transport
+loss mid-run, or a bounded pipe wait). The hook process may
+still be running.
+```
+
+It is a **controlled crash**: the environment lock — the mechanism
+that already makes a controller crash fail closed — is deliberately
+left in place, so no second operation can start while the old hook's
+process may still exist. No transport can prove that a process, let
+alone a descendant tree, has stopped; the toolkit never claims it.
+
+The remedy is always the same, in this order:
+
+```text
+verify the target by hand (nothing still executing)
+        ↓
+remove the environment lock by hand
+        ↓
+resolve the attempt/recovery marker if one exists
+(recoveryRequired carries that fact)
+```
+
+`lockRetained` may accompany either classification of unknown hook
+fate:
+
+| Situation                                             | Outcome                  | `recoveryRequired` | `safeToRetry` | `lockRetained` |
+| ----------------------------------------------------- | ------------------------ | ------------------ | ------------- | -------------- |
+| hook fate unknown before the durable attempt boundary | `infrastructure-failure` | `false`            | `false`       | `true`         |
+| hook fate unknown after the boundary                  | `uncertain`              | `true`             | `false`       | `true`         |
+
+`lockRetained` is deliberately **not** set when a lock-release attempt
+failed — that is a different situation and surfaces as a joined
+failure, never as deliberate retention.
+
 ### Evidence taxonomy (recovery resolve preflight)
 
 ```text
@@ -176,6 +221,7 @@ absent means unset/zero, which for booleans means `false`.
   "committed":            false,  // (always) observed state committed
   "alreadyCurrent":       false,  // (always) requested release already current
   "consequentialStarted": false,  // (always) durable attempt marker written
+  "lockRetained":         false,  // (v1 additive; present only when true)
   "attemptId":            "...",  // boundary identity, when written
   "version":              "1.0.0",
   "bundleDigest":         "sha256:...",
@@ -197,6 +243,7 @@ names are non-contract (see below); the `status` enum is not.
   "committed":        false,  // (always) restored state committed
   "alreadyRecovered": false,  // (always) recovery already committed; nothing executed
   "recoveryStarted":  false,  // (always) durable recovery marker written
+  "lockRetained":     false,  // (v1 additive; present only when true)
   "recoveryId":       "...",  // boundary identity, when written
   "fromVersion":      "2.0.0",
   "toVersion":        "1.0.0",
@@ -204,6 +251,7 @@ names are non-contract (see below); the `status` enum is not.
   "stages":           [ ]
 }
 ```
+
 
 ### `status`
 

@@ -227,6 +227,15 @@ func reportRollback(rep *lifecycle.RollbackReport, err error, envName string, st
 		}
 		fmt.Fprintf(stderr, "✗ rollback %s: infrastructure failure: %v\n", envName, err)
 		switch {
+		case rep != nil && rep.LockRetained:
+			fmt.Fprintln(stderr, "  A lifecycle hook's execution fate could not be established: the hook")
+			fmt.Fprintln(stderr, "  process may still be running. The environment lock was deliberately")
+			fmt.Fprintln(stderr, "  retained. Verify the target — nothing may still be executing — and")
+			fmt.Fprintln(stderr, "  only then remove the lock by hand and proceed deliberately.")
+			if rep.RecoveryStarted {
+				fmt.Fprintln(stderr, "  A recovery marker is unresolved: run the recovery after cleanup.")
+			}
+			return exitInfra
 		case rep != nil && rep.Committed:
 			fmt.Fprintln(stderr, "  The observed state is committed; the recovery itself succeeded.")
 			fmt.Fprintln(stderr, "  Post-commit bookkeeping failed. Run `deployctl status` before")

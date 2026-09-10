@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/magtheo/deploy-toolkit/internal/transport"
 )
@@ -105,16 +107,22 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 	return nil
 }
 
+// runWaitDelay bounds how long Wait may be kept open by processes
+// still holding inherited stdout/stderr pipes after the direct child
+// is gone (cancelled, or exited while a descendant keeps the pipe
+// open). Var for test overriding.
+var runWaitDelay = 5 * time.Second
+
 func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
 	if ctx.Err() != nil {
-		return transport.RunResult{}, ctx.Err()
+		return transport.RunResult{Fate: transport.RunNotStarted}, ctx.Err()
 	}
 	if err := transport.ValidateRunRequest(req); err != nil {
-		return transport.RunResult{}, err
+		return transport.RunResult{Fate: transport.RunNotStarted}, err
 	}
 	dir, err := transport.ValidateAbsolutePath(req.Dir)
 	if err != nil {
-		return transport.RunResult{}, &transport.StartError{Err: fmt.Errorf("working directory: %w", err)}
+		return transport.RunResult{Fate: transport.RunNotStarted}, &transport.StartError{Err: fmt.Errorf("working directory: %w", err)}
 	}
 	cmd := exec.CommandContext(ctx, req.Argv[0], req.Argv[1:]...)
 	cmd.Dir = dir
@@ -125,24 +133,48 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 		}
 		cmd.Env = env
 	}
+	// Own process group + group SIGKILL on cancellation: the default
+	// exec.CommandContext cancellation kills ONLY the direct child,
+	// leaving grandchildren running (verified). Group kill is still
+	// best-effort — a descendant that escaped the group via setsid is
+	// NOT covered, so cancellation remains fate RunUnknown, never a
+	// claimed termination.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// A cancelled or exited child whose descendants hold the inherited
+	// pipes would otherwise block Wait forever (verified M1-9 hang):
+	// WaitDelay bounds it. Expiry makes the fate unknown, not negative.
+	cmd.WaitDelay = runWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		// fork/exec failed synchronously: definitively nothing ran.
+		return transport.RunResult{Fate: transport.RunNotStarted}, &transport.StartError{Err: fmt.Errorf("start %s in %s: %w", req.Argv[0], dir, err)}
+	}
+	runErr := cmd.Wait()
+	// Cancellation is checked FIRST: the group SIGKILL surfaces as an
+	// ExitError ("signal: killed"), which must never be mistaken for a
+	// determined hook exit. A cancellation — even one racing a genuine
+	// exit — leaves the tree's fate unknowable (setsid escape is
+	// undetectable), so the fate is RunUnknown and the error is the
+	// context error, never a manufactured exit code.
 	if ctx.Err() != nil {
-		return transport.RunResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
+		return transport.RunResult{Fate: transport.RunUnknown, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
 	}
-	res := transport.RunResult{
-		ExitCode: 0,
-		Stdout:   stdout.Bytes(),
-		Stderr:   stderr.Bytes(),
+	if runErr == nil {
+		return transport.RunResult{Fate: transport.RunExited, ExitCode: 0, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, nil
 	}
-	if runErr != nil {
-		exitErr, ok := runErr.(*exec.ExitError)
-		if !ok {
-			return transport.RunResult{Stdout: res.Stdout, Stderr: res.Stderr}, &transport.StartError{Err: fmt.Errorf("start %s in %s: %w", req.Argv[0], dir, runErr)}
-		}
-		res.ExitCode = exitErr.ExitCode()
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		// Determined nonzero exit (including external kills): an
+		// observable hook outcome, not an error return (the lifecycle
+		// reads the exit code).
+		return transport.RunResult{Fate: transport.RunExited, ExitCode: exitErr.ExitCode(), Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, nil
 	}
-	return res, nil
+	// WaitDelay expiry while a pipe-holder survives, or an unexpected
+	// Wait error: the process tree's fate cannot be established.
+	return transport.RunResult{Fate: transport.RunUnknown, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, fmt.Errorf("run %s: %w", req.Argv[0], runErr)
 }

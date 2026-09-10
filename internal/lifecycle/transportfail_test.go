@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +21,12 @@ type failingRunTransport struct {
 	failRunWhen func(argv []string) bool // finer-grained: matches the full argv
 	failPut     bool
 	failPutWhen func(path string) bool
+	// fate reported with injected Run errors. nil means RunUnknown —
+	// the honest default: "connection died mid-deployment" happened
+	// AFTER the request was dispatched, so the fate is unknown, never
+	// provably not-started. Set fate explicitly (pointer) to inject the
+	// not-started flavor.
+	fate *transport.RunFate
 }
 
 func (t *failingRunTransport) Put(ctx context.Context, req transport.PutRequest) error {
@@ -30,11 +37,15 @@ func (t *failingRunTransport) Put(ctx context.Context, req transport.PutRequest)
 }
 
 func (t *failingRunTransport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
+	fate := transport.RunUnknown
+	if t.fate != nil {
+		fate = *t.fate
+	}
 	if t.failWhen != nil && t.failWhen(req.Argv[0]) {
-		return transport.RunResult{}, fmt.Errorf("ssh connection died mid-deployment")
+		return transport.RunResult{Fate: fate}, fmt.Errorf("ssh connection died mid-deployment")
 	}
 	if t.failRunWhen != nil && t.failRunWhen(req.Argv) {
-		return transport.RunResult{}, fmt.Errorf("ssh connection died mid-deployment")
+		return transport.RunResult{Fate: fate}, fmt.Errorf("ssh connection died mid-deployment")
 	}
 	return t.inner.Run(ctx, req)
 }
@@ -61,7 +72,7 @@ func (t *hangingTransport) ProbePath(ctx context.Context, path string) (transpor
 func (t *hangingTransport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
 	if req.Argv[0] == t.hang {
 		<-ctx.Done()
-		return transport.RunResult{}, ctx.Err()
+		return transport.RunResult{Fate: transport.RunUnknown}, ctx.Err()
 	}
 	return t.inner.Run(ctx, req)
 }
@@ -102,6 +113,12 @@ func TestDeployTransportFailureIsInfraError(t *testing.T) {
 	if rep == nil || rep.Committed {
 		t.Errorf("rep = %+v, want uncommitted report", rep)
 	}
+	if !rep.LockRetained {
+		t.Errorf("rep = %+v, want the lock deliberately retained: a mid-run transport death leaves the hook's fate unknown", rep)
+	}
+	if _, statErr := os.Stat(f.lockDir()); statErr != nil {
+		t.Errorf("environment lock must survive an unknown-fate hook (stat err = %v)", statErr)
+	}
 	// The infrastructure failure is still recorded as a fact — and the
 	// evidence model is truthful: apply produced NO exit code.
 	records := history(t, f)
@@ -120,7 +137,6 @@ func TestDeployTransportFailureIsInfraError(t *testing.T) {
 	if pf, _ := stages["preflight"].(map[string]any); pf == nil || fmt.Sprint(pf["exit"]) != "0" {
 		t.Errorf("preflight in history = %#v, want exit 0", stages["preflight"])
 	}
-	requireNoLock(t, f)
 }
 
 func TestDeployLockReleaseFailureJoinsWithExistingError(t *testing.T) {

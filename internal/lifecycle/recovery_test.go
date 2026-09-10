@@ -169,10 +169,20 @@ func TestDeployTransportLossDuringApplyLeavesUnresolvedAttempt(t *testing.T) {
 	if !attemptPresent(t, f) {
 		t.Fatal("uncertain apply outcome must leave the attempt marker behind")
 	}
+	// The unknown fate also retains the environment lock: a controlled
+	// crash. The retry refuses on the held lock BEFORE anything runs.
+	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	if !errors.Is(err, ErrEnvLockHeld) {
+		t.Fatalf("retry err = %v, want held-lock refusal while the retained lock exists", err)
+	}
+	// Operator procedure: verify the target, remove the lock by hand.
+	if err := os.RemoveAll(f.lockDir()); err != nil {
+		t.Fatal(err)
+	}
 	// Like any failure after the marker exists, the transport loss keeps
 	// the marker; only committed observed state or explicit recovery
-	// removes it. A normal retry therefore refuses.
-	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	// removes it. The retry now refuses on the unresolved attempt.
+	rep, err = deploy(t, f, "my-app", "1.0.0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -183,10 +183,22 @@ Rules (v1 promise):
     sees the failed release's identity (it is that release's undo), while
     the restored release's `preflight`/`apply`/`verify` see the restored
     release's identity.
+- **Hooks are synchronous operations.** A hook must not return while
+  unmanaged work it launched can continue changing deployment state
+  (`start-worker & exit 0` violates this contract). Delegating to a
+  supervisor is fine — `systemctl restart …`, `docker compose up -d …` —
+  because the hook's semantic operation is *instructing the supervisor*,
+  and `verify` subsequently establishes the required application state.
+  Deploy Toolkit cannot and does not prove that arbitrary descendant
+  processes have stopped; this contract is what makes "exit code
+  observed" mean "this stage is finished".
 - Lifecycle execution holds a **cross-process, target-scoped environment
   lock** for the whole sequence (atomic `mkdir` on the target; a held lock
   fails closed; no stale-lock breaking — a crashed runner leaves the lock
-  for explicit operator removal).
+  for explicit operator removal). The lock is also **deliberately
+  retained** when a hook's execution fate cannot be established
+  (cancellation, transport loss mid-run) — a controlled crash; see
+  `data.lockRetained` in `docs/cli-v1.md`.
 - History records **structured stage outcomes** (stage name, exit code,
   release identity, digests, timestamps) — never raw hook stdout/stderr,
   which may contain application secrets. Raw output is not persisted by

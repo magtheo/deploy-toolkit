@@ -122,51 +122,110 @@ func ParsePrivateKey(data []byte) (gossh.Signer, error) {
 
 func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
 	if ctx.Err() != nil {
-		return transport.RunResult{}, ctx.Err()
+		return transport.RunResult{Fate: transport.RunNotStarted}, ctx.Err()
 	}
 	if err := transport.ValidateRunRequest(req); err != nil {
-		return transport.RunResult{}, err
+		return transport.RunResult{Fate: transport.RunNotStarted}, err
 	}
 	dir, err := transport.ValidateAbsolutePath(req.Dir)
 	if err != nil {
-		return transport.RunResult{}, &transport.StartError{Err: fmt.Errorf("working directory: %w", err)}
+		return transport.RunResult{Fate: transport.RunNotStarted}, &transport.StartError{Err: fmt.Errorf("working directory: %w", err)}
 	}
 	command, err := buildCommand(dir, req.Env, req.Argv)
 	if err != nil {
-		return transport.RunResult{}, err
+		return transport.RunResult{Fate: transport.RunNotStarted}, err
 	}
 	session, err := t.conn.NewSession()
 	if err != nil {
-		return transport.RunResult{}, fmt.Errorf("ssh: open session: %w", err)
+		// No session exists, so no exec request was ever sent.
+		return transport.RunResult{Fate: transport.RunNotStarted}, fmt.Errorf("ssh: open session: %w", err)
 	}
 	defer session.Close()
 
 	var stdout, stderr bytes.Buffer
 	session.Stdout = &stdout
 	session.Stderr = &stderr
-	done := make(chan error, 1)
-	go func() { done <- session.Run(command) }()
+
+	// Outcome of the two execution phases, from the worker goroutine.
+	type sshOutcome struct {
+		startErr error // Start phase failed (exec request never confirmed)
+		waitErr  error // Wait phase result (empty when startErr != nil)
+	}
+	done := make(chan sshOutcome, 1)
+	go func() {
+		if serr := session.Start(command); serr != nil {
+			done <- sshOutcome{startErr: serr}
+			return
+		}
+		done <- sshOutcome{waitErr: session.Wait()}
+	}()
 
 	select {
 	case <-ctx.Done():
+		// Control-plane cancellation only (verified against OpenSSH):
+		// closing the session/channel does NOT terminate the remote
+		// process, and no signal is delivered. The exec request was
+		// sent (Start had returned) or is in flight — either way the
+		// remote fate is unknowable, never a claimed termination.
 		session.Close()
 		<-done
-		return transport.RunResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
-	case err := <-done:
-		res := transport.RunResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
-		if err == nil {
-			return res, nil
+		return transport.RunResult{Fate: transport.RunUnknown, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
+	case out := <-done:
+		if out.startErr == nil {
+			return t.runOutcome(req, out.waitErr, stdout, stderr)
 		}
-		exitErr, ok := err.(*gossh.ExitError)
-		if !ok {
-			return res, fmt.Errorf("ssh: run: %w", err)
+		// The exec request failed. x/crypto folds two very different
+		// cases into one error: (a) the server explicitly REJECTED the
+		// exec request — nothing started; (b) the connection died while
+		// the request was in flight — the command may be running.
+		// Distinguish by connection liveness: a dead connection fails
+		// this probe too, so case (b) can only ever classify as
+		// RunUnknown, never as RunNotStarted.
+		if err := t.alive(); err != nil {
+			return transport.RunResult{Fate: transport.RunUnknown, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, fmt.Errorf("ssh: exec %s: %w", req.Argv[0], out.startErr)
 		}
-		res.ExitCode = exitErr.ExitStatus()
-		if res.ExitCode == 126 || res.ExitCode == 127 {
-			return res, &transport.StartError{ExitCode: res.ExitCode, Err: fmt.Errorf("target dispatch failed for %s in %s", req.Argv[0], dir)}
+		// Healthy connection + Start failure = rejection, or a rare
+		// post-accept local setup failure. Only the library's exact
+		// rejection shape counts as proven not-started; everything else
+		// stays conservatively unknown. (Pinned by test against the
+		// vendored x/crypto version.)
+		if out.startErr.Error() == fmt.Sprintf("ssh: command %v failed", command) {
+			return transport.RunResult{Fate: transport.RunNotStarted}, &transport.StartError{Err: fmt.Errorf("ssh: exec request rejected for %s", req.Argv[0])}
 		}
+		return transport.RunResult{Fate: transport.RunUnknown, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, fmt.Errorf("ssh: exec %s: %w", req.Argv[0], out.startErr)
+	}
+}
+
+// runOutcome maps a completed session.Wait into the fate contract: an
+// observed exit code is determined (RunExited) — including the SSH
+// 126/127 dispatch convention surfaced as StartError — while any other
+// Wait error means the channel died mid-run and the remote fate is
+// unknowable (RunUnknown).
+func (t *Transport) runOutcome(req transport.RunRequest, waitErr error, stdout, stderr bytes.Buffer) (transport.RunResult, error) {
+	res := transport.RunResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
+	if waitErr == nil {
+		res.Fate = transport.RunExited
 		return res, nil
 	}
+	exitErr, ok := waitErr.(*gossh.ExitError)
+	if !ok {
+		res.Fate = transport.RunUnknown
+		return res, fmt.Errorf("ssh: run: %w", waitErr)
+	}
+	res.Fate = transport.RunExited
+	res.ExitCode = exitErr.ExitStatus()
+	if res.ExitCode == 126 || res.ExitCode == 127 {
+		return res, &transport.StartError{ExitCode: res.ExitCode, Err: fmt.Errorf("target dispatch failed for %s", req.Argv[0])}
+	}
+	return res, nil
+}
+
+// alive probes whether the underlying SSH connection is still usable.
+// It sends a ignore-style request that no server acts on; failure means
+// the transport is dead.
+func (t *Transport) alive() error {
+	_, _, err := t.conn.SendRequest("keepalive@openssh.com", false, nil)
+	return err
 }
 
 // Put stages req.Content atomically at req.Path via a dedicated SFTP

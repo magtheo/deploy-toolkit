@@ -67,10 +67,48 @@ type RunRequest struct {
 }
 
 type RunResult struct {
+	// Fate is the execution-fate fact carried by EVERY Run return,
+	// including error returns. The lifecycle must never infer "may
+	// still be running" from arbitrary Go errors — it reads this
+	// field. See the RunFate contract.
+	Fate RunFate
+
+	// ExitCode is meaningful only when Fate == RunExited.
 	ExitCode int
 	Stdout   []byte
 	Stderr   []byte
 }
+
+// RunFate states what is KNOWN about the execution of a Run request.
+// It is the safety input for the lifecycle's lock policy: an
+// environment lock must be retained exactly when a started hook's fate
+// is RunUnknown, because no transport can prove that a process — let
+// alone a descendant tree — has stopped.
+//
+// Every Run return carries a meaningful Fate, even alongside an error:
+//
+//   - RunNotStarted: no execution could have begun. Request validation
+//     failed before anything was attempted, or the start itself
+//     definitively failed (local fork/exec error; explicit exec-request
+//     rejection over SSH). Nothing is running because of this call.
+//   - RunExited: the command reached a determined exit — an exit code
+//     was observed (including nonzero, and including SSH 126/127
+//     dispatch conventions). The direct command is finished; the
+//     synchronous-hook contract (Consumer Contract v1) is what rules
+//     out unmanaged descendants, not this fact alone.
+//   - RunUnknown: execution MAY have begun and its fate cannot be
+//     established: context cancellation after start, transport or
+//     connection loss mid-run, an ambiguous exec request, or a local
+//     Wait bounded by WaitDelay while a pipe-holding process survives.
+//     Callers must treat the process as possibly still running: retain
+//     the environment lock, never manufacture an exit code.
+type RunFate int
+
+const (
+	RunNotStarted RunFate = iota
+	RunExited
+	RunUnknown
+)
 
 // StartError marks a target-side start failure: the requested program or
 // working directory could not be used. Local transports observe this
