@@ -58,3 +58,33 @@ func TestRunExitIsExitedFate(t *testing.T) {
 		t.Errorf("res = %+v err = %v, want RunExited 3", res, err)
 	}
 }
+
+// Explicit server-side rejection of the exec request is the one
+// provable not-started shape over SSH: the server saw the request and
+// said no, so nothing is running and the lock may be released. Pinned
+// because RunNotStarted authorizes lock release.
+func TestRunExecRejectionIsNotStarted(t *testing.T) {
+	signer := clientSigner(t)
+	ts := startTestServer(t, signer.PublicKey())
+	ts.rejectExec = true
+	tr, err := dialTransport(t, ts, signer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	res, err := tr.Run(context.Background(), transport.RunRequest{
+		Argv: []string{"true"},
+		Dir:  "/tmp",
+	})
+	if err == nil {
+		t.Fatal("err = nil, want the rejection StartError")
+	}
+	if res.Fate != transport.RunNotStarted {
+		t.Errorf("fate = %v, want RunNotStarted", res.Fate)
+	}
+	var startErr *transport.StartError
+	if !errors.As(err, &startErr) {
+		t.Errorf("err = %v (%T), want a StartError", err, err)
+	}
+}

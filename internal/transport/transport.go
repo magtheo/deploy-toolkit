@@ -85,29 +85,39 @@ type RunResult struct {
 // is RunUnknown, because no transport can prove that a process — let
 // alone a descendant tree — has stopped.
 //
+// RunUnknown is deliberately the ZERO value: a transport that forgets
+// to set Fate fails closed (lock retained), never open. The lifecycle
+// additionally validates fate/error combinations, so an implementation
+// that violates this contract cannot manufacture a releasable outcome.
+//
 // Every Run return carries a meaningful Fate, even alongside an error:
 //
 //   - RunNotStarted: no execution could have begun. Request validation
 //     failed before anything was attempted, or the start itself
 //     definitively failed (local fork/exec error; explicit exec-request
 //     rejection over SSH). Nothing is running because of this call.
+//     Must accompany a non-nil error.
 //   - RunExited: the command reached a determined exit — an exit code
 //     was observed (including nonzero, and including SSH 126/127
 //     dispatch conventions). The direct command is finished; the
 //     synchronous-hook contract (Consumer Contract v1) is what rules
-//     out unmanaged descendants, not this fact alone.
+//     out unmanaged descendants, not this fact alone. May accompany an
+//     error (SSH 126/127 dispatch StartError).
 //   - RunUnknown: execution MAY have begun and its fate cannot be
 //     established: context cancellation after start, transport or
 //     connection loss mid-run, an ambiguous exec request, or a local
 //     Wait bounded by WaitDelay while a pipe-holding process survives.
 //     Callers must treat the process as possibly still running: retain
-//     the environment lock, never manufacture an exit code.
+//     the environment lock, never manufacture an exit code. Must
+//     accompany a non-nil error.
 type RunFate int
 
 const (
-	RunNotStarted RunFate = iota
+	// RunUnknown is the zero value: fate defaults to the conservative
+	// state, so an omitted Fate can never authorize lock release.
+	RunUnknown RunFate = iota
+	RunNotStarted
 	RunExited
-	RunUnknown
 )
 
 // StartError marks a target-side start failure: the requested program or

@@ -241,3 +241,74 @@ func TestDeterminedFailureReleasesLock(t *testing.T) {
 	}
 	requireNoLock(t, f)
 }
+
+// contractViolator returns an arbitrary (res, err) pair for matching
+// hooks — the transport-contract-failure shapes.
+type contractViolator struct {
+	inner transport.Transport
+	when  func(argv []string) bool
+	res   transport.RunResult
+	err   error
+}
+
+func (t *contractViolator) Put(ctx context.Context, req transport.PutRequest) error {
+	return t.inner.Put(ctx, req)
+}
+
+func (t *contractViolator) ProbePath(ctx context.Context, path string) (transport.PathState, error) {
+	return t.inner.ProbePath(ctx, path)
+}
+
+func (t *contractViolator) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
+	if t.when(req.Argv) {
+		return t.res, t.err
+	}
+	return t.inner.Run(ctx, req)
+}
+
+// Every fate combination that is not a proven not-started or a
+// determined exit must fail closed: zero-value RunResult (the classic
+// wrapper mistake), unknown fate with nil error, and unknown-or-invalid
+// fate values — all retain the lock and never look like a successful
+// or determined hook.
+func TestFateContractViolationsFailClosed(t *testing.T) {
+	tests := []struct {
+		name string
+		res  transport.RunResult
+		err  error
+	}{
+		{"zero-value RunResult + error", transport.RunResult{}, errors.New("connection lost")},
+		{"unknown fate + nil error", transport.RunResult{Fate: transport.RunUnknown}, nil},
+		{"invalid fate + nil error", transport.RunResult{Fate: transport.RunFate(42)}, nil},
+		{"invalid fate + error", transport.RunResult{Fate: transport.RunFate(7)}, errors.New("connection lost")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, "my-app", nil)
+			rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+			tgt, err := target.New(&contractViolator{
+				inner: local.New(),
+				when:  func(argv []string) bool { return strings.Contains(argv[0], "preflight.sh") },
+				res:   tc.res,
+				err:   tc.err,
+			}, f.root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rep, err := Deploy(t.Context(), DeployInput{
+				Target: tgt, TargetManifest: f.targetManifest(),
+				Environment: f.environment("my-app", "1.0.0"), Release: rel, Bundle: bundleBytes, Owner: "test",
+			})
+			if err == nil {
+				t.Fatalf("rep = %+v, want an error", rep)
+			}
+			if !rep.LockRetained {
+				t.Errorf("rep = %+v, want the lock retained (fail closed)", rep)
+			}
+			if attemptPresent(t, f) {
+				t.Error("preflight contract violation must not fabricate an attempt marker")
+			}
+			assertLockRetained(t, f)
+		})
+	}
+}

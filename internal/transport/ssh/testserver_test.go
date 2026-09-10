@@ -16,10 +16,11 @@ import (
 )
 
 type testServer struct {
-	addr      string
-	hostKey   gossh.PublicKey
-	ln        net.Listener
-	stallSftp bool
+	addr       string
+	hostKey    gossh.PublicKey
+	ln         net.Listener
+	stallSftp  bool
+	rejectExec bool
 	// stallClosed is closed when a client tears down a stalled sftp
 	// channel, letting tests assert bounded resource lifetime, not just
 	// fast caller return.
@@ -100,6 +101,12 @@ func (ts *testServer) handleSession(channel gossh.Channel, requests <-chan *goss
 		case "exec":
 			var payload struct{ Command string }
 			if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
+				req.Reply(false, nil)
+				continue
+			}
+			if ts.rejectExec {
+				// A deliberate, positive server rejection of the exec
+				// request (ok=false) — the proven not-started shape.
 				req.Reply(false, nil)
 				continue
 			}

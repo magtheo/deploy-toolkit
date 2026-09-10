@@ -174,21 +174,16 @@ func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transpor
 		if out.startErr == nil {
 			return t.runOutcome(req, out.waitErr, stdout, stderr)
 		}
-		// The exec request failed. x/crypto folds two very different
-		// cases into one error: (a) the server explicitly REJECTED the
-		// exec request — nothing started; (b) the connection died while
-		// the request was in flight — the command may be running.
-		// Distinguish by connection liveness: a dead connection fails
-		// this probe too, so case (b) can only ever classify as
-		// RunUnknown, never as RunNotStarted.
-		if err := t.alive(); err != nil {
-			return transport.RunResult{Fate: transport.RunUnknown, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, fmt.Errorf("ssh: exec %s: %w", req.Argv[0], out.startErr)
-		}
-		// Healthy connection + Start failure = rejection, or a rare
-		// post-accept local setup failure. Only the library's exact
-		// rejection shape counts as proven not-started; everything else
-		// stays conservatively unknown. (Pinned by test against the
-		// vendored x/crypto version.)
+		// The exec request failed. In the pinned x/crypto v0.56.0,
+		// Session.Start produces exactly ONE distinguishable error
+		// shape: "ssh: command <cmd> failed", generated ONLY when the
+		// server positively replied ok=false to the exec request — a
+		// proven rejection, nothing started. Every other Start error is
+		// the underlying SendRequest failure (connection died while the
+		// request was in flight — the command may be running), and
+		// s.start() has no failure return in this version. So: exact
+		// rejection shape → RunNotStarted; everything else →
+		// conservatively RunUnknown.
 		if out.startErr.Error() == fmt.Sprintf("ssh: command %v failed", command) {
 			return transport.RunResult{Fate: transport.RunNotStarted}, &transport.StartError{Err: fmt.Errorf("ssh: exec request rejected for %s", req.Argv[0])}
 		}
@@ -218,14 +213,6 @@ func (t *Transport) runOutcome(req transport.RunRequest, waitErr error, stdout, 
 		return res, &transport.StartError{ExitCode: res.ExitCode, Err: fmt.Errorf("target dispatch failed for %s", req.Argv[0])}
 	}
 	return res, nil
-}
-
-// alive probes whether the underlying SSH connection is still usable.
-// It sends a ignore-style request that no server acts on; failure means
-// the transport is dead.
-func (t *Transport) alive() error {
-	_, _, err := t.conn.SendRequest("keepalive@openssh.com", false, nil)
-	return err
 }
 
 // Put stages req.Content atomically at req.Path via a dedicated SFTP

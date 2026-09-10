@@ -92,11 +92,23 @@ func runStageStep(ctx context.Context, tr transport.Transport, name, dir string,
 	}
 	res, err := tr.Run(ctx, transport.RunRequest{Argv: step.Argv, Dir: dir, Env: henv})
 	if err != nil {
-		// Fate, not error identity, decides safety: RunUnknown means
-		// the hook process may still be running (cancellation,
-		// transport loss, bounded pipe wait). StartError and
-		// validation failures are known non-running fates.
-		return StageResult{Name: name, Failed: true, InfraError: true, Unknown: res.Fate == transport.RunUnknown}, err
+		// Fate decides safety, and it is VALIDATED, not trusted: only
+		// the two fates that prove "nothing can be running" may skip
+		// retention (RunNotStarted: definite dispatch failure;
+		// RunExited with a StartError: the SSH 126/127 convention).
+		// RunUnknown — the zero value — and any INVALID fate value
+		// retain the lock, so a transport that forgets to set Fate, or
+		// invents a new value this version does not know, fails closed.
+		unknown := res.Fate != transport.RunNotStarted && res.Fate != transport.RunExited
+		return StageResult{Name: name, Failed: true, InfraError: true, Unknown: unknown}, err
+	}
+	// A nil error is only defined for a determined exit. Any other fate
+	// with nil error is a transport-contract violation and fails closed:
+	// reported as an infrastructure error with unknown fate (lock
+	// retained), never as a successful or determined hook.
+	if res.Fate != transport.RunExited {
+		return StageResult{Name: name, Failed: true, InfraError: true, Unknown: true},
+			fmt.Errorf("hook %s: transport contract violation: Run returned fate %d with nil error; treated as unknown fate (lock retained)", name, int(res.Fate))
 	}
 	return StageResult{
 		Name:     name,
