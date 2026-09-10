@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
+	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
 // runDeploy executes a deployment of the release the environment pins.
@@ -119,6 +120,12 @@ func reportDeploy(rep *lifecycle.Report, err error, stdout, stderr io.Writer) in
 			fmt.Fprintf(stderr, "✗ deploy %s: refused: the environment lock is held — another\noperation may currently be executing.\n", env)
 			fmt.Fprintln(stderr, "  Do not rerun mechanically. Run `deployctl status`; only remove a stale")
 			fmt.Fprintln(stderr, "  lock after verifying no deployment is in flight.")
+			return exitFailed
+		}
+		if errors.Is(err, target.ErrEvidenceInvalid) {
+			fmt.Fprintf(stderr, "✗ deploy %s: refused: durable evidence on the target exists but is invalid.\n", env)
+			fmt.Fprintln(stderr, "  Rerunning cannot help until the evidence is repaired. Run `deployctl status`,")
+			fmt.Fprintln(stderr, "  repair the damaged file by hand, then proceed deliberately.")
 			return exitFailed
 		}
 		fmt.Fprintf(stderr, "✗ deploy %s: infrastructure failure: %v\n", env, err)

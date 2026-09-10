@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
+	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
 // The public machine interface. --json emits exactly one versioned
@@ -163,6 +164,15 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 			// It is never safe-to-retry infrastructure.
 			env.Outcome = outcomeRefused
 			env.Message = "refused: the environment lock is held — another operation may currently be executing"
+		case errors.Is(err, target.ErrEvidenceInvalid):
+			// Invalid durable evidence is a REFUSAL, mirroring the
+			// resolve preflight: the evidence exists but fails strict
+			// validation, so the facts cannot be trusted and nothing
+			// may be decided. Retrying is pointless until the evidence
+			// is repaired; it is infrastructure-shaped only in the
+			// transport sense, never in the safe-to-retry sense.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: durable evidence on the target exists but is invalid — repair it (deployctl status), do not rerun"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"
@@ -237,6 +247,10 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 			// safe-to-retry infrastructure.
 			env.Outcome = outcomeRefused
 			env.Message = "refused: the environment lock is held — another operation may currently be executing"
+		case errors.Is(err, target.ErrEvidenceInvalid):
+			// Mirror deploy: invalid durable evidence is a refusal.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: durable evidence on the target exists but is invalid — repair it (deployctl status), do not rerun"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"

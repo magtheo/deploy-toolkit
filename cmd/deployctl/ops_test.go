@@ -1649,3 +1649,58 @@ func TestLockPathFileIsUnreadableNotFreeOrHeld(t *testing.T) {
 		t.Errorf("state = %v, want degraded", data["state"])
 	}
 }
+
+// Invalid durable evidence is a REFUSAL in every operational command:
+// the facts cannot be trusted, so nothing may be decided and rerunning
+// cannot help. Deploy and rollback previously rendered this as
+// safe-to-retry infrastructure — the exact opposite of the truth.
+func TestCorruptEvidenceIsRefusalNotInfra(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"deploy over corrupt state", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
+		{"deploy over corrupt attempt marker", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
+		{"rollback over corrupt state", []string{"rollback", "production", "--to", "2.0.0", "--repo-dir", "%DIR%", "--confirm", "rollback production to 2.0.0", "--owner", "test"}},
+	}
+	damage := []func(t *testing.T, f *cliFixture){
+		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.statePath(), "{corrupt") },
+		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.attemptPath(), "{corrupt") },
+		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.statePath(), "{corrupt") },
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCLIFixture(t)
+			damage[i](t, f)
+
+			args := make([]string, len(tc.args))
+			for j, a := range tc.args {
+				args[j] = strings.ReplaceAll(a, "%DIR%", f.repoDir)
+			}
+			code, doc := runJSON(t, args...)
+			if code != exitFailed {
+				t.Fatalf("exit = %d, want %d (%s)", code, exitFailed, doc["message"])
+			}
+			if doc["outcome"] != "refused" || doc["safeToRetry"] != false {
+				t.Errorf("shape = %v safeToRetry=%v, want refused/false", doc["outcome"], doc["safeToRetry"])
+			}
+			if doc["recoveryRequired"] != false {
+				t.Errorf("recoveryRequired = %v: untrustworthy state does not prove markers", doc["recoveryRequired"])
+			}
+			if len(orderCLI(t, f)) != 0 {
+				t.Error("hooks ran despite corrupt evidence")
+			}
+
+			code, _, errOut := runCLI(args...)
+			if code != exitFailed {
+				t.Fatalf("human exit = %d", code)
+			}
+			if !strings.Contains(errOut, "invalid") || !strings.Contains(errOut, "repair") {
+				t.Errorf("human stderr lacks repair guidance:\n%s", errOut)
+			}
+			if strings.Contains(errOut, "simply") || strings.Contains(errOut, "infrastructure failure") {
+				t.Errorf("human stderr misclassifies a refusal:\n%s", errOut)
+			}
+		})
+	}
+}
