@@ -298,7 +298,7 @@ func probeSFTPPath(cl *sftp.Client, p string) (transport.PathState, error) {
 			return transport.PathFile, nil
 		}
 		if !fi.IsDir() {
-			return 0, fmt.Errorf("target: probe %s: %s is not a directory (broken target hierarchy)", p, cur)
+			return 0, fmt.Errorf("target: probe %s: %s is not a directory (broken target hierarchy)", p, path.Join(cur, part))
 		}
 		cur = path.Join(cur, part)
 	}

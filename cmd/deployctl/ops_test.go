@@ -1598,7 +1598,18 @@ func TestStatusBrokenHierarchyIsDegradedNotNotDeployed(t *testing.T) {
 	// "state" exists as a regular FILE where the hierarchy needs a
 	// directory — the exact shape the old `test -e` misreported as a
 	// fresh target.
-	writeFileCLIF(t, f.statePath(), "{")
+	// The INTERMEDIATE "state" component is a regular file where the
+	// hierarchy requires a directory — the exact shape `test -e`
+	// misreported as a fresh target (its exit 1 conflated ENOTDIR with
+	// ENOENT). The probe must classify it as unknown, and status must
+	// degrade rather than claim not-deployed.
+	intermediate := filepath.Dir(f.statePath()) // .../my-app/state
+	if err := os.MkdirAll(filepath.Dir(intermediate), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(intermediate, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	code, doc := runJSON(t, "status", "production", "--repo-dir", f.repoDir)
 	if code != exitOK {
 		t.Fatalf("a degraded status report is still a successful report: exit = %d", code)
@@ -1607,20 +1618,34 @@ func TestStatusBrokenHierarchyIsDegradedNotNotDeployed(t *testing.T) {
 	if data["state"] != "degraded" {
 		t.Fatalf("state = %v, want degraded", data["state"])
 	}
+	if data["state"] == "not-deployed" {
+		t.Errorf("a broken hierarchy must never present as a fresh target")
+	}
 	if data["observed"] != nil {
 		t.Errorf("degraded status must claim no observed state: %v", data["observed"])
 	}
 }
 
-// A regular FILE at the lock path is broken evidence — degraded, never
-// "free" (which would green-light operations) and never "held".
-func TestLockPathFileIsNotFree(t *testing.T) {
+// A regular FILE at the lock path is broken evidence: lock "unreadable",
+// overall state "degraded" — never "free" (which would green-light
+// operations) and never "held" (only a real lock DIRECTORY is held,
+// matching AcquireEnvLock).
+func TestLockPathFileIsUnreadableNotFreeOrHeld(t *testing.T) {
 	f := newCLIFixture(t)
 	writeFileCLIF(t, f.lockPath(), "not a lock")
 	code, doc := runJSON(t, "status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want a successful degraded report", code)
+	}
 	data, _ := doc["data"].(map[string]any)
 	lock, _ := data["lock"].(string)
-	if lock == "free" {
-		t.Errorf("a file at the lock path was reported free: %v (exit %d)", doc, code)
+	if lock != "unreadable" {
+		t.Errorf("lock = %q, want unreadable", lock)
+	}
+	if lock == "free" || lock == "held" {
+		t.Errorf("a file at the lock path was classified %q", lock)
+	}
+	if data["state"] != "degraded" {
+		t.Errorf("state = %v, want degraded", data["state"])
 	}
 }

@@ -73,3 +73,39 @@ func TestProbePathOverSFTP(t *testing.T) {
 		}
 	})
 }
+
+// Permission failure over SFTP must arrive as an error with
+// permission — not absence — semantics: this pins the library
+// translation (SSH_FX_PERMISSION_DENIED → os.ErrPermission) the
+// outside-in walk relies on to never map "cannot establish" to absence.
+// Skipped as root, since root ignores permission bits.
+func TestProbePathPermissionDeniedIsNeverAbsent(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permission bits")
+	}
+	signer := clientSigner(t)
+	ts := startTestServer(t, signer.PublicKey())
+	tr, err := dialTransport(t, ts, signer, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	root := t.TempDir()
+	sealed := filepath.Join(root, "sealed")
+	if err := os.MkdirAll(sealed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sealed, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(sealed, 0o755) })
+
+	_, err = tr.ProbePath(t.Context(), filepath.Join(sealed, "production.json"))
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("permission failure must not carry not-exist semantics: %v", err)
+	}
+}

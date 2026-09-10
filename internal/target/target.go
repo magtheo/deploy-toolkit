@@ -84,10 +84,10 @@ func (t *Target) ProbePath(ctx context.Context, path string) (transport.PathStat
 }
 
 // ReadFile reads a toolkit-owned file from the target — staged contract
-// bytes, state snapshots, history logs. Callers must gate it behind
-// exists() when absence is meaningful: cat reports both absence and
-// unreadability as a non-zero exit and the two cannot be distinguished
-// through the transport contract.
+// bytes, state snapshots, history logs. Callers must gate it behind the
+// path/evidence probe (probePath / absent) when absence is meaningful:
+// cat reports both absence and unreadability as a non-zero exit and the
+// two cannot be distinguished through the transport contract.
 func (t *Target) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	res, err := t.tr.Run(ctx, transport.RunRequest{Argv: []string{"cat", path}, Dir: "/"})
 	if err != nil {

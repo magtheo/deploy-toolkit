@@ -16,10 +16,13 @@ type Transport interface {
 	// absolute path on the target? PathAbsent is a POSITIVE fact,
 	// returned only when absence has been proven — never as a fallback
 	// for "the probe could not tell". Permission failures, broken
-	// hierarchies (a non-directory where a directory is required),
-	// unsupported path kinds and transport failures are errors. The
-	// probe follows symlinks (v0.1 preserves the historical semantics;
-	// a target-tree symlink policy would be separate hardening).
+	// hierarchies (a non-directory where a directory is required) and
+	// transport failures are errors. PathFile means any non-directory
+	// object; a stricter special-file policy (devices, sockets, ...)
+	// would be separate hardening and is deliberately not attempted
+	// here. The probe follows symlinks (v0.1 preserves the historical
+	// semantics; a target-tree symlink policy would also be separate
+	// hardening).
 	ProbePath(ctx context.Context, path string) (PathState, error)
 }
 
