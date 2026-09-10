@@ -189,14 +189,19 @@ func TestDeployAlreadyCurrentSelfHealsStaleMarker(t *testing.T) {
 	// leftover instead of demanding recovery.
 	f := newFixture(t, "my-app", nil)
 	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
-	if _, err := Deploy(t.Context(), DeployInput{
+	// The real crash window: the first deploy commits (signing observed
+	// state with ITS attempt id) and dies before clearing the marker —
+	// so the stale marker carries the SAME id the commit was signed
+	// with.
+	first, err := Deploy(t.Context(), DeployInput{
 		Target: f.target, TargetManifest: f.targetManifest(),
 		Environment: f.environment("my-app", "1.0.0"), Release: rel, Bundle: bundleBytes, Owner: "test",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := f.target.WriteAttempt(t.Context(), target.AttemptMarker{
-		AttemptID:    "0123456789abcdef",
+		AttemptID:    first.AttemptID,
 		Project:      "my-app",
 		Environment:  "production",
 		ToRelease:    "1.0.0",
@@ -214,6 +219,39 @@ func TestDeployAlreadyCurrentSelfHealsStaleMarker(t *testing.T) {
 	}
 	if attemptPresent(t, f) {
 		t.Error("stale marker was not healed")
+	}
+}
+
+func TestDeploySelfHealRequiresCommitSignature(t *testing.T) {
+	// Release and digest match the observed state, but the marker's id
+	// is NOT the id the observed state was signed with — the state is
+	// proof of SOME operation, not of THIS marker's attempt. A hand-made
+	// or schema-skewed marker naming the current release is never
+	// erased: the environment stays blocked pending explicit recovery.
+	f := newFixture(t, "my-app", nil)
+	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+	if _, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "1.0.0"), Release: rel, Bundle: bundleBytes, Owner: "test",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.target.WriteAttempt(t.Context(), target.AttemptMarker{
+		AttemptID:    "0123456789abcdef",
+		Project:      "my-app",
+		Environment:  "production",
+		ToRelease:    "1.0.0",
+		BundleDigest: rel.Bundle.Digest,
+		StartedAt:    time.Unix(1700000000, 0).UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	if err != nil || !rep.RecoveryRequired || rep.AlreadyCurrent {
+		t.Fatalf("rep = %+v err = %v, want refusal with recovery required", rep, err)
+	}
+	if !attemptPresent(t, f) {
+		t.Error("the forged-identity marker must survive")
 	}
 }
 

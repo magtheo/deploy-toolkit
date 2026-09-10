@@ -215,17 +215,23 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		return rep, fmt.Errorf("read recovery marker: %w", rerr)
 	}
 	if aerr == nil {
-		// Self-heal requires the FULL identity match: the marker must
-		// describe an attempt to exactly the requested release with
-		// exactly the requested bundle digest, AND committed observed
-		// state must show that same release with that same digest. Only
-		// then does observed state prove that THIS attempt reached its
-		// trusted terminal. A marker for a different target release (e.g.
-		// an unresolved 2.0.0 attempt while 1.0.0 is observed) is never
-		// erased by deploying the currently observed release.
+		// Self-heal requires the FULL identity match — the same triple
+		// standard the rollback self-heal demands (operationId proves
+		// WHICH operation committed, release identity alone proves
+		// nothing): the marker must describe an attempt to exactly the
+		// requested release with exactly the requested bundle digest,
+		// AND committed observed state must show that same release with
+		// that same digest SIGNED by this attempt's id. Only then does
+		// observed state prove that THIS attempt reached its trusted
+		// terminal. A marker for a different target release (e.g. an
+		// unresolved 2.0.0 attempt while 1.0.0 is observed) is never
+		// erased by deploying the currently observed release — and a
+		// hand-forged marker naming the currently observed release is
+		// never erased without the commit signature either.
 		if observed.Current != nil &&
 			attempt.ToRelease == rep.Version && attempt.BundleDigest == rel.Bundle.Digest &&
-			observed.Current.Release == rep.Version && observed.Current.BundleDigest == rel.Bundle.Digest {
+			observed.Current.Release == rep.Version && observed.Current.BundleDigest == rel.Bundle.Digest &&
+			observed.Current.OperationID == "deploy:"+attempt.AttemptID {
 			// The attempt reached its trusted terminal; the marker is a
 			// leftover from a crash between commit and cleanup.
 			if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
