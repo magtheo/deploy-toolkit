@@ -28,10 +28,14 @@ var ErrStateAbsent = errors.New("observed state: no deployment recorded")
 // ErrEvidenceInvalid marks strict-validation failures on durable target
 // files (state snapshot, attempt/recovery markers): the file EXISTS and
 // was read, but does not decode or validate. This is structurally
-// different from absence (normal), corruption-by-transport (an error
-// mid-read surfaces as a transport error) — invalid evidence fails
-// closed and, for recovery operations, is classifiable as a refusal to
-// act rather than an infrastructure failure.
+// different from absence (normal) and corruption-by-transport (an error
+// mid-read surfaces as a transport error). Invalid evidence fails
+// closed: every operational command (deploy, rollback, recovery
+// resolve) classifies it as a refusal to act — the facts cannot be
+// trusted, so nothing may be decided and rerunning cannot help until a
+// human has inspected the evidence and verified the target's actual
+// state. It must never encourage editing observed state merely to make
+// an operation proceed.
 var ErrEvidenceInvalid = errors.New("evidence failed strict validation")
 
 // operationIDPattern pins the operationId shape: which kind of lifecycle

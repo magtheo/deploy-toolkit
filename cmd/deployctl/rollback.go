@@ -220,8 +220,9 @@ func reportRollback(rep *lifecycle.RollbackReport, err error, envName string, st
 		}
 		if errors.Is(err, target.ErrEvidenceInvalid) {
 			fmt.Fprintf(stderr, "✗ rollback %s: refused: durable evidence on the target exists but is invalid.\n", envName)
-			fmt.Fprintln(stderr, "  Rerunning cannot help until the evidence is repaired. Run `deployctl status`,")
-			fmt.Fprintln(stderr, "  repair the damaged file by hand, then proceed deliberately.")
+			fmt.Fprintln(stderr, "  Rerunning cannot help while the evidence is invalid. Run `deployctl status`, inspect")
+			fmt.Fprintln(stderr, "  the affected evidence and verify the target's actual state before following the")
+			fmt.Fprintln(stderr, "  recovery procedure. Do NOT edit observed state merely to make this proceed.")
 			return exitFailed
 		}
 		fmt.Fprintf(stderr, "✗ rollback %s: infrastructure failure: %v\n", envName, err)

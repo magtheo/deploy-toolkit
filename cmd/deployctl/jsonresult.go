@@ -172,7 +172,7 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 			// is repaired; it is infrastructure-shaped only in the
 			// transport sense, never in the safe-to-retry sense.
 			env.Outcome = outcomeRefused
-			env.Message = "refused: durable evidence on the target exists but is invalid — repair it (deployctl status), do not rerun"
+			env.Message = "refused: durable evidence on the target exists but is invalid — run deployctl status, inspect the evidence and verify the target before recovery; do not rerun"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"
@@ -250,7 +250,7 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 		case errors.Is(err, target.ErrEvidenceInvalid):
 			// Mirror deploy: invalid durable evidence is a refusal.
 			env.Outcome = outcomeRefused
-			env.Message = "refused: durable evidence on the target exists but is invalid — repair it (deployctl status), do not rerun"
+			env.Message = "refused: durable evidence on the target exists but is invalid — run deployctl status, inspect the evidence and verify the target before recovery; do not rerun"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"

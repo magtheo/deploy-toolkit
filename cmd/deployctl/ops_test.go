@@ -1662,11 +1662,15 @@ func TestCorruptEvidenceIsRefusalNotInfra(t *testing.T) {
 		{"deploy over corrupt state", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
 		{"deploy over corrupt attempt marker", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
 		{"rollback over corrupt state", []string{"rollback", "production", "--to", "2.0.0", "--repo-dir", "%DIR%", "--confirm", "rollback production to 2.0.0", "--owner", "test"}},
+		{"deploy over corrupt recovery marker", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
 	}
 	damage := []func(t *testing.T, f *cliFixture){
 		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.statePath(), "{corrupt") },
 		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.attemptPath(), "{corrupt") },
 		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.statePath(), "{corrupt") },
+		// Distinct path: ReadRecovery → ErrEvidenceInvalid must
+		// survive deploy's wrap and still classify as refusal.
+		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.recoveryPath(), "{corrupt") },
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
