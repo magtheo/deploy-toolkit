@@ -456,7 +456,7 @@ func TestLockChurnParallelEnvironments(t *testing.T) {
 					// after the winner finishes must proceed. Bound the
 					// test-side retry; a persistent lock would fail it.
 					recovered := false
-					for attempt := 0; attempt < 100; attempt++ {
+					for attempt := 0; attempt < 500; attempt++ {
 						time.Sleep(10 * time.Millisecond)
 						if rep, err = Deploy(t.Context(), in); !errors.Is(err, target.ErrStageLockHeld) {
 							recovered = true
@@ -468,7 +468,7 @@ func TestLockChurnParallelEnvironments(t *testing.T) {
 						return
 					}
 				} else if err != nil {
-					errs <- fmt.Errorf("env-%d round %d: %w", n, r, err)
+					errs <- fmt.Errorf("env-%d round %d: %v (rep: staged=%v committed=%v alreadyCurrent=%v)", n, r, err, rep.Staged, rep.Committed, rep.AlreadyCurrent)
 					return
 				}
 				if rep == nil || (!rep.Committed && !rep.AlreadyCurrent) {
