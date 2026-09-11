@@ -185,6 +185,12 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 			// transport sense, never in the safe-to-retry sense.
 			env.Outcome = outcomeRefused
 			env.Message = "refused: durable evidence on the target exists but is invalid — run deployctl status, inspect the evidence and verify the target before recovery; do not rerun"
+		case errors.Is(err, target.ErrStageLockHeld):
+			// The release version is being staged by another
+			// environment's operation right now: refusal, same class
+			// as a held environment lock.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: this release version is being staged by another operation — wait for it to finish, or remove a crashed stager's lock after verifying"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"
@@ -291,6 +297,12 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 			// Mirror deploy: invalid durable evidence is a refusal.
 			env.Outcome = outcomeRefused
 			env.Message = "refused: durable evidence on the target exists but is invalid — run deployctl status, inspect the evidence and verify the target before recovery; do not rerun"
+		case errors.Is(err, target.ErrStageLockHeld):
+			// The release version is being staged by another
+			// environment's operation right now: refusal, same class
+			// as a held environment lock.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: this release version is being staged by another operation — wait for it to finish, or remove a crashed stager's lock after verifying"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"

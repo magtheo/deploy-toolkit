@@ -18,6 +18,7 @@ configuration:
     <deployRoot>/<project>/attempts/<env>.json    unresolved deployment attempt
     <deployRoot>/<project>/recoveries/<env>.json  unresolved recovery (rollback)
     <deployRoot>/<project>/.locks/<env>/          environment lock
+    <deployRoot>/<project>/.staging/<version>/    staging lock (cross-environment)
 
 ## Release staging
 
@@ -30,7 +31,19 @@ Enforced in this order:
    target. A mismatch is a broken artifact, not a staging condition — it is
    refused and leaves no trace.
 
-2. **Immutable once staged.** A release directory is complete if and only if
+2. **Cross-environment serialization.** Releases are
+   environment-independent, so two environments deploying the same
+   version share one staging sequence. A project-scoped staging lock
+   (`.staging/<version>/`, atomic `mkdir`) serializes it: the loser
+   refuses (`ErrStageLockHeld` — "another operation is staging this
+   version", the same refusal class as a held environment lock) and a
+   retry after the winner finishes takes the idempotent
+   `already-staged` path. A crashed stager leaves the lock for manual
+   removal, exactly like the environment lock. Under this lock, a
+   directory without its marker can only be a genuine interrupted
+   stage, never a concurrent one.
+
+3. **Immutable once staged.** A release directory is complete if and only if
    it contains `.staged.json` (the staged marker). If the directory exists:
    - marker present, same bundle digest → **idempotent** (`already-staged`),
      nothing is written;
@@ -43,23 +56,18 @@ Enforced in this order:
      as a complete release, and the toolkit never silently completes,
      overwrites, or deletes one.
 
-3. **Marker last.** Bundle files are uploaded first (each one atomically,
+4. **Marker last.** Bundle files are uploaded first (each one atomically,
    via the transport's temp+rename `Put`); the marker — recording schema,
    project, version, bundle digest and staged time — is written last. The
    marker's presence is the atomic commit of the stage. Every reader of a
    release directory checks the marker first.
 
-4. **Defensive extraction.** The bundle is digest-verified, but staging
+5. **Defensive extraction.** The bundle is digest-verified, but staging
    still refuses anything a filesystem could misinterpret: absolute entry
    paths, `.`/`..` segments, and any non-regular entry. Bundle Format v1 is
    regular-files-only (the builder refuses symlinks at construction, when
    the release is still mutable), so a non-file entry in a bundle means the
    bytes were tampered with or built by something that ignored the format.
-
-5. **Concurrent stages of the same version** with identical bytes converge
-   to the same outcome (idempotent). Stages with conflicting bytes for one
-   version are an operator error that step-9's single-flight-per-environment
-   execution prevents; the marker discipline above contains the damage.
 
 ## Observed state
 

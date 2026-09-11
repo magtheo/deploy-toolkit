@@ -148,8 +148,11 @@ func TestDeployLockReleaseFailureJoinsWithExistingError(t *testing.T) {
 	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
 	tr := &failingRunTransport{
 		inner: local.New(),
-		failWhen: func(argv0 string) bool {
-			return argv0 == "cat" || argv0 == "rmdir"
+		failRunWhen: func(argv []string) bool {
+			// The environment lock's rmdir only — the staging lock is a
+			// different release (M1-10) and its failure would mask the
+			// scenario this test proves.
+			return argv[0] == "cat" || (argv[0] == "rmdir" && strings.Contains(argv[len(argv)-1], "/.locks/"))
 		},
 	}
 	tgt, err := target.New(tr, f.root)
@@ -181,7 +184,12 @@ func TestDeployCancelledCleanupIsBounded(t *testing.T) {
 	// own timeout and its failure is surfaced.
 	old := lockCleanupTimeout
 	lockCleanupTimeout = 250 * time.Millisecond
-	defer func() { lockCleanupTimeout = old }()
+	oldStaging := target.StagingCleanupTimeout
+	target.StagingCleanupTimeout = 250 * time.Millisecond
+	defer func() {
+		lockCleanupTimeout = old
+		target.StagingCleanupTimeout = oldStaging
+	}()
 
 	f := newFixture(t, "my-app", nil)
 	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")

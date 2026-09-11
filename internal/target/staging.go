@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
@@ -48,6 +50,19 @@ func (s StageStatus) String() string {
 	}
 }
 
+// StagingCleanupTimeout bounds staging-lock release attempts so a
+// stuck target cannot hang staging finalization forever. Var for test
+// overriding (exported because the lifecycle tests exercise it through
+// the public Deploy path).
+var StagingCleanupTimeout = 30 * time.Second
+
+// ErrStageLockHeld marks the staging lock being held: another
+// environment of the same project is staging THIS release version right
+// now. Like the environment lock, it is a REFUSAL-class fact (another
+// operation may be executing), and a crashed stager leaves the lock for
+// manual removal — never silently broken.
+var ErrStageLockHeld = errors.New("staging lock is held")
+
 // StagedMarker records what a staged release directory contains. It is an
 // observed fact about bytes on the target, not desired state.
 type StagedMarker struct {
@@ -75,7 +90,18 @@ type StagedMarker struct {
 //     refused (never silently completed or overwritten) — the operator
 //     removes it manually. Fail closed beats clever cleanup.
 //  4. Staging never touches observed state. staged is not deployed.
-func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte, stagedAt time.Time) (StageStatus, error) {
+//  5. Staging is serialized ACROSS environments by a project-scoped
+//     staging lock (.staging/<version>, atomic mkdir). Releases are
+//     environment-independent, so two environments deploying the same
+//     version share one staging sequence; without the lock, one would
+//     see the other's mid-stage directory (files present, marker not
+//     yet written) and misread it as an interrupted stage. Under the
+//     lock that shape can only mean a crashed stager — refused, lock
+//     left for manual removal, exactly like the environment lock.
+//
+// Stage returns NAMED values: the deferred staging-lock release joins a
+// release failure into retErr — unnamed returns would drop it.
+func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte, stagedAt time.Time) (status StageStatus, retErr error) {
 	releaseDir, err := t.layout.ReleaseDir(rel.Metadata.Project, rel.Metadata.Version)
 	if err != nil {
 		return StageNew, err
@@ -122,6 +148,61 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 	if err != nil {
 		return StageNotAttempted, err
 	}
+	// Serialize the marker-check + write sequence across environments.
+	// Everything below — probe, existing-stage verification, file
+	// writes, marker — runs under this lock.
+	lockDir, err := t.layout.StagingLockDir(rel.Metadata.Project, rel.Metadata.Version)
+	if err != nil {
+		return StageNotAttempted, err
+	}
+	parent := lockDir[:strings.LastIndex(lockDir, "/")]
+	if res, err := t.tr.Run(ctx, transport.RunRequest{Argv: []string{"mkdir", "-p", parent}, Dir: "/"}); err != nil {
+		return StageNotAttempted, fmt.Errorf("staging lock %s: create parent: %w", lockDir, err)
+	} else if res.ExitCode != 0 {
+		return StageNotAttempted, fmt.Errorf("staging lock %s: create parent exit %d: %s", lockDir, res.ExitCode, firstLine(res.Stderr))
+	}
+	// mkdir can fail EEXIST for a lock the owner removes a moment
+	// later (winner finished staging between our mkdir and our probe).
+	// That exact handoff is retried a bounded number of times; a lock
+	// that keeps existing is the genuine held shape: refusal.
+	var acquired bool
+	for attempt := 0; attempt < 3; attempt++ {
+		res, err := t.tr.Run(ctx, transport.RunRequest{Argv: []string{"mkdir", lockDir}, Dir: "/"})
+		if err != nil {
+			return StageNotAttempted, fmt.Errorf("staging lock %s: %w", lockDir, err)
+		}
+		if res.ExitCode == 0 {
+			acquired = true
+			break
+		}
+		pst, perr := t.probePath(ctx, lockDir)
+		if perr == nil && pst == transport.PathDirectory {
+			return StageNotAttempted, fmt.Errorf("%w: %s is being staged by another operation (a crashed stager leaves the lock; remove it manually after verifying no stage is in flight)", ErrStageLockHeld, lockDir)
+		}
+		if perr == nil && pst == transport.PathAbsent {
+			continue // the winner released it between mkdir and probe: try again
+		}
+		return StageNotAttempted, fmt.Errorf("staging lock %s: mkdir exit %d: %s", lockDir, res.ExitCode, firstLine(res.Stderr))
+	}
+	if !acquired {
+		return StageNotAttempted, fmt.Errorf("%w: %s could not be acquired", ErrStageLockHeld, lockDir)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), StagingCleanupTimeout)
+		defer ccancel()
+		rres, rerr := t.tr.Run(cctx, transport.RunRequest{Argv: []string{"rmdir", lockDir}, Dir: "/"})
+		if rerr == nil && rres.ExitCode != 0 {
+			rerr = fmt.Errorf("rmdir exit %d: %s", rres.ExitCode, firstLine(rres.Stderr))
+		}
+		if rerr != nil {
+			// A leftover staging lock blocks future stages of this
+			// version; the error must never be swallowed.
+			if retErr == nil {
+				retErr = fmt.Errorf("staging lock %s could not be released (manual cleanup required): %w", lockDir, rerr)
+			}
+		}
+	}()
+
 	for _, f := range files {
 		if err := t.tr.Put(ctx, transport.PutRequest{
 			Path:    releaseDir + "/" + f.relPath,
