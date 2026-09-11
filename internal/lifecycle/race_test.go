@@ -437,6 +437,10 @@ func TestLockChurnParallelEnvironments(t *testing.T) {
 	const rounds = 8
 	var wg sync.WaitGroup
 	errs := make(chan error, envs*rounds)
+	start := time.Now()
+	logf := func(format string, args ...any) {
+		t.Logf("%.3f %s", time.Since(start).Seconds(), fmt.Sprintf(format, args...))
+	}
 	for e := 0; e < envs; e++ {
 		wg.Add(1)
 		go func(n int) {
@@ -446,6 +450,8 @@ func TestLockChurnParallelEnvironments(t *testing.T) {
 				Target: f.target, TargetManifest: f.targetManifest(),
 				Environment: env, Release: rel, Bundle: bundleBytes, Owner: "churn",
 			}
+			logf("env-%d: start", n)
+			defer logf("env-%d: done", n)
 			for r := 0; r < rounds; r++ {
 				rep, err := Deploy(t.Context(), in)
 				if errors.Is(err, target.ErrStageLockHeld) {
@@ -480,8 +486,28 @@ func TestLockChurnParallelEnvironments(t *testing.T) {
 	}
 	wg.Wait()
 	close(errs)
+	failed := false
 	for err := range errs {
+		failed = true
 		t.Error(err)
+	}
+	if failed {
+		// Forensics: what actually landed on the target?
+		for _, dir := range []string{
+			f.root + "/my-app/releases/1.0.0",
+			f.root + "/my-app/.staging",
+		} {
+			ents, rerr := os.ReadDir(dir)
+			if rerr != nil {
+				t.Logf("dump %s: %v", dir, rerr)
+				continue
+			}
+			names := make([]string, 0, len(ents))
+			for _, ent := range ents {
+				names = append(names, ent.Name())
+			}
+			t.Logf("dump %s: %v", dir, names)
+		}
 	}
 	for e := 0; e < envs; e++ {
 		lock := f.root + "/my-app/.locks/env-" + fmt.Sprint(e)
