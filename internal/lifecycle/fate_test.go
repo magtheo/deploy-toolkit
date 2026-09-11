@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -281,6 +282,7 @@ func TestFateContractViolationsFailClosed(t *testing.T) {
 		{"unknown fate + nil error", transport.RunResult{Fate: transport.RunUnknown}, nil},
 		{"invalid fate + nil error", transport.RunResult{Fate: transport.RunFate(42)}, nil},
 		{"invalid fate + error", transport.RunResult{Fate: transport.RunFate(7)}, errors.New("connection lost")},
+		{"exited fate + arbitrary error (contract violation)", transport.RunResult{Fate: transport.RunExited}, errors.New("connection disappeared")},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -310,5 +312,50 @@ func TestFateContractViolationsFailClosed(t *testing.T) {
 			}
 			assertLockRetained(t, f)
 		})
+	}
+}
+
+// A compound failure must stay compound: invalid durable evidence
+// (refusal) whose lock release ALSO fails. Both sentinels survive the
+// join — rendering must surface both facts, and this is NOT a
+// deliberate retention (the release was attempted and failed; that is
+// the joined-error path, not fate-unknown).
+func TestEvidenceRefusalWithFailedReleaseStaysCompound(t *testing.T) {
+	f := newFixture(t, "my-app", nil)
+	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+	// Corrupt observed state: the read fails strict validation.
+	statePath := f.root + "/my-app/state/production.json"
+	if err := os.MkdirAll(filepath.Dir(statePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, []byte("{corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The release's rmdir fails; the owner-file rm succeeds.
+	tr := &failingRunTransport{
+		inner: local.New(),
+		failRunWhen: func(argv []string) bool {
+			return argv[0] == "rmdir"
+		},
+	}
+	tgt, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Deploy(t.Context(), DeployInput{
+		Target: tgt, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "1.0.0"), Release: rel, Bundle: bundleBytes, Owner: "test",
+	})
+	if err == nil {
+		t.Fatalf("rep = %+v, want the compound error", rep)
+	}
+	if !errors.Is(err, target.ErrEvidenceInvalid) {
+		t.Errorf("err = %v, want the evidence-refusal sentinel", err)
+	}
+	if !errors.Is(err, ErrLockReleaseFailed) {
+		t.Errorf("err = %v, want the lock-release sentinel", err)
+	}
+	if rep.LockRetained {
+		t.Errorf("rep = %+v, a FAILED release is a joined error, not a deliberate retention", rep)
 	}
 }

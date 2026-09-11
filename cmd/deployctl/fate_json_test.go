@@ -6,12 +6,15 @@ package main
 // boundary, for deploy and rollback.
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
+	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
 func TestJSONLockRetainedClassification(t *testing.T) {
@@ -107,4 +110,43 @@ func containsAny(s string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// A compound failure — evidence refusal whose lock release also failed —
+// must render BOTH facts on every surface. The refusal classification
+// stays, but the cleanup problem must not hide behind it.
+func TestCompoundFailureSurfacesBothFacts(t *testing.T) {
+	evidence := fmt.Errorf("read observed state: state.json: %w", target.ErrEvidenceInvalid)
+	joined := errors.Join(evidence, fmt.Errorf("environment lock /locks/production could not be released (manual cleanup required): %w: rmdir: not empty", lifecycle.ErrLockReleaseFailed))
+
+	t.Run("deploy json", func(t *testing.T) {
+		doc, code := deployResult(&lifecycle.Report{Project: "my-app", Environment: "production"}, joined)
+		if code != exitFailed || doc.Outcome != "refused" {
+			t.Fatalf("shape = %v/%d, want refused/1", doc.Outcome, code)
+		}
+		if !strings.Contains(doc.Message, "invalid") || !strings.Contains(doc.Message, "COULD NOT BE RELEASED") {
+			t.Errorf("message hides part of the compound state: %q", doc.Message)
+		}
+	})
+	t.Run("rollback json", func(t *testing.T) {
+		doc, code := rollbackResult(&lifecycle.RollbackReport{Project: "my-app", Environment: "production"}, joined)
+		if code != exitFailed || doc.Outcome != "refused" {
+			t.Fatalf("shape = %v/%d, want refused/1", doc.Outcome, code)
+		}
+		if !strings.Contains(doc.Message, "invalid") || !strings.Contains(doc.Message, "COULD NOT BE RELEASED") {
+			t.Errorf("message hides part of the compound state: %q", doc.Message)
+		}
+	})
+	t.Run("human warning", func(t *testing.T) {
+		var buf bytes.Buffer
+		warnLockReleaseFailed(&buf, joined)
+		if !strings.Contains(buf.String(), "COULD NOT BE RELEASED") || !strings.Contains(buf.String(), "manual cleanup") {
+			t.Errorf("human warning missing: %q", buf.String())
+		}
+		buf.Reset()
+		warnLockReleaseFailed(&buf, evidence)
+		if buf.Len() != 0 {
+			t.Errorf("warning printed without the sentinel: %q", buf.String())
+		}
+	})
 }

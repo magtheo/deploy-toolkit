@@ -93,14 +93,27 @@ func runStageStep(ctx context.Context, tr transport.Transport, name, dir string,
 	}
 	res, err := tr.Run(ctx, transport.RunRequest{Argv: step.Argv, Dir: dir, Env: henv})
 	if err != nil {
-		// Fate decides safety, and it is VALIDATED, not trusted: only
-		// the two fates that prove "nothing can be running" may skip
-		// retention (RunNotStarted: definite dispatch failure;
-		// RunExited with a StartError: the SSH 126/127 convention).
-		// RunUnknown — the zero value — and any INVALID fate value
-		// retain the lock, so a transport that forgets to set Fate, or
-		// invents a new value this version does not know, fails closed.
-		unknown := res.Fate != transport.RunNotStarted && res.Fate != transport.RunExited
+		// Fate decides safety, and it is VALIDATED, not trusted. Only
+		// two combinations prove "nothing can be running" and may skip
+		// retention: RunNotStarted (definite dispatch failure) and
+		// RunExited WITH a StartError (the SSH 126/127 convention — the
+		// documented exception, not a general one). RunExited with an
+		// arbitrary error is a contract violation: an exit code that
+		// arrives with "connection disappeared" proves nothing — treated
+		// as unknown. RunUnknown — the zero value — and any invalid
+		// fate value also retain the lock, so a transport that forgets
+		// to set Fate, or invents a value this version does not know,
+		// fails closed.
+		var unknown bool
+		switch {
+		case res.Fate == transport.RunNotStarted:
+			unknown = false
+		case res.Fate == transport.RunExited:
+			var startErr *transport.StartError
+			unknown = !errors.As(err, &startErr)
+		default:
+			unknown = true
+		}
 		return StageResult{Name: name, Failed: true, InfraError: true, Unknown: unknown}, err
 	}
 	// A nil error is only defined for a determined exit. Any other fate

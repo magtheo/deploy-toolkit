@@ -211,7 +211,9 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
 		defer cancel()
 		if relErr := lock.Release(cleanupCtx); relErr != nil {
-			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w", lockDir, relErr))
+			// Carry the sentinel so rendering can surface the compound
+			// state instead of a single classification.
+			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w: %w", lockDir, ErrLockReleaseFailed, relErr))
 		}
 	}()
 

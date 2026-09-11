@@ -136,3 +136,52 @@ func TestStageRefusesFileAtReleaseDir(t *testing.T) {
 		t.Fatalf("err = %v, want a not-a-directory refusal", err)
 	}
 }
+
+// unprovenProbe returns the zero PathState with a NIL error for
+// matching paths — the "wrapper forgot to set the state" shape.
+type unprovenProbe struct {
+	inner transport.Transport
+	when  func(path string) bool
+	seen  int
+}
+
+func (t *unprovenProbe) Put(ctx context.Context, req transport.PutRequest) error {
+	return t.inner.Put(ctx, req)
+}
+
+func (t *unprovenProbe) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
+	return t.inner.Run(ctx, req)
+}
+
+func (t *unprovenProbe) ProbePath(ctx context.Context, path string) (transport.PathState, error) {
+	if t.when != nil && t.when(path) {
+		t.seen++
+		return transport.PathUnknown, nil
+	}
+	return t.inner.ProbePath(ctx, path)
+}
+
+// A probe that sets NO state (the zero value) claims NOTHING. It must
+// arrive as an error at every consumer — never as proven absence, which
+// would green-light deployments over an unreadable target. Mirrors the
+// RunFate fail-closed default.
+func TestZeroValueProbeClaimsNothing(t *testing.T) {
+	tr := &unprovenProbe{
+		inner: local.New(),
+		when:  func(path string) bool { return strings.HasSuffix(path, "state/production.json") },
+	}
+	tgt, err := New(tr, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Evidence reads: an error, NOT ErrStateAbsent.
+	if _, err := tgt.ReadState(context.Background(), "my-app", "production"); err == nil || errors.Is(err, ErrStateAbsent) {
+		t.Fatalf("err = %v, want a non-absence error for an unproven probe", err)
+	}
+
+	// Strict Exists: an error, not a clean "false".
+	if present, err := tgt.Exists(context.Background(), "/srv/deploy/my-app/state/production.json"); err == nil {
+		t.Errorf("Exists = %v with nil error, want the contract violation surfaced", present)
+	}
+}

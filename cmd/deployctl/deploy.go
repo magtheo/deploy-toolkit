@@ -118,18 +118,21 @@ func reportDeploy(rep *lifecycle.Report, err error, stdout, stderr io.Writer) in
 		}
 		if errors.Is(err, lifecycle.ErrEnvLockHeld) {
 			fmt.Fprintf(stderr, "✗ deploy %s: refused: the environment lock is held — another\noperation may currently be executing.\n", env)
+			warnLockReleaseFailed(stderr, err)
 			fmt.Fprintln(stderr, "  Do not rerun mechanically. Run `deployctl status`; only remove a stale")
 			fmt.Fprintln(stderr, "  lock after verifying no deployment is in flight.")
 			return exitFailed
 		}
 		if errors.Is(err, target.ErrEvidenceInvalid) {
 			fmt.Fprintf(stderr, "✗ deploy %s: refused: durable evidence on the target exists but is invalid.\n", env)
+			warnLockReleaseFailed(stderr, err)
 			fmt.Fprintln(stderr, "  Rerunning cannot help while the evidence is invalid. Run `deployctl status`, inspect")
 			fmt.Fprintln(stderr, "  the affected evidence and verify the target's actual state before following the")
 			fmt.Fprintln(stderr, "  recovery procedure. Do NOT edit observed state merely to make this proceed.")
 			return exitFailed
 		}
 		fmt.Fprintf(stderr, "✗ deploy %s: infrastructure failure: %v\n", env, err)
+		warnLockReleaseFailed(stderr, err)
 		switch {
 		case rep != nil && rep.LockRetained:
 			fmt.Fprintln(stderr, "  A lifecycle hook's execution fate could not be established: the hook")

@@ -41,9 +41,18 @@ func New(tr transport.Transport, deployRoot string) (*Target, error) {
 func (t *Target) probePath(ctx context.Context, path string) (transport.PathState, error) {
 	st, err := t.tr.ProbePath(ctx, path)
 	if err != nil {
-		return 0, fmt.Errorf("target: probe %s: %w", path, err)
+		return transport.PathUnknown, fmt.Errorf("target: probe %s: %w", path, err)
 	}
-	return st, nil
+	// Validate the enum instead of trusting implementations: the zero
+	// value (PathUnknown) and any value outside this version's enum
+	// mean the transport claimed NOTHING — that is an error, never
+	// absence. Mirrors the RunFate validation in the lifecycle.
+	switch st {
+	case transport.PathAbsent, transport.PathFile, transport.PathDirectory:
+		return st, nil
+	default:
+		return transport.PathUnknown, fmt.Errorf("target: probe %s: transport returned unproven state %d (contract violation, treated as error)", path, int(st))
+	}
 }
 
 // absent is the one shared decision for evidence paths: only a

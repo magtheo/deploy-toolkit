@@ -217,7 +217,19 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 		env.Outcome = outcomeFailure
 		env.Message = "deploy failed: " + rep.FailureReason
 	}
+	noteLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
+}
+
+// noteLockReleaseFailed surfaces the COMPOUND state: whatever the
+// classification (refusal, failure, uncertain, infrastructure), a
+// lock-release failure is an additional fact that must never hide
+// behind it — the environment stays locked until manual cleanup.
+func noteLockReleaseFailed(env *resultEnvelope, err error) {
+	if err == nil || !errors.Is(err, lifecycle.ErrLockReleaseFailed) {
+		return
+	}
+	env.Message += " — THE ENVIRONMENT LOCK COULD NOT BE RELEASED: manual cleanup is required; no other operation may start until it is removed"
 }
 
 // ---- rollback ----------------------------------------------------------
@@ -309,6 +321,7 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 		env.Outcome = outcomeFailure
 		env.Message = "rollback failed: " + rep.FailureReason
 	}
+	noteLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
 }
 

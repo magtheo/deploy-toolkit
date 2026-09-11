@@ -28,19 +28,29 @@ type Transport interface {
 
 // Implementations must return a meaningful PathState only when the
 // error is nil; when the error is non-nil, callers must ignore the
-// state value entirely (it may be the zero value, PathAbsent).
+// state value entirely (it may be the zero value, PathUnknown).
 
 // PathState is the kind of object found at a probed path. It is
 // deliberately not generic filesystem metadata: the lifecycle cares
 // about evidence of presence, absence and directory-ness, and nothing
 // else. Any state that cannot be positively established is an error,
 // not a PathState.
+//
+// PathUnknown is deliberately the ZERO value, mirroring RunFate: a
+// probe result whose state was never set — the classic
+// `return transport.PathState{}, nil` wrapper mistake — claims
+// NOTHING, never proven absence. Absence is a positive fact and must
+// be set explicitly; consumers reject PathUnknown and any value outside
+// the enum as the error it is.
 type PathState int
 
 const (
-	PathAbsent    PathState = iota // proven: no object occupies the path
-	PathFile                       // proven: a non-directory object occupies the path
-	PathDirectory                  // proven: a directory occupies the path
+	// PathUnknown is the zero value: a probe that cannot speak has
+	// claimed nothing, and every consumer must treat it as an error.
+	PathUnknown   PathState = iota
+	PathAbsent              // proven: no object occupies the path
+	PathFile                // proven: a non-directory object occupies the path
+	PathDirectory           // proven: a directory occupies the path
 )
 
 type PutRequest struct {
