@@ -51,15 +51,16 @@ exactly ONE deployctl.result/v1 document on stdout
 
 ```jsonc
 {
-  "schema":           "deployctl.result/v1",  // always
-  "command":          "deploy",               // enum, below
-  "outcome":          "success",              // enum, below
-  "project":          "my-app",               // when known
-  "environment":      "production",           // when known
-  "recoveryRequired": false,                  // always
-  "safeToRetry":      true,                   // always
-  "message":          "...",                  // NON-CONTRACTUAL, below
-  "data":             { }                     // per-command shape, below
+  "schema":              "deployctl.result/v1",  // always
+  "command":             "deploy",               // enum, below
+  "outcome":             "success",              // enum, below
+  "project":             "my-app",               // when known
+  "environment":         "production",           // when known
+  "recoveryRequired":    false,                  // always
+  "safeToRetry":         true,                   // always
+  "lockReleaseFailed":   false,                  // (v1 additive; present only when true)
+  "message":             "...",                  // NON-CONTRACTUAL, below
+  "data":                { }                     // per-command shape, below
 }
 ```
 
@@ -72,6 +73,7 @@ exactly ONE deployctl.result/v1 document on stdout
 | `environment`       | when known      | Same rule.                                                                                                                                                    |
 | `recoveryRequired`  | always          | The toolkit's **authoritative conclusion** that recovery or resolution is currently required. Raw marker presence is a separate fact, reported in `data.attempt` / `data.recovery` — `false` does **not** imply marker absence, especially while the environment is `locked` or `degraded`. See the semantics section. |
 | `safeToRetry`       | always          | `true` **only** when re-running the same command after the infrastructure problem is fixed is known-safe (no consequential work executed). `false` otherwise.  |
+| `lockReleaseFailed` | v1 additive; present only when `true` | The invocation could not release its acquired environment lock — the environment stays locked until manual cleanup, **whatever the `outcome`**. Records a fact; it does not change the classification. See `lockRetained` for the deliberate-retention counterpart. |
 | `message`           | always          | **Explicitly non-contractual.** Human-oriented prose. Never parse it, never branch on it, never assert on it in tests. All machine decisions come from the fields. |
 | `data`              | per command     | Command-specific shape. Absent only when there is nothing meaningful to report.                                                                               |
 
@@ -193,8 +195,23 @@ fate:
 | hook fate unknown after the boundary                  | `uncertain`              | `true`             | `false`       | `true`         |
 
 `lockRetained` is deliberately **not** set when a lock-release attempt
-failed — that is a different situation and surfaces as a joined
-failure, never as deliberate retention.
+failed — that is a different situation and surfaces as the envelope
+fact `lockReleaseFailed: true` (joined with the operation's own
+outcome, never changing its classification). The two facts are
+mutually exclusive:
+
+```text
+lockRetained      = the lock was deliberately NOT released
+                    (a hook's execution fate is unknown)
+lockReleaseFailed = the lock release was attempted and failed
+                    (manual cleanup required)
+```
+
+A `resolution` whose markers were removed and whose lock release then
+failed reports `outcome: infrastructure-failure` with
+`lockReleaseFailed: true` and `recoveryRequired: false` — the block is
+down; only cleanup failed. When markers remain, `recoveryRequired` is
+`true` and `data.remaining*Id` names exactly what survives.
 
 ### Evidence taxonomy (recovery resolve preflight)
 

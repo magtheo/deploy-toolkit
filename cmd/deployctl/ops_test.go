@@ -895,9 +895,10 @@ func TestRecoveryResolveCommand(t *testing.T) {
 	os.Remove(f.statePath())
 
 	// A sentence naming a marker that is not there: refused by the
-	// engine's identity binding, nothing changed.
+	// engine's identity binding, nothing changed — the block remains,
+	// and the human text now says exactly that (fact-driven).
 	code, _, errOut = runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
-	if code != exitFailed || !strings.Contains(errOut, "NOT removed") {
+	if code != exitFailed || !strings.Contains(errOut, "block remains") {
 		t.Fatalf("absent-marker confirmation: exit = %d, stderr =\n%s", code, errOut)
 	}
 	if _, err := os.Stat(f.attemptPath()); err != nil {
@@ -1710,4 +1711,45 @@ func TestCorruptEvidenceIsRefusalNotInfra(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The resolve preflight refusal must carry the HONEST blocked fact:
+// untrustworthy evidence does not establish that a valid marker exists,
+// so recoveryRequired stays false and no marker identity is fabricated.
+func TestJSONResolveCorruptEvidenceIsNotRecoveryRequired(t *testing.T) {
+	t.Run("corrupt state, no markers", func(t *testing.T) {
+		f := newCLIFixture(t)
+		writeFileCLIF(t, f.statePath(), "{corrupt")
+		code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
+		if code != exitFailed || doc["outcome"] != "refused" {
+			t.Fatalf("shape = %v/%d, want refused/1", doc["outcome"], code)
+		}
+		if doc["recoveryRequired"] != false {
+			t.Errorf("recoveryRequired = %v, want false: corrupt state proves no marker", doc["recoveryRequired"])
+		}
+		data, _ := doc["data"].(map[string]any)
+		// The ids are omitempty: an absent or empty id both mean "no
+		// valid marker was read" — never a fabricated identity.
+		if v := data["remainingAttemptId"]; v != nil && v != "" {
+			t.Errorf("remainingAttemptId = %v, want absent: no valid marker was read", v)
+		}
+		if v := data["remainingRecoveryId"]; v != nil && v != "" {
+			t.Errorf("remainingRecoveryId = %v, want absent", v)
+		}
+	})
+	t.Run("corrupt attempt marker", func(t *testing.T) {
+		f := newCLIFixture(t)
+		writeFileCLIF(t, f.attemptPath(), "{corrupt")
+		code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
+		if code != exitFailed || doc["outcome"] != "refused" {
+			t.Fatalf("shape = %v/%d, want refused/1", doc["outcome"], code)
+		}
+		if doc["recoveryRequired"] != false {
+			t.Errorf("recoveryRequired = %v, want false: an unreadable marker is not a valid one", doc["recoveryRequired"])
+		}
+		data, _ := doc["data"].(map[string]any)
+		if v := data["remainingAttemptId"]; v != nil && v != "" {
+			t.Errorf("remainingAttemptId = %v, want absent: no valid marker was read", v)
+		}
+	})
 }

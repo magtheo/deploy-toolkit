@@ -124,8 +124,9 @@ func TestCompoundFailureSurfacesBothFacts(t *testing.T) {
 		if code != exitFailed || doc.Outcome != "refused" {
 			t.Fatalf("shape = %v/%d, want refused/1", doc.Outcome, code)
 		}
-		if !strings.Contains(doc.Message, "invalid") || !strings.Contains(doc.Message, "COULD NOT BE RELEASED") {
-			t.Errorf("message hides part of the compound state: %q", doc.Message)
+		// The machine fact is the STRUCTURED field — never the message.
+		if doc.LockReleaseFailed != true {
+			t.Errorf("lockReleaseFailed = %v, want true (cli-v1: never parse the message)", doc.LockReleaseFailed)
 		}
 	})
 	t.Run("rollback json", func(t *testing.T) {
@@ -133,8 +134,8 @@ func TestCompoundFailureSurfacesBothFacts(t *testing.T) {
 		if code != exitFailed || doc.Outcome != "refused" {
 			t.Fatalf("shape = %v/%d, want refused/1", doc.Outcome, code)
 		}
-		if !strings.Contains(doc.Message, "invalid") || !strings.Contains(doc.Message, "COULD NOT BE RELEASED") {
-			t.Errorf("message hides part of the compound state: %q", doc.Message)
+		if doc.LockReleaseFailed != true {
+			t.Errorf("lockReleaseFailed = %v, want true (cli-v1: never parse the message)", doc.LockReleaseFailed)
 		}
 	})
 	t.Run("human warning", func(t *testing.T) {
@@ -147,6 +148,53 @@ func TestCompoundFailureSurfacesBothFacts(t *testing.T) {
 		warnLockReleaseFailed(&buf, evidence)
 		if buf.Len() != 0 {
 			t.Errorf("warning printed without the sentinel: %q", buf.String())
+		}
+	})
+}
+
+// The lockReleaseFailed envelope fact on recovery resolve, with
+// fact-driven rendering: a cleanup-window release failure after
+// successful marker removals must say "completed", not claim markers
+// remain; a partial clear names exactly what survives.
+func TestResolveLockReleaseFailedRendering(t *testing.T) {
+	t.Run("full resolve then release failure", func(t *testing.T) {
+		rep := &lifecycle.ResolveReport{
+			Project: "my-app", Environment: "production",
+			ResolvedAttemptID: "0123456789abcdef", HistorySeq: 3,
+		}
+		joined := errors.Join(errors.New("resolution recorded"), fmt.Errorf("lock: %w", lifecycle.ErrLockReleaseFailed))
+		doc, code := resolveResult(rep, joined, false)
+		if code != exitInfra || doc.Outcome != "infrastructure-failure" {
+			t.Fatalf("shape = %v/%d", doc.Outcome, code)
+		}
+		if doc.LockReleaseFailed != true {
+			t.Errorf("lockReleaseFailed = %v, want true", doc.LockReleaseFailed)
+		}
+		if doc.RecoveryRequired != false {
+			t.Errorf("recoveryRequired = %v, want false: markers were removed", doc.RecoveryRequired)
+		}
+		if !strings.Contains(doc.Message, "completed") {
+			t.Errorf("message = %q, want completion (not markers-remain)", doc.Message)
+		}
+	})
+	t.Run("partial resolve then release failure", func(t *testing.T) {
+		rep := &lifecycle.ResolveReport{
+			Project: "my-app", Environment: "production",
+			ResolvedRecoveryID:  "0123456789abcdef",
+			AttemptPresentAfter: true, AttemptMarkerID: "fedcba9876543210",
+			RecoveryRequired: true,
+		}
+		joined := errors.Join(errors.New("clear attempt marker: exit 1"), fmt.Errorf("lock: %w", lifecycle.ErrLockReleaseFailed))
+		doc, _ := resolveResult(rep, joined, false)
+		if doc.LockReleaseFailed != true || doc.RecoveryRequired != true {
+			t.Errorf("shape = %v/%v, want true/true", doc.LockReleaseFailed, doc.RecoveryRequired)
+		}
+		if !strings.Contains(doc.Message, "block remains") {
+			t.Errorf("message = %q, want the block-remains fact", doc.Message)
+		}
+		data, _ := doc.Data.(*resolveResultData)
+		if data == nil || data.RemainingAttemptID != "fedcba9876543210" {
+			t.Errorf("remaining attempt id = %+v, want the survivor", data)
 		}
 	})
 }

@@ -103,7 +103,10 @@ func refuseResolve(format string, args ...any) error {
 // Evidence is recorded BEFORE the markers are removed (attempt first,
 // recovery last), so a failed history write leaves the block in place
 // and the invocation can simply be retried.
-func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
+// Resolve returns NAMED values on purpose: the deferred lock-release
+// cleanup joins a release failure into err — with unnamed returns that
+// assignment would be dropped and the failed cleanup silently lost.
+func Resolve(ctx context.Context, in ResolveInput) (rep *ResolveReport, err error) {
 	switch {
 	case in.Target == nil:
 		return nil, fmt.Errorf("ResolveInput.Target is required")
@@ -123,7 +126,7 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	if now == nil {
 		now = time.Now
 	}
-	rep := &ResolveReport{
+	rep = &ResolveReport{
 		Project:     in.Project,
 		Environment: in.Environment.Metadata.Name,
 	}
@@ -151,7 +154,9 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
 		defer cancel()
 		if relErr := lock.Release(cleanupCtx); relErr != nil {
-			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w", lockDir, relErr))
+			// Same sentinel as deploy/rollback: the release failure is
+			// a machine-reachable fact, joinable with any outcome.
+			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w: %w", lockDir, ErrLockReleaseFailed, relErr))
 		}
 	}()
 

@@ -46,6 +46,11 @@ type resultEnvelope struct {
 	Outcome     string `json:"outcome"`
 	Project     string `json:"project,omitempty"`
 	Environment string `json:"environment,omitempty"`
+	// LockReleaseFailed (compatible v1 envelope extension): the
+	// invocation's environment lock could not be released — the
+	// environment stays locked until manual cleanup, whatever the
+	// outcome classification. See cli-v1.md.
+	LockReleaseFailed bool `json:"lockReleaseFailed,omitempty"`
 	// RecoveryRequired: an unresolved attempt/recovery marker (or a
 	// partial resolution leaving one) blocks normal operation.
 	RecoveryRequired bool `json:"recoveryRequired"`
@@ -229,6 +234,8 @@ func noteLockReleaseFailed(env *resultEnvelope, err error) {
 	if err == nil || !errors.Is(err, lifecycle.ErrLockReleaseFailed) {
 		return
 	}
+	// The structured fact is the contract; the prose is a courtesy.
+	env.LockReleaseFailed = true
 	env.Message += " — THE ENVIRONMENT LOCK COULD NOT BE RELEASED: manual cleanup is required; no other operation may start until it is removed"
 }
 
@@ -448,8 +455,17 @@ func resolveResult(rep *lifecycle.ResolveReport, err error, refused bool) (*resu
 		env.RecoveryRequired = rep.RecoveryRequired
 		env.Message = "refused: " + err.Error()
 	case err != nil:
+		// Fact-driven, not coarse: RecoveryRequired is the engine's
+		// post-run fact. A cleanup-window release failure after
+		// successful removals must not claim markers remain, and a
+		// partial clear must not claim ALL markers remain — the
+		// remaining*Id fields name exactly what survives.
 		env.Outcome = outcomeInfraFailed
-		env.Message = "infrastructure failure; the markers were NOT removed: " + err.Error()
+		if rep.RecoveryRequired {
+			env.Message = "infrastructure failure; the block remains: unresolved marker(s) are still on the target: " + err.Error()
+		} else {
+			env.Message = "marker resolution completed, but environment-lock cleanup failed: " + err.Error()
+		}
 	case rep.NothingToResolve:
 		env.Outcome = outcomeSuccess
 		env.SafeToRetry = true
@@ -458,6 +474,7 @@ func resolveResult(rep *lifecycle.ResolveReport, err error, refused bool) (*resu
 		env.Outcome = outcomeSuccess
 		env.Message = "resolution recorded and authorized markers removed"
 	}
+	noteLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
 }
 

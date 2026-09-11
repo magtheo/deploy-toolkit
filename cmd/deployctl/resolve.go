@@ -275,7 +275,7 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	blocked := aerr == nil || rerr == nil
 	refuseJSON := func(format string, args ...any) int {
 		if jsonMode {
-			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: true, Message: fmt.Sprintf(format, args...), Data: blockData()})
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: blocked, Message: fmt.Sprintf(format, args...), Data: blockData()})
 		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %s\n", envName, fmt.Sprintf(format, args...))
 		fmt.Fprintln(stderr, "  Unreadable evidence must be repaired, not resolved. Run `deployctl status`.")
@@ -410,8 +410,14 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 			return emitJSON(stdout, mustEnvelope(resolveResult(rep, err, errors.Is(err, lifecycle.ErrResolveRefused))))
 		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
-		fmt.Fprintln(stderr, "  The markers were NOT removed — the block is still in place.")
-		fmt.Fprintln(stderr, "  Run `deployctl status` and follow its guidance.")
+		warnLockReleaseFailed(stderr, err)
+		if rep != nil && !rep.RecoveryRequired {
+			fmt.Fprintln(stderr, "  Marker resolution completed, but the environment lock could not be")
+			fmt.Fprintln(stderr, "  released — manual cleanup required. Run `deployctl status`.")
+		} else {
+			fmt.Fprintln(stderr, "  The block remains: unresolved marker(s) are still on the target.")
+			fmt.Fprintln(stderr, "  Run `deployctl status` and follow its guidance.")
+		}
 		return exitFailed
 	}
 	if env, code := resolveResult(rep, nil, false); jsonMode {

@@ -359,3 +359,61 @@ func TestEvidenceRefusalWithFailedReleaseStaysCompound(t *testing.T) {
 		t.Errorf("rep = %+v, a FAILED release is a joined error, not a deliberate retention", rep)
 	}
 }
+
+// Full resolve completes, then the lock release fails: the markers ARE
+// gone (resolution recorded, rm -f succeeded), only cleanup failed.
+// The sentinel must be reachable and the report must NOT claim the
+// markers remain.
+func TestResolveFullResolutionThenReleaseFailure(t *testing.T) {
+	f := newFixture(t, "my-app", nil)
+	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+
+	// Unresolved attempt via unknown-fate apply, then the operator
+	// removes the retained lock.
+	tgt, err := target.New(&unknownFateTransport{
+		inner:     local.New(),
+		unknownIn: func(argv []string) bool { return strings.Contains(argv[0], "apply.sh") },
+	}, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed, err := Deploy(t.Context(), DeployInput{
+		Target: tgt, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "1.0.0"), Release: rel, Bundle: bundleBytes, Owner: "test",
+	})
+	if err == nil {
+		t.Fatal("setup: unknown-fate deploy must fail")
+	}
+	if err := os.RemoveAll(f.lockDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Resolve with a transport whose rmdir fails: marker removal (rm -f)
+	// succeeds, the lock's rmdir does not.
+	tr := &failingRunTransport{
+		inner:       local.New(),
+		failRunWhen: func(argv []string) bool { return argv[0] == "rmdir" },
+	}
+	tgt2, err := target.New(tr, f.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := resolveInput(t, f, "", failed.AttemptID)
+	in.Target = tgt2
+	rep, err := Resolve(t.Context(), in)
+	if err == nil {
+		t.Fatalf("rep = %+v, want the release failure", rep)
+	}
+	if !errors.Is(err, ErrLockReleaseFailed) {
+		t.Errorf("err = %v, want the lock-release sentinel", err)
+	}
+	if rep.ResolvedAttemptID != failed.AttemptID {
+		t.Errorf("resolved = %q, want the attempt removed", rep.ResolvedAttemptID)
+	}
+	if rep.RecoveryRequired {
+		t.Errorf("rep = %+v, the markers were removed: the block is NOT up", rep)
+	}
+	if attemptPresent(t, f) {
+		t.Error("the attempt marker was not removed")
+	}
+}
