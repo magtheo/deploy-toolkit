@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/magtheo/deploy-toolkit/internal/transport"
 	"io"
 	"strings"
 
@@ -290,7 +291,23 @@ func lockHeld(ctx context.Context, tgt *target.Target, dc *deploymentContext) (b
 	if err != nil {
 		return false, err
 	}
-	return tgt.Exists(ctx, path)
+	// Lock semantics are type-aware, matching AcquireEnvLock (which
+	// only reports held when the path is an actual directory): a
+	// directory is a held lock, proven absence is free, and anything
+	// else occupying the path is broken evidence — an error, which the
+	// status classification renders as degraded, never as free.
+	st, err := tgt.ProbePath(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	switch st {
+	case transport.PathDirectory:
+		return true, nil
+	case transport.PathAbsent:
+		return false, nil
+	default:
+		return false, fmt.Errorf("lock path %s is not a directory (broken target hierarchy)", path)
+	}
 }
 
 // buildStatusJSON assembles the machine document from the same facts the

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -121,51 +122,97 @@ func ParsePrivateKey(data []byte) (gossh.Signer, error) {
 
 func (t *Transport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
 	if ctx.Err() != nil {
-		return transport.RunResult{}, ctx.Err()
+		return transport.RunResult{Fate: transport.RunNotStarted}, ctx.Err()
 	}
 	if err := transport.ValidateRunRequest(req); err != nil {
-		return transport.RunResult{}, err
+		return transport.RunResult{Fate: transport.RunNotStarted}, err
 	}
 	dir, err := transport.ValidateAbsolutePath(req.Dir)
 	if err != nil {
-		return transport.RunResult{}, &transport.StartError{Err: fmt.Errorf("working directory: %w", err)}
+		return transport.RunResult{Fate: transport.RunNotStarted}, &transport.StartError{Err: fmt.Errorf("working directory: %w", err)}
 	}
 	command, err := buildCommand(dir, req.Env, req.Argv)
 	if err != nil {
-		return transport.RunResult{}, err
+		return transport.RunResult{Fate: transport.RunNotStarted}, err
 	}
 	session, err := t.conn.NewSession()
 	if err != nil {
-		return transport.RunResult{}, fmt.Errorf("ssh: open session: %w", err)
+		// No session exists, so no exec request was ever sent.
+		return transport.RunResult{Fate: transport.RunNotStarted}, fmt.Errorf("ssh: open session: %w", err)
 	}
 	defer session.Close()
 
 	var stdout, stderr bytes.Buffer
 	session.Stdout = &stdout
 	session.Stderr = &stderr
-	done := make(chan error, 1)
-	go func() { done <- session.Run(command) }()
+
+	// Outcome of the two execution phases, from the worker goroutine.
+	type sshOutcome struct {
+		startErr error // Start phase failed (exec request never confirmed)
+		waitErr  error // Wait phase result (empty when startErr != nil)
+	}
+	done := make(chan sshOutcome, 1)
+	go func() {
+		if serr := session.Start(command); serr != nil {
+			done <- sshOutcome{startErr: serr}
+			return
+		}
+		done <- sshOutcome{waitErr: session.Wait()}
+	}()
 
 	select {
 	case <-ctx.Done():
+		// Control-plane cancellation only (verified against OpenSSH):
+		// closing the session/channel does NOT terminate the remote
+		// process, and no signal is delivered. The exec request was
+		// sent (Start had returned) or is in flight — either way the
+		// remote fate is unknowable, never a claimed termination.
 		session.Close()
 		<-done
-		return transport.RunResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
-	case err := <-done:
-		res := transport.RunResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
-		if err == nil {
-			return res, nil
+		return transport.RunResult{Fate: transport.RunUnknown, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, ctx.Err()
+	case out := <-done:
+		if out.startErr == nil {
+			return t.runOutcome(req, out.waitErr, stdout, stderr)
 		}
-		exitErr, ok := err.(*gossh.ExitError)
-		if !ok {
-			return res, fmt.Errorf("ssh: run: %w", err)
+		// The exec request failed. In the pinned x/crypto v0.56.0,
+		// Session.Start produces exactly ONE distinguishable error
+		// shape: "ssh: command <cmd> failed", generated ONLY when the
+		// server positively replied ok=false to the exec request — a
+		// proven rejection, nothing started. Every other Start error is
+		// the underlying SendRequest failure (connection died while the
+		// request was in flight — the command may be running), and
+		// s.start() has no failure return in this version. So: exact
+		// rejection shape → RunNotStarted; everything else →
+		// conservatively RunUnknown.
+		if out.startErr.Error() == fmt.Sprintf("ssh: command %v failed", command) {
+			return transport.RunResult{Fate: transport.RunNotStarted}, &transport.StartError{Err: fmt.Errorf("ssh: exec request rejected for %s", req.Argv[0])}
 		}
-		res.ExitCode = exitErr.ExitStatus()
-		if res.ExitCode == 126 || res.ExitCode == 127 {
-			return res, &transport.StartError{ExitCode: res.ExitCode, Err: fmt.Errorf("target dispatch failed for %s in %s", req.Argv[0], dir)}
-		}
+		return transport.RunResult{Fate: transport.RunUnknown, Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}, fmt.Errorf("ssh: exec %s: %w", req.Argv[0], out.startErr)
+	}
+}
+
+// runOutcome maps a completed session.Wait into the fate contract: an
+// observed exit code is determined (RunExited) — including the SSH
+// 126/127 dispatch convention surfaced as StartError — while any other
+// Wait error means the channel died mid-run and the remote fate is
+// unknowable (RunUnknown).
+func (t *Transport) runOutcome(req transport.RunRequest, waitErr error, stdout, stderr bytes.Buffer) (transport.RunResult, error) {
+	res := transport.RunResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
+	if waitErr == nil {
+		res.Fate = transport.RunExited
 		return res, nil
 	}
+	exitErr, ok := waitErr.(*gossh.ExitError)
+	if !ok {
+		res.Fate = transport.RunUnknown
+		return res, fmt.Errorf("ssh: run: %w", waitErr)
+	}
+	res.Fate = transport.RunExited
+	res.ExitCode = exitErr.ExitStatus()
+	if res.ExitCode == 126 || res.ExitCode == 127 {
+		return res, &transport.StartError{ExitCode: res.ExitCode, Err: fmt.Errorf("target dispatch failed for %s", req.Argv[0])}
+	}
+	return res, nil
 }
 
 // Put stages req.Content atomically at req.Path via a dedicated SFTP
@@ -187,6 +234,17 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 	if mode == 0 {
 		mode = 0o644
 	}
+	return t.withSFTP(ctx, func(cl *sftp.Client) error {
+		return sftpPut(cl, dst, mode, req.Content)
+	})
+}
+
+// withSFTP runs fn with one dedicated SFTP client on one dedicated SSH
+// session — the same pattern Put has always used, now shared so a probe
+// walks the whole parent chain inside a single session rather than
+// paying a session per component. Closing the session unblocks the
+// caller on cancellation; the sftp client is closed by fn's deferral.
+func (t *Transport) withSFTP(ctx context.Context, fn func(cl *sftp.Client) error) error {
 	session, err := t.conn.NewSession()
 	if err != nil {
 		return fmt.Errorf("ssh: open sftp session: %w", err)
@@ -214,7 +272,7 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 			return
 		}
 		defer cl.Close()
-		done <- sftpPut(cl, dst, mode, req.Content)
+		done <- fn(cl)
 	}()
 	select {
 	case err := <-done:
@@ -224,6 +282,73 @@ func (t *Transport) Put(ctx context.Context, req transport.PutRequest) error {
 		<-done
 		return ctx.Err()
 	}
+}
+
+// ProbePath implements transport.Transport. Absence is PROVEN, never
+// guessed from a status code: the walk starts at "/" — the one anchor
+// that must exist on any Linux target — and descends component by
+// component. At every step, all previously traversed prefixes have been
+// positively stat-verified as directories, so when a later component
+// reports SSH_FX_NO_SUCH_FILE, ENOTDIR is impossible: servers (OpenSSH
+// included) map both ENOENT and ENOTDIR onto that one status, and the
+// walk is what removes the ambiguity. A missing component is therefore
+// proven absence of everything beneath it — including a deployRoot that
+// does not exist yet, which is a legitimate fresh-target fact, not an
+// error. A non-directory where a directory is required, a permission
+// failure, any other protocol code, and transport failures are errors —
+// "cannot establish" is never mapped to absence.
+//
+// The walk trusts that each stat sees a stable namespace for its
+// duration; an external actor rewriting an already-verified parent
+// mid-walk is outside v0.1's threat model (the toolkit serializes its
+// own operations, and SFTP offers no openat-style atomic walk to do
+// better without disguising an assumption as atomicity).
+func (t *Transport) ProbePath(ctx context.Context, path string) (transport.PathState, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	p, err := transport.ValidateAbsolutePath(path)
+	if err != nil {
+		return 0, err
+	}
+	var state transport.PathState
+	err = t.withSFTP(ctx, func(cl *sftp.Client) error {
+		st, perr := probeSFTPPath(cl, p)
+		state = st
+		return perr
+	})
+	return state, err
+}
+
+func probeSFTPPath(cl *sftp.Client, p string) (transport.PathState, error) {
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	cur := "/"
+	for i, part := range parts {
+		fi, err := cl.Stat(path.Join(cur, part))
+		if err != nil {
+			switch {
+			case errors.Is(err, os.ErrNotExist):
+				// Every earlier prefix was positively verified as a
+				// directory, so this cannot be ENOTDIR: proven absence.
+				return transport.PathAbsent, nil
+			case errors.Is(err, os.ErrPermission):
+				return 0, fmt.Errorf("target: probe %s: %s: permission denied", p, path.Join(cur, part))
+			default:
+				return 0, fmt.Errorf("target: probe %s: %s: %w", p, path.Join(cur, part), err)
+			}
+		}
+		if i == len(parts)-1 {
+			if fi.IsDir() {
+				return transport.PathDirectory, nil
+			}
+			return transport.PathFile, nil
+		}
+		if !fi.IsDir() {
+			return 0, fmt.Errorf("target: probe %s: %s is not a directory (broken target hierarchy)", p, path.Join(cur, part))
+		}
+		cur = path.Join(cur, part)
+	}
+	return transport.PathDirectory, nil
 }
 
 func sftpPut(cl *sftp.Client, dst string, mode os.FileMode, content []byte) error {

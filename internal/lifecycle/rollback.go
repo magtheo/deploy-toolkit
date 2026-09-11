@@ -103,6 +103,12 @@ type RollbackReport struct {
 	RecoveryStarted bool
 	HistorySeq      int64
 	FailureReason   string
+	// LockRetained records that the invocation deliberately did NOT
+	// release its acquired environment lock because a lifecycle hook's
+	// execution fate was RunUnknown — the hook process may still be
+	// running. A controlled crash, not a release failure (which surfaces
+	// as a joined error instead).
+	LockRetained bool
 }
 
 // Rollback is the explicit recovery operation. It is deliberately NOT a
@@ -195,11 +201,19 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	if err != nil {
 		return rep, err
 	}
+	// Lifecycle-local retain state (mirrors Deploy): Release stays
+	// literal and is skipped entirely on a deliberate retention.
+	releaseLock := true
 	defer func() {
+		if !releaseLock {
+			return
+		}
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
 		defer cancel()
 		if relErr := lock.Release(cleanupCtx); relErr != nil {
-			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w", lockDir, relErr))
+			// Carry the sentinel so rendering can surface the compound
+			// state instead of a single classification.
+			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w: %w", lockDir, ErrLockReleaseFailed, relErr))
 		}
 	}()
 
@@ -414,8 +428,16 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	if err != nil {
 		return rep, fmt.Errorf("hook environment: %w", err)
 	}
+	// RunUnknown fate retains the lock for every hook, preflight
+	// included (mirrors Deploy: the hook-execution boundary and the
+	// durable recovery boundary are different).
 	runToStage := func(name string, step *manifest.LifecycleStep) (StageResult, error) {
-		return runStageStep(ctx, in.Target.Transport(), name, toDir, toHenv, step)
+		sr, err := runStageStep(ctx, in.Target.Transport(), name, toDir, toHenv, step)
+		if sr.Unknown {
+			releaseLock = false
+			rep.LockRetained = true
+		}
+		return sr, err
 	}
 
 	// The To release's preflight decides whether the restore may begin.
@@ -469,7 +491,16 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	if from.Migration.Mode != manifest.MigrationNone {
 		sr, ierr = runStageStep(ctx, in.Target.Transport(), "rollback", fromDir, fromHenv, fromContract.Lifecycle.Rollback)
 		rep.Stages = append(rep.Stages, sr)
+		if sr.Unknown {
+			releaseLock = false
+			rep.LockRetained = true
+		}
 		if ierr != nil {
+			if sr.Unknown {
+				// The recovery marker exists (written before this
+				// stage), so recovery is required as a fact.
+				rep.RecoveryRequired = true
+			}
 			return failInfra("rollback could not be executed", ierr)
 		}
 		if sr.Failed {
@@ -480,6 +511,9 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	sr, ierr = runToStage("apply", toContract.Lifecycle.Apply)
 	rep.Stages = append(rep.Stages, sr)
 	if ierr != nil {
+		if sr.Unknown {
+			rep.RecoveryRequired = true
+		}
 		return failInfra("apply could not be executed", ierr)
 	}
 	if sr.Failed {
@@ -489,6 +523,9 @@ func Rollback(ctx context.Context, in RollbackInput) (rep *RollbackReport, err e
 	sr, ierr = runToStage("verify", toContract.Lifecycle.Verify)
 	rep.Stages = append(rep.Stages, sr)
 	if ierr != nil {
+		if sr.Unknown {
+			rep.RecoveryRequired = true
+		}
 		return failInfra("verify could not be executed", ierr)
 	}
 	if sr.Failed {
@@ -637,6 +674,9 @@ func validateRollbackTransition(in RollbackInput) error {
 // the durable marker, not the invocation finishing the bookkeeping, is
 // authoritative for who changed production.
 func recordRollbackOutcome(ctx context.Context, in RollbackInput, now func() time.Time, rep *RollbackReport, kind, authorization string) error {
+	// Mirror deploy: evidence finalization is context-independent.
+	ctx, cancel := evidenceCtx()
+	defer cancel()
 	stages := make(map[string]any, len(rep.Stages))
 	for _, s := range rep.Stages {
 		switch {

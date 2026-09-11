@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -211,8 +212,33 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 
 func reportRollback(rep *lifecycle.RollbackReport, err error, envName string, stdout, stderr io.Writer) int {
 	if err != nil {
+		if errors.Is(err, lifecycle.ErrEnvLockHeld) {
+			fmt.Fprintf(stderr, "✗ rollback %s: refused: the environment lock is held — another\noperation may currently be executing.\n", envName)
+			warnLockReleaseFailed(stderr, err)
+			fmt.Fprintln(stderr, "  Do not rerun mechanically. Run `deployctl status`; only remove a stale")
+			fmt.Fprintln(stderr, "  lock after verifying no recovery is in flight.")
+			return exitFailed
+		}
+		if errors.Is(err, target.ErrEvidenceInvalid) {
+			fmt.Fprintf(stderr, "✗ rollback %s: refused: durable evidence on the target exists but is invalid.\n", envName)
+			warnLockReleaseFailed(stderr, err)
+			fmt.Fprintln(stderr, "  Rerunning cannot help while the evidence is invalid. Run `deployctl status`, inspect")
+			fmt.Fprintln(stderr, "  the affected evidence and verify the target's actual state before following the")
+			fmt.Fprintln(stderr, "  recovery procedure. Do NOT edit observed state merely to make this proceed.")
+			return exitFailed
+		}
 		fmt.Fprintf(stderr, "✗ rollback %s: infrastructure failure: %v\n", envName, err)
+		warnLockReleaseFailed(stderr, err)
 		switch {
+		case rep != nil && rep.LockRetained:
+			fmt.Fprintln(stderr, "  A lifecycle hook's execution fate could not be established: the hook")
+			fmt.Fprintln(stderr, "  process may still be running. The environment lock was deliberately")
+			fmt.Fprintln(stderr, "  retained. Verify the target — nothing may still be executing — and")
+			fmt.Fprintln(stderr, "  only then remove the lock by hand and proceed deliberately.")
+			if rep.RecoveryStarted {
+				fmt.Fprintln(stderr, "  A recovery marker is unresolved: run the recovery after cleanup.")
+			}
+			return exitInfra
 		case rep != nil && rep.Committed:
 			fmt.Fprintln(stderr, "  The observed state is committed; the recovery itself succeeded.")
 			fmt.Fprintln(stderr, "  Post-commit bookkeeping failed. Run `deployctl status` before")

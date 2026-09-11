@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
+	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
 // runDeploy executes a deployment of the release the environment pins.
@@ -114,8 +116,33 @@ func reportDeploy(rep *lifecycle.Report, err error, stdout, stderr io.Writer) in
 		if rep != nil {
 			env = rep.Project + "/" + rep.Environment
 		}
+		if errors.Is(err, lifecycle.ErrEnvLockHeld) {
+			fmt.Fprintf(stderr, "✗ deploy %s: refused: the environment lock is held — another\noperation may currently be executing.\n", env)
+			warnLockReleaseFailed(stderr, err)
+			fmt.Fprintln(stderr, "  Do not rerun mechanically. Run `deployctl status`; only remove a stale")
+			fmt.Fprintln(stderr, "  lock after verifying no deployment is in flight.")
+			return exitFailed
+		}
+		if errors.Is(err, target.ErrEvidenceInvalid) {
+			fmt.Fprintf(stderr, "✗ deploy %s: refused: durable evidence on the target exists but is invalid.\n", env)
+			warnLockReleaseFailed(stderr, err)
+			fmt.Fprintln(stderr, "  Rerunning cannot help while the evidence is invalid. Run `deployctl status`, inspect")
+			fmt.Fprintln(stderr, "  the affected evidence and verify the target's actual state before following the")
+			fmt.Fprintln(stderr, "  recovery procedure. Do NOT edit observed state merely to make this proceed.")
+			return exitFailed
+		}
 		fmt.Fprintf(stderr, "✗ deploy %s: infrastructure failure: %v\n", env, err)
+		warnLockReleaseFailed(stderr, err)
 		switch {
+		case rep != nil && rep.LockRetained:
+			fmt.Fprintln(stderr, "  A lifecycle hook's execution fate could not be established: the hook")
+			fmt.Fprintln(stderr, "  process may still be running. The environment lock was deliberately")
+			fmt.Fprintln(stderr, "  retained. Verify the target — nothing may still be executing — and")
+			fmt.Fprintln(stderr, "  only then remove the lock by hand and proceed deliberately.")
+			if rep.ConsequentialStarted {
+				fmt.Fprintln(stderr, "  An attempt marker is unresolved: run the recovery after cleanup.")
+			}
+			return exitInfra
 		case rep != nil && rep.Committed:
 			fmt.Fprintln(stderr, "  The observed state is committed; the deployment itself succeeded.")
 			fmt.Fprintln(stderr, "  Post-commit bookkeeping failed. Run `deployctl status` before")

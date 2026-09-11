@@ -454,7 +454,15 @@ func TestRollbackFailedRecoveryRequiresExplicitResolution(t *testing.T) {
 	if st, err := f.target.ReadState(t.Context(), "my-app", "production"); err != nil || st.Current.Release != "1.0.0" {
 		t.Fatalf("state must be untouched by the failed recovery: %+v, %v", st.Current, err)
 	}
-	requireNoLock(t, f)
+	// The mid-run transport loss has unknown fate: the lock is retained
+	// (a controlled crash). The operator verifies and removes it by hand
+	// before any retry.
+	if _, statErr := os.Stat(f.lockDir()); statErr != nil {
+		t.Fatalf("lock must survive an unknown-fate recovery (stat err = %v)", statErr)
+	}
+	if err := os.RemoveAll(f.lockDir()); err != nil {
+		t.Fatal(err)
+	}
 	afterFirst := order(t, f.marker)
 	if strings.Count(strings.Join(afterFirst, ","), "rollback-2.0.0") != 1 {
 		t.Fatalf("rollback hook execution = %v, want exactly one rollback hook run", afterFirst)
@@ -542,6 +550,11 @@ func TestRollbackEmergencyRetryIsRefusedNotReplayed(t *testing.T) {
 	}
 	afterFirst := order(t, f.marker)
 
+	// The retained lock from the unknown-fate failure must be removed by
+	// the operator before the retry (controlled-crash semantics).
+	if err := os.RemoveAll(f.lockDir()); err != nil {
+		t.Fatal(err)
+	}
 	rep, err := Rollback(t.Context(), rollbackInput(t, f, f.revision, "2.0.0", f.revision, "1.0.0", RollbackManual))
 	if err != nil {
 		t.Fatal(err)
@@ -732,6 +745,12 @@ func TestDeployRefusesWhileRecoveryUnresolved(t *testing.T) {
 	in.Target = tgt
 	if _, err := Rollback(t.Context(), in); err == nil {
 		t.Fatal("test setup: recovery must fail")
+	}
+	// The failed setup recovery had unknown fate mid-apply: its lock is
+	// retained. Operator verifies and removes it before the next
+	// operation.
+	if err := os.RemoveAll(f.lockDir()); err != nil {
+		t.Fatal(err)
 	}
 	before := order(t, f.marker)
 

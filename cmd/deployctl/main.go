@@ -125,6 +125,7 @@ Promotion check flags (for the trusted CI workflow):
   --repo owner/name                          source repository (required)
   --base <sha>                               trusted base commit (required)
   --head <sha>                               promotion branch head (required)
+  --repo-dir .                               local checkout containing the revision (required for new-release proposals)
 
 Both require GITHUB_TOKEN.
 
@@ -142,6 +143,7 @@ Rollback flags (manual/emergency recovery):
   --to <version>                version to restore (required)
   --from <version>              version being undone (default: the pinned release)
   --repo-dir .                  checkout containing both release revisions
+  --owner identity              recorded in the lock and history (default user@host)
   --confirm "sentence"          typed confirmation; omit to be prompted
   --json                        single deployctl.result/v1 document on stdout (bare flag only; --json=<value> is not the machine interface)
 
@@ -158,6 +160,7 @@ Recovery resolve flags:
   --repo-dir .                  checkout containing .deploy/
   --owner identity              recorded as resolution evidence (default user@host)
   --confirm "sentence"          typed confirmation; omit to be prompted
+  --json                        single deployctl.result/v1 document on stdout (bare flag only; --json=<value> is not the machine interface)
 
 Recovery resolve is the explicit end of an unresolved situation, for use
 ONLY after the target has been verified by hand. It executes no hooks and

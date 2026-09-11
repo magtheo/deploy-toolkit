@@ -77,11 +77,11 @@ func (t *Target) readHistoryVerified(ctx context.Context, project, env string) (
 	if err != nil {
 		return nil, "", err
 	}
-	present, err := t.exists(ctx, path)
+	absent, err := t.absent(ctx, path)
 	if err != nil {
 		return nil, "", err
 	}
-	if !present {
+	if absent {
 		return nil, "", fmt.Errorf("%s/%s: %w", project, env, ErrHistoryAbsent)
 	}
 	raw, err := t.ReadFile(ctx, path)

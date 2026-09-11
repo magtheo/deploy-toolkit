@@ -31,8 +31,13 @@ type StageResult struct {
 	// target, and no exit code exists. Evidence renders this as an
 	// infrastructure error, never as an exit code.
 	InfraError bool
-	Stdout     []byte
-	Stderr     []byte
+	// Unknown marks a stage whose execution fate is RunUnknown: the
+	// process may still be running and no exit code will ever arrive.
+	// This — not arbitrary transport trouble — is the fact that forces
+	// the environment lock to be retained.
+	Unknown bool
+	Stdout  []byte
+	Stderr  []byte
 }
 
 // Report describes one deployment attempt. A completed attempt with a
@@ -64,6 +69,14 @@ type Report struct {
 	AttemptID     string
 	HistorySeq    int64
 	FailureReason string
+	// LockRetained records that the invocation deliberately did NOT
+	// release its acquired environment lock because a lifecycle hook's
+	// execution fate was RunUnknown — the hook process may still be
+	// running. This is a controlled crash: the environment stays locked
+	// pending human verification of the target, exactly as after a
+	// controller crash. It is never set for a lock-release ATTEMPT that
+	// failed (that surfaces as a joined error, a different situation).
+	LockRetained bool
 }
 
 // DeployInput carries the desired state (parsed through the manifest
@@ -133,7 +146,15 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	if err != nil {
 		return rep, err
 	}
+	// releaseLock is lifecycle-local retain state: the lock is released
+	// on every return path EXCEPT when a hook's execution fate was
+	// RunUnknown. EnvLock.Release stays literal — "attempt to remove the
+	// lock" — and is simply never called for a deliberate retention.
+	releaseLock := true
 	defer func() {
+		if !releaseLock {
+			return
+		}
 		// Cleanup must survive a cancelled deploy context but must not run
 		// unbounded: a fresh, bounded context. Lock-release failure is a
 		// hard failure — the environment is blocked until an operator
@@ -142,7 +163,9 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
 		defer cancel()
 		if relErr := lock.Release(cleanupCtx); relErr != nil {
-			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w", lockDir, relErr))
+			// Carry the sentinel so rendering can surface the compound
+			// state instead of a single classification.
+			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w: %w", lockDir, ErrLockReleaseFailed, relErr))
 		}
 	}()
 
@@ -215,17 +238,23 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		return rep, fmt.Errorf("read recovery marker: %w", rerr)
 	}
 	if aerr == nil {
-		// Self-heal requires the FULL identity match: the marker must
-		// describe an attempt to exactly the requested release with
-		// exactly the requested bundle digest, AND committed observed
-		// state must show that same release with that same digest. Only
-		// then does observed state prove that THIS attempt reached its
-		// trusted terminal. A marker for a different target release (e.g.
-		// an unresolved 2.0.0 attempt while 1.0.0 is observed) is never
-		// erased by deploying the currently observed release.
+		// Self-heal requires the FULL identity match — the same triple
+		// standard the rollback self-heal demands (operationId proves
+		// WHICH operation committed, release identity alone proves
+		// nothing): the marker must describe an attempt to exactly the
+		// requested release with exactly the requested bundle digest,
+		// AND committed observed state must show that same release with
+		// that same digest SIGNED by this attempt's id. Only then does
+		// observed state prove that THIS attempt reached its trusted
+		// terminal. A marker for a different target release (e.g. an
+		// unresolved 2.0.0 attempt while 1.0.0 is observed) is never
+		// erased by deploying the currently observed release — and a
+		// hand-forged marker naming the currently observed release is
+		// never erased without the commit signature either.
 		if observed.Current != nil &&
 			attempt.ToRelease == rep.Version && attempt.BundleDigest == rel.Bundle.Digest &&
-			observed.Current.Release == rep.Version && observed.Current.BundleDigest == rel.Bundle.Digest {
+			observed.Current.Release == rep.Version && observed.Current.BundleDigest == rel.Bundle.Digest &&
+			observed.Current.OperationID == "deploy:"+attempt.AttemptID {
 			// The attempt reached its trusted terminal; the marker is a
 			// leftover from a crash between commit and cleanup.
 			if cerr := in.Target.ClearAttempt(ctx, rep.Project, rep.Environment); cerr != nil {
@@ -307,8 +336,17 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	}
 
 	// Exit codes are hook outcomes; Run errors are infrastructure errors.
+	// A RunUnknown fate additionally retains the environment lock — for
+	// EVERY hook, including preflight: the hook-execution boundary and
+	// the durable attempt boundary are different, and a possibly-still-
+	// running preflight process is exactly what the lock exists to guard.
 	runStage := func(name string, step *manifest.LifecycleStep) (StageResult, error) {
-		return runStageStep(ctx, in.Target.Transport(), name, releaseDir, henv, step)
+		sr, err := runStageStep(ctx, in.Target.Transport(), name, releaseDir, henv, step)
+		if sr.Unknown {
+			releaseLock = false
+			rep.LockRetained = true
+		}
+		return sr, err
 	}
 
 	// Staging is non-impacting; preflight decides whether the staged
@@ -357,6 +395,11 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	sr, ierr = runStage("migrate", migrateStep)
 	rep.Stages = append(rep.Stages, sr)
 	if ierr != nil {
+		if sr.Unknown {
+			// The attempt marker exists (written before this stage), so
+			// recovery is required as a matter of fact, not of caution.
+			rep.RecoveryRequired = true
+		}
 		return failInfra("migrate could not be executed", ierr)
 	}
 	if sr.Failed {
@@ -366,6 +409,9 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	sr, ierr = runStage("apply", stagedProject.Lifecycle.Apply)
 	rep.Stages = append(rep.Stages, sr)
 	if ierr != nil {
+		if sr.Unknown {
+			rep.RecoveryRequired = true
+		}
 		return failInfra("apply could not be executed", ierr)
 	}
 	if sr.Failed {
@@ -375,6 +421,9 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 	sr, ierr = runStage("verify", stagedProject.Lifecycle.Verify)
 	rep.Stages = append(rep.Stages, sr)
 	if ierr != nil {
+		if sr.Unknown {
+			rep.RecoveryRequired = true
+		}
 		return failInfra("verify could not be executed", ierr)
 	}
 	if sr.Failed {
@@ -428,6 +477,11 @@ func randomHexID() (string, error) {
 }
 
 func recordOutcome(ctx context.Context, in DeployInput, now func() time.Time, rep *Report, kind string) error {
+	// Evidence finalization deliberately ignores the caller's context: a
+	// cancelled deadline must not cost the operator the record of what
+	// happened. See evidenceCtx for the strict boundary.
+	ctx, cancel := evidenceCtx()
+	defer cancel()
 	data := outcomeData(rep, in)
 	if kind == "deploy.succeeded" {
 		// The state commit is part of the success fact.

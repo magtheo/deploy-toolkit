@@ -483,7 +483,7 @@ func TestStatusLockDominatesMarkers(t *testing.T) {
 		t.Fatalf("deploy: %d\n%s\n%s", code, out, errOut)
 	}
 	writeFileCLIF(t, f.recoveryPath(), fmt.Sprintf(`{"schema":"toolkit.recovery/v1","recoveryId":"0123456789abcdef","sourceAttemptId":"","project":"my-app","environment":"production","fromRelease":"1.0.0","fromBundleDigest":%q,"toRelease":"2.0.0","toBundleDigest":%q,"authorization":"manual","startedAt":"2026-09-09T00:00:00Z"}`, fakeDigest, fakeDigest))
-	writeFileCLIF(t, f.lockPath(), "")
+	os.MkdirAll(f.lockPath(), 0o755)
 	code, out, _ := runCLI("status", "production", "--repo-dir", f.repoDir)
 	if code != exitOK {
 		t.Fatalf("status exit = %d", code)
@@ -771,7 +771,7 @@ func TestStatusGuidanceObeyesClassificationPrecedence(t *testing.T) {
 			name: "lock + attempt",
 			setup: func(t *testing.T, f *cliFixture) {
 				writeAttemptMarker(t, f, "1.0.0")
-				writeFileCLIF(t, f.lockPath(), "")
+				os.MkdirAll(f.lockPath(), 0o755)
 			},
 			want:    "Wait for the active operation",
 			notWant: "deployctl rollback",
@@ -895,9 +895,10 @@ func TestRecoveryResolveCommand(t *testing.T) {
 	os.Remove(f.statePath())
 
 	// A sentence naming a marker that is not there: refused by the
-	// engine's identity binding, nothing changed.
+	// engine's identity binding, nothing changed — the block remains,
+	// and the human text now says exactly that (fact-driven).
 	code, _, errOut = runCLI("recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
-	if code != exitFailed || !strings.Contains(errOut, "NOT removed") {
+	if code != exitFailed || !strings.Contains(errOut, "block remains") {
 		t.Fatalf("absent-marker confirmation: exit = %d, stderr =\n%s", code, errOut)
 	}
 	if _, err := os.Stat(f.attemptPath()); err != nil {
@@ -1299,7 +1300,7 @@ func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
 	// Held lock: refused, environment named.
 	os.Remove(f.statePath())
 	writeAttemptMarker(t, f, "1.0.0")
-	writeFileCLIF(t, f.lockPath(), "")
+	os.MkdirAll(f.lockPath(), 0o755)
 	code, doc = runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
 		"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
 	if code != exitFailed || doc["outcome"] != "refused" {
@@ -1311,48 +1312,14 @@ func TestJSONErrorPathsAreAlwaysJSON(t *testing.T) {
 	}
 }
 
-// Dead transport is infrastructure, not refusal: when the connection is
-// up but a read class cannot be answered, the preflight must report
-// infrastructure-failure (exit 3) — the same classification the engine
-// applies to its own reads — with exactly one JSON document. Each read
-// class is exercised individually by killing exactly that command on
-// the fake target.
-func TestJSONResolveDeadTransportPerReadClass(t *testing.T) {
-	tests := []struct {
-		name   string
-		failIf string
-		seed   func(t *testing.T, f *cliFixture)
-	}{
-		{"state read", "/state/", nil},
-		{"attempt read", "/attempts/", nil},
-		{"recovery read", "/recoveries/", nil},
-		// The lock precheck is only reached when SOMETHING is
-		// unresolved; seed an attempt marker so the reads succeed and
-		// the precheck is the next command to die.
-		{"lock precheck", "/.locks/", func(t *testing.T, f *cliFixture) { writeAttemptMarker(t, f, "1.0.0") }},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newCLIFixture(t)
-			if tc.seed != nil {
-				tc.seed(t, f)
-			}
-			keyPEM, hostKeyLine := validSSHMaterial(t)
-			key, _, _, _, err := gossh.ParseAuthorizedKey([]byte(hostKeyLine))
-			if err != nil {
-				t.Fatal(err)
-			}
-			srv := startFakeSSH(t, key, tc.failIf)
-			host, port := srv.hostPort()
-			f.useSSHTransportAt(t, keyPEM, srv.hostKey(), host, port)
-			code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
-				"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
-			if code != exitInfra || doc["outcome"] != "infrastructure-failure" {
-				t.Fatalf("exit = %d outcome = %v (%s), want 3/infrastructure-failure", code, doc["outcome"], doc["message"])
-			}
-		})
-	}
-}
+// NOTE: dead-transport classification is covered by
+// TestJSONResolveDeadProbeIsInfrastructure (CLI end-to-end: a probe that
+// cannot run is exit 3 infrastructure-failure, never refusal or absence)
+// and by TestUnknownIsNeverAbsence in internal/target (every read class
+// refuses to interpret unknown as absence). The substrate no longer
+// shells out for existence, so per-command kill-the-exec tests cannot
+// target individual reads — and no longer need to: all read classes
+// share one proven-absence primitive and one failure classification.
 
 // The blocked-state facts in resolve JSON come from the engine's
 // post-operation presence flags — not from the read-time marker ids:
@@ -1491,4 +1458,298 @@ func TestJSONNeverConsumableAsValue(t *testing.T) {
 func (f *cliFixture) attemptExists() bool {
 	_, err := os.Stat(f.attemptPath())
 	return err == nil
+}
+
+// The recovery-resolve prologue must lex the ENTIRE argv exactly once —
+// the same single-pass invariant as the other operational commands. An
+// empty argv must be a usage error (never a panic on args[1:]), and
+// --json in the first position must still select machine mode.
+func TestResolveSinglePassLexing(t *testing.T) {
+	t.Run("bare invocation is a usage error, not a panic", func(t *testing.T) {
+		f := newCLIFixture(t)
+		code, _, errOut := runCLI("recovery", "resolve")
+		if code != exitUsage {
+			t.Fatalf("exit = %d, want %d\nstderr:\n%s", code, exitUsage, errOut)
+		}
+		if strings.Contains(errOut, "panic") {
+			t.Errorf("panicked:\n%s", errOut)
+		}
+		if len(orderCLI(t, f)) != 0 || f.attemptExists() {
+			t.Error("something executed despite the usage error")
+		}
+	})
+
+	t.Run("--json in first position still selects machine mode", func(t *testing.T) {
+		newCLIFixture(t)
+		code, out, errOut := runCLI("recovery", "resolve", "--json")
+		if code != exitUsage {
+			t.Fatalf("exit = %d, want %d\nstdout:\n%s\nstderr:\n%s", code, exitUsage, out, errOut)
+		}
+		if !json.Valid([]byte(out)) {
+			t.Fatalf("--json stdout is not a single JSON document: out=%q stderr=%q", out, errOut)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(out), &doc); err != nil {
+			t.Fatal(err)
+		}
+		if doc["schema"] != "deployctl.result/v1" || doc["command"] != "recovery-resolve" || doc["outcome"] != "usage-error" {
+			t.Errorf("document = %v", doc)
+		}
+	})
+
+	t.Run("machine mode before the environment preserves interleaving", func(t *testing.T) {
+		f := newCLIFixture(t)
+		writeAttemptMarker(t, f, "1.0.0")
+		code, doc := runJSON(t, "recovery", "resolve", "--json", "production", "attempt", "0123456789abcdef",
+			"--repo-dir", f.repoDir, "--confirm", "resolve production attempt 0123456789abcdef")
+		if code != exitOK || doc["outcome"] != "success" {
+			t.Fatalf("exit = %d outcome = %v (%s), want interleaved parse to resolve", code, doc["outcome"], doc["message"])
+		}
+		if f.attemptExists() {
+			t.Error("the marker was not resolved")
+		}
+	})
+}
+
+// A genuinely held environment lock is a REFUSAL per the frozen
+// deployctl.result/v1 contract — never safe-to-retry infrastructure.
+// These regressions drive the engine sentinel through both commands and
+// pin the JSON shape and the human classification.
+func TestHeldLockIsRefusalNotInfra(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"deploy", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
+		{"rollback", []string{"rollback", "production", "--to", "2.0.0", "--repo-dir", "%DIR%", "--confirm", "rollback production to 2.0.0", "--owner", "test"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCLIFixture(t)
+			if err := os.MkdirAll(f.lockPath(), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			before := len(orderCLI(t, f))
+
+			args := make([]string, len(tc.args))
+			for i, a := range tc.args {
+				args[i] = strings.ReplaceAll(a, "%DIR%", f.repoDir)
+			}
+			code, doc := runJSON(t, args...)
+			if code != exitFailed {
+				t.Fatalf("exit = %d, want %d (%s)", code, exitFailed, doc["message"])
+			}
+			if doc["outcome"] != "refused" || doc["recoveryRequired"] != false || doc["safeToRetry"] != false {
+				t.Errorf("shape = %v %v %v, want refused/false/false", doc["outcome"], doc["recoveryRequired"], doc["safeToRetry"])
+			}
+			if doc["command"] != tc.name {
+				t.Errorf("command = %v", doc["command"])
+			}
+			if len(orderCLI(t, f)) != before {
+				t.Error("hooks ran despite a held lock")
+			}
+			if f.attemptExists() {
+				t.Error("an attempt marker was written despite a held lock")
+			}
+
+			// Human mode: refused framing, never "simply rerun".
+			hArgs := append([]string{}, args...)
+			code, _, errOut := runCLI(hArgs...)
+			if code != exitFailed {
+				t.Fatalf("human exit = %d, want %d", code, exitFailed)
+			}
+			if !strings.Contains(errOut, "refused") || !strings.Contains(errOut, "may currently be executing") {
+				t.Errorf("human stderr lacks refused framing:\n%s", errOut)
+			}
+			if strings.Contains(errOut, "simply") || strings.Contains(errOut, "infrastructure failure") {
+				t.Errorf("human stderr misclassifies a refusal:\n%s", errOut)
+			}
+		})
+	}
+}
+
+// Transport death during the substrate probe is infrastructure, never
+// absence: the CLI must report infrastructure-failure (exit 3) — a dead
+// probe must never let a mid-recovery environment present itself as a
+// fresh target.
+func TestJSONResolveDeadProbeIsInfrastructure(t *testing.T) {
+	f := newCLIFixture(t)
+	writeAttemptMarker(t, f, "1.0.0")
+	keyPEM, hostKeyLine := validSSHMaterial(t)
+	key, _, _, _, err := gossh.ParseAuthorizedKey([]byte(hostKeyLine))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := startFakeSSHOpts(t, key, "", true) // sftp rejected: probes cannot run
+	host, port := srv.hostPort()
+	f.useSSHTransportAt(t, keyPEM, srv.hostKey(), host, port)
+	code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir,
+		"attempt", "0123456789abcdef", "--confirm", "resolve production attempt 0123456789abcdef")
+	if code != exitInfra || doc["outcome"] != "infrastructure-failure" {
+		t.Fatalf("exit = %d outcome = %v (%s), want 3/infrastructure-failure", code, doc["outcome"], doc["message"])
+	}
+	if !f.attemptExists() {
+		t.Error("the marker must survive a dead probe")
+	}
+}
+
+// status may emit not-deployed only from PROVEN absence; a broken
+// hierarchy renders as degraded evidence claiming nothing.
+func TestStatusBrokenHierarchyIsDegradedNotNotDeployed(t *testing.T) {
+	f := newCLIFixture(t)
+	// "state" exists as a regular FILE where the hierarchy needs a
+	// directory — the exact shape the old `test -e` misreported as a
+	// fresh target.
+	// The INTERMEDIATE "state" component is a regular file where the
+	// hierarchy requires a directory — the exact shape `test -e`
+	// misreported as a fresh target (its exit 1 conflated ENOTDIR with
+	// ENOENT). The probe must classify it as unknown, and status must
+	// degrade rather than claim not-deployed.
+	intermediate := filepath.Dir(f.statePath()) // .../my-app/state
+	if err := os.MkdirAll(filepath.Dir(intermediate), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(intermediate, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, doc := runJSON(t, "status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK {
+		t.Fatalf("a degraded status report is still a successful report: exit = %d", code)
+	}
+	data, _ := doc["data"].(map[string]any)
+	if data["state"] != "degraded" {
+		t.Fatalf("state = %v, want degraded", data["state"])
+	}
+	if data["state"] == "not-deployed" {
+		t.Errorf("a broken hierarchy must never present as a fresh target")
+	}
+	if data["observed"] != nil {
+		t.Errorf("degraded status must claim no observed state: %v", data["observed"])
+	}
+}
+
+// A regular FILE at the lock path is broken evidence: lock "unreadable",
+// overall state "degraded" — never "free" (which would green-light
+// operations) and never "held" (only a real lock DIRECTORY is held,
+// matching AcquireEnvLock).
+func TestLockPathFileIsUnreadableNotFreeOrHeld(t *testing.T) {
+	f := newCLIFixture(t)
+	writeFileCLIF(t, f.lockPath(), "not a lock")
+	code, doc := runJSON(t, "status", "production", "--repo-dir", f.repoDir)
+	if code != exitOK {
+		t.Fatalf("exit = %d, want a successful degraded report", code)
+	}
+	data, _ := doc["data"].(map[string]any)
+	lock, _ := data["lock"].(string)
+	if lock != "unreadable" {
+		t.Errorf("lock = %q, want unreadable", lock)
+	}
+	if lock == "free" || lock == "held" {
+		t.Errorf("a file at the lock path was classified %q", lock)
+	}
+	if data["state"] != "degraded" {
+		t.Errorf("state = %v, want degraded", data["state"])
+	}
+}
+
+// Invalid durable evidence is a REFUSAL in every operational command:
+// the facts cannot be trusted, so nothing may be decided and rerunning
+// cannot help. Deploy and rollback previously rendered this as
+// safe-to-retry infrastructure — the exact opposite of the truth.
+func TestCorruptEvidenceIsRefusalNotInfra(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{"deploy over corrupt state", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
+		{"deploy over corrupt attempt marker", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
+		{"rollback over corrupt state", []string{"rollback", "production", "--to", "2.0.0", "--repo-dir", "%DIR%", "--confirm", "rollback production to 2.0.0", "--owner", "test"}},
+		{"deploy over corrupt recovery marker", []string{"deploy", "production", "--repo-dir", "%DIR%", "--owner", "test"}},
+	}
+	damage := []func(t *testing.T, f *cliFixture){
+		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.statePath(), "{corrupt") },
+		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.attemptPath(), "{corrupt") },
+		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.statePath(), "{corrupt") },
+		// Distinct path: ReadRecovery → ErrEvidenceInvalid must
+		// survive deploy's wrap and still classify as refusal.
+		func(t *testing.T, f *cliFixture) { writeFileCLIF(t, f.recoveryPath(), "{corrupt") },
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCLIFixture(t)
+			damage[i](t, f)
+
+			args := make([]string, len(tc.args))
+			for j, a := range tc.args {
+				args[j] = strings.ReplaceAll(a, "%DIR%", f.repoDir)
+			}
+			code, doc := runJSON(t, args...)
+			if code != exitFailed {
+				t.Fatalf("exit = %d, want %d (%s)", code, exitFailed, doc["message"])
+			}
+			if doc["outcome"] != "refused" || doc["safeToRetry"] != false {
+				t.Errorf("shape = %v safeToRetry=%v, want refused/false", doc["outcome"], doc["safeToRetry"])
+			}
+			if doc["recoveryRequired"] != false {
+				t.Errorf("recoveryRequired = %v: untrustworthy state does not prove markers", doc["recoveryRequired"])
+			}
+			if len(orderCLI(t, f)) != 0 {
+				t.Error("hooks ran despite corrupt evidence")
+			}
+
+			code, _, errOut := runCLI(args...)
+			if code != exitFailed {
+				t.Fatalf("human exit = %d", code)
+			}
+			if !strings.Contains(errOut, "invalid") || !strings.Contains(errOut, "verify") {
+				t.Errorf("human stderr lacks inspect-and-verify guidance:\n%s", errOut)
+			}
+			if !strings.Contains(errOut, "Do NOT edit") {
+				t.Errorf("human stderr must forbid hand-editing observed state:\n%s", errOut)
+			}
+			if strings.Contains(errOut, "repair the damaged file by hand") || strings.Contains(errOut, "simply") || strings.Contains(errOut, "infrastructure failure") {
+				t.Errorf("human stderr misclassifies a refusal or invites hand-editing:\n%s", errOut)
+			}
+		})
+	}
+}
+
+// The resolve preflight refusal must carry the HONEST blocked fact:
+// untrustworthy evidence does not establish that a valid marker exists,
+// so recoveryRequired stays false and no marker identity is fabricated.
+func TestJSONResolveCorruptEvidenceIsNotRecoveryRequired(t *testing.T) {
+	t.Run("corrupt state, no markers", func(t *testing.T) {
+		f := newCLIFixture(t)
+		writeFileCLIF(t, f.statePath(), "{corrupt")
+		code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
+		if code != exitFailed || doc["outcome"] != "refused" {
+			t.Fatalf("shape = %v/%d, want refused/1", doc["outcome"], code)
+		}
+		if doc["recoveryRequired"] != false {
+			t.Errorf("recoveryRequired = %v, want false: corrupt state proves no marker", doc["recoveryRequired"])
+		}
+		data, _ := doc["data"].(map[string]any)
+		// The ids are omitempty: an absent or empty id both mean "no
+		// valid marker was read" — never a fabricated identity.
+		if v := data["remainingAttemptId"]; v != nil && v != "" {
+			t.Errorf("remainingAttemptId = %v, want absent: no valid marker was read", v)
+		}
+		if v := data["remainingRecoveryId"]; v != nil && v != "" {
+			t.Errorf("remainingRecoveryId = %v, want absent", v)
+		}
+	})
+	t.Run("corrupt attempt marker", func(t *testing.T) {
+		f := newCLIFixture(t)
+		writeFileCLIF(t, f.attemptPath(), "{corrupt")
+		code, doc := runJSON(t, "recovery", "resolve", "production", "--repo-dir", f.repoDir, "--confirm", "resolve production attempt deadbeefdeadbeef")
+		if code != exitFailed || doc["outcome"] != "refused" {
+			t.Fatalf("shape = %v/%d, want refused/1", doc["outcome"], code)
+		}
+		if doc["recoveryRequired"] != false {
+			t.Errorf("recoveryRequired = %v, want false: an unreadable marker is not a valid one", doc["recoveryRequired"])
+		}
+		data, _ := doc["data"].(map[string]any)
+		if v := data["remainingAttemptId"]; v != nil && v != "" {
+			t.Errorf("remainingAttemptId = %v, want absent: no valid marker was read", v)
+		}
+	})
 }

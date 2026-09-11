@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
+	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
 // The public machine interface. --json emits exactly one versioned
@@ -45,6 +46,11 @@ type resultEnvelope struct {
 	Outcome     string `json:"outcome"`
 	Project     string `json:"project,omitempty"`
 	Environment string `json:"environment,omitempty"`
+	// LockReleaseFailed (compatible v1 envelope extension): the
+	// invocation's environment lock could not be released — the
+	// environment stays locked until manual cleanup, whatever the
+	// outcome classification. See cli-v1.md.
+	LockReleaseFailed bool `json:"lockReleaseFailed,omitempty"`
 	// RecoveryRequired: an unresolved attempt/recovery marker (or a
 	// partial resolution leaving one) blocks normal operation.
 	RecoveryRequired bool `json:"recoveryRequired"`
@@ -120,14 +126,20 @@ func usageErrorResult(command, envName, message string) *resultEnvelope {
 // ---- deploy ------------------------------------------------------------
 
 type deployResultData struct {
-	Committed            bool           `json:"committed"`
-	AlreadyCurrent       bool           `json:"alreadyCurrent"`
-	ConsequentialStarted bool           `json:"consequentialStarted"`
-	AttemptID            string         `json:"attemptId,omitempty"`
-	Version              string         `json:"version,omitempty"`
-	BundleDigest         string         `json:"bundleDigest,omitempty"`
-	FailureReason        string         `json:"failureReason,omitempty"`
-	Stages               []stageOutcome `json:"stages,omitempty"`
+	Committed            bool `json:"committed"`
+	AlreadyCurrent       bool `json:"alreadyCurrent"`
+	ConsequentialStarted bool `json:"consequentialStarted"`
+	// LockRetained (compatible v1 extension): the invocation
+	// deliberately did not release its acquired environment lock
+	// because a lifecycle hook's execution fate could not be
+	// established. Verify the target, remove the lock by hand, then
+	// resolve any marker; see cli-v1.md.
+	LockRetained  bool           `json:"lockRetained,omitempty"`
+	AttemptID     string         `json:"attemptId,omitempty"`
+	Version       string         `json:"version,omitempty"`
+	BundleDigest  string         `json:"bundleDigest,omitempty"`
+	FailureReason string         `json:"failureReason,omitempty"`
+	Stages        []stageOutcome `json:"stages,omitempty"`
 }
 
 func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
@@ -141,6 +153,7 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 			Committed:            rep.Committed,
 			AlreadyCurrent:       rep.AlreadyCurrent,
 			ConsequentialStarted: rep.ConsequentialStarted,
+			LockRetained:         rep.LockRetained,
 			AttemptID:            rep.AttemptID,
 			Version:              rep.Version,
 			BundleDigest:         rep.BundleDigest,
@@ -157,6 +170,21 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 	switch {
 	case err != nil:
 		switch {
+		case errors.Is(err, lifecycle.ErrEnvLockHeld):
+			// A held lock is a REFUSAL per the frozen cli-v1
+			// contract: another operation may currently be executing.
+			// It is never safe-to-retry infrastructure.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: the environment lock is held — another operation may currently be executing"
+		case errors.Is(err, target.ErrEvidenceInvalid):
+			// Invalid durable evidence is a REFUSAL, mirroring the
+			// resolve preflight: the evidence exists but fails strict
+			// validation, so the facts cannot be trusted and nothing
+			// may be decided. Retrying is pointless until the evidence
+			// is repaired; it is infrastructure-shaped only in the
+			// transport sense, never in the safe-to-retry sense.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: durable evidence on the target exists but is invalid — run deployctl status, inspect the evidence and verify the target before recovery; do not rerun"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"
@@ -165,6 +193,17 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 			env.RecoveryRequired = true
 			env.SafeToRetry = false
 			env.Message = "outcome uncertain: consequential deployment work may have executed (attempt " + orNone(rep.AttemptID) + " unresolved)"
+			if rep.LockRetained {
+				env.Message += " — the environment lock was deliberately retained because a hook's execution fate could not be established; verify the target, remove the lock, then resolve the attempt"
+			}
+		case rep != nil && rep.LockRetained:
+			// Pre-boundary unknown fate: still possibly-running work,
+			// so the lock survives and retrying is NOT safe — but no
+			// attempt marker exists, so this is infrastructure-failure
+			// shape, not uncertain.
+			env.Outcome = outcomeInfraFailed
+			env.SafeToRetry = false
+			env.Message = "infrastructure failure: a lifecycle hook's execution fate could not be established — the environment lock was deliberately retained; verify no hook is still executing, remove the lock, then retry deliberately: " + err.Error()
 		default:
 			env.Outcome = outcomeInfraFailed
 			env.SafeToRetry = true
@@ -183,20 +222,36 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 		env.Outcome = outcomeFailure
 		env.Message = "deploy failed: " + rep.FailureReason
 	}
+	noteLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
+}
+
+// noteLockReleaseFailed surfaces the COMPOUND state: whatever the
+// classification (refusal, failure, uncertain, infrastructure), a
+// lock-release failure is an additional fact that must never hide
+// behind it — the environment stays locked until manual cleanup.
+func noteLockReleaseFailed(env *resultEnvelope, err error) {
+	if err == nil || !errors.Is(err, lifecycle.ErrLockReleaseFailed) {
+		return
+	}
+	// The structured fact is the contract; the prose is a courtesy.
+	env.LockReleaseFailed = true
+	env.Message += " — THE ENVIRONMENT LOCK COULD NOT BE RELEASED: manual cleanup is required; no other operation may start until it is removed"
 }
 
 // ---- rollback ----------------------------------------------------------
 
 type rollbackResultData struct {
-	Committed            bool           `json:"committed"`
-	AlreadyRecovered     bool           `json:"alreadyRecovered"`
-	ConsequentialStarted bool           `json:"recoveryStarted"`
-	RecoveryID           string         `json:"recoveryId,omitempty"`
-	FromVersion          string         `json:"fromVersion,omitempty"`
-	ToVersion            string         `json:"toVersion,omitempty"`
-	FailureReason        string         `json:"failureReason,omitempty"`
-	Stages               []stageOutcome `json:"stages,omitempty"`
+	Committed            bool `json:"committed"`
+	AlreadyRecovered     bool `json:"alreadyRecovered"`
+	ConsequentialStarted bool `json:"recoveryStarted"`
+	// LockRetained (compatible v1 extension): mirror of deploy.
+	LockRetained  bool           `json:"lockRetained,omitempty"`
+	RecoveryID    string         `json:"recoveryId,omitempty"`
+	FromVersion   string         `json:"fromVersion,omitempty"`
+	ToVersion     string         `json:"toVersion,omitempty"`
+	FailureReason string         `json:"failureReason,omitempty"`
+	Stages        []stageOutcome `json:"stages,omitempty"`
 }
 
 func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, int) {
@@ -210,6 +265,7 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 			Committed:            rep.Committed,
 			AlreadyRecovered:     rep.AlreadyRecovered,
 			ConsequentialStarted: rep.RecoveryStarted,
+			LockRetained:         rep.LockRetained,
 			RecoveryID:           rep.RecoveryID,
 			FromVersion:          rep.FromVersion,
 			ToVersion:            rep.ToVersion,
@@ -226,6 +282,15 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 	switch {
 	case err != nil:
 		switch {
+		case errors.Is(err, lifecycle.ErrEnvLockHeld):
+			// Mirror deploy: a held lock is a refusal, never
+			// safe-to-retry infrastructure.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: the environment lock is held — another operation may currently be executing"
+		case errors.Is(err, target.ErrEvidenceInvalid):
+			// Mirror deploy: invalid durable evidence is a refusal.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: durable evidence on the target exists but is invalid — run deployctl status, inspect the evidence and verify the target before recovery; do not rerun"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"
@@ -235,7 +300,16 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 		case rep != nil && rep.RecoveryStarted:
 			env.Outcome = outcomeUncertain
 			env.RecoveryRequired = true
+			env.SafeToRetry = false
 			env.Message = "outcome uncertain: consequential recovery work may have executed (recovery " + orNone(rep.RecoveryID) + " unresolved)"
+			if rep.LockRetained {
+				env.Message += " — the environment lock was deliberately retained because a hook's execution fate could not be established; verify the target, remove the lock, then resolve the recovery"
+			}
+		case rep != nil && rep.LockRetained:
+			// Pre-boundary unknown fate (mirror of deploy).
+			env.Outcome = outcomeInfraFailed
+			env.SafeToRetry = false
+			env.Message = "infrastructure failure: a lifecycle hook's execution fate could not be established — the environment lock was deliberately retained; verify no hook is still executing, remove the lock, then retry deliberately: " + err.Error()
 		default:
 			env.Outcome = outcomeInfraFailed
 			env.SafeToRetry = true
@@ -254,6 +328,7 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 		env.Outcome = outcomeFailure
 		env.Message = "rollback failed: " + rep.FailureReason
 	}
+	noteLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
 }
 
@@ -380,8 +455,17 @@ func resolveResult(rep *lifecycle.ResolveReport, err error, refused bool) (*resu
 		env.RecoveryRequired = rep.RecoveryRequired
 		env.Message = "refused: " + err.Error()
 	case err != nil:
+		// Fact-driven, not coarse: RecoveryRequired is the engine's
+		// post-run fact. A cleanup-window release failure after
+		// successful removals must not claim markers remain, and a
+		// partial clear must not claim ALL markers remain — the
+		// remaining*Id fields name exactly what survives.
 		env.Outcome = outcomeInfraFailed
-		env.Message = "infrastructure failure; the markers were NOT removed: " + err.Error()
+		if rep.RecoveryRequired {
+			env.Message = "infrastructure failure; the block remains: unresolved marker(s) are still on the target: " + err.Error()
+		} else {
+			env.Message = "marker resolution completed, but environment-lock cleanup failed: " + err.Error()
+		}
 	case rep.NothingToResolve:
 		env.Outcome = outcomeSuccess
 		env.SafeToRetry = true
@@ -390,6 +474,7 @@ func resolveResult(rep *lifecycle.ResolveReport, err error, refused bool) (*resu
 		env.Outcome = outcomeSuccess
 		env.Message = "resolution recorded and authorized markers removed"
 	}
+	noteLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
 }
 

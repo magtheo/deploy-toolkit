@@ -62,7 +62,7 @@ never added because mature-looking systems have them.
 Project-specific behavior must never leak into the toolkit. Wrong:
 
 ```go
-if project == "platform-core" { restartLiveKit() }
+if project == "example-service" { restartLiveKit() }
 ```
 
 Right: the project declares a `verify` hook in its own `project.yaml`.
@@ -85,13 +85,13 @@ go build -o deployctl ./cmd/deployctl
 ./deployctl validate templates/*.yaml
 ```
 
-CI (`.github/workflows/ci.yml`) runs exactly these checks on every push and PR.
+CI (`.github/workflows/ci.yml`) runs these checks on every pull request and every push to `main`.
 
 ## Contract status
 
 The schemas in `schemas/` are the public contract — currently **candidate
-Consumer Contract v1**: frozen only after a real `platform-core` deployment has
-exercised release generation. Go types in `internal/manifest` must stay in
+Consumer Contract v1**: it remains candidate until it has been exercised end to
+end by a real external consumer in a production-shaped deployment rehearsal. Go types in `internal/manifest` must stay in
 lockstep with them.
 
 All manifest ingestion goes through **one pipeline** in `manifest.Parse`:
@@ -104,8 +104,9 @@ traversal rules) live as `check()` methods in `internal/manifest`.
 If you change a schema, you are changing a published API — see the versioning
 policy in `docs/consumer-contract-v1.md`.
 
-## Reference consumer
+## Contract validation
 
-`platform-core` is the reference consumer; features must be validated against a
-real deployment there. `examples/static-site` (later) proves the generic
-contract. Neither consumer's specifics may leak into this repository.
+The contract must be validated by a real external consumer in a
+production-shaped deployment rehearsal; `examples/static-site` (later) proves
+the generic contract with a public example. No consumer's specifics — and no
+consumer's name — leak into this repository.

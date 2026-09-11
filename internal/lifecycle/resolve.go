@@ -103,7 +103,10 @@ func refuseResolve(format string, args ...any) error {
 // Evidence is recorded BEFORE the markers are removed (attempt first,
 // recovery last), so a failed history write leaves the block in place
 // and the invocation can simply be retried.
-func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
+// Resolve returns NAMED values on purpose: the deferred lock-release
+// cleanup joins a release failure into err — with unnamed returns that
+// assignment would be dropped and the failed cleanup silently lost.
+func Resolve(ctx context.Context, in ResolveInput) (rep *ResolveReport, err error) {
 	switch {
 	case in.Target == nil:
 		return nil, fmt.Errorf("ResolveInput.Target is required")
@@ -123,7 +126,7 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	if now == nil {
 		now = time.Now
 	}
-	rep := &ResolveReport{
+	rep = &ResolveReport{
 		Project:     in.Project,
 		Environment: in.Environment.Metadata.Name,
 	}
@@ -140,7 +143,10 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	})
 	if err != nil {
 		if errors.Is(err, ErrEnvLockHeld) {
-			return rep, refuseResolve("acquire environment lock: %v", err)
+			// Refusal classification, but keep BOTH sentinels
+			// reachable: the held-lock fact must survive for callers
+			// that classify by errors.Is.
+			return rep, fmt.Errorf("acquire environment lock: %w: %w", err, ErrResolveRefused)
 		}
 		return rep, fmt.Errorf("acquire environment lock: %w", err)
 	}
@@ -148,7 +154,9 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), lockCleanupTimeout)
 		defer cancel()
 		if relErr := lock.Release(cleanupCtx); relErr != nil {
-			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w", lockDir, relErr))
+			// Same sentinel as deploy/rollback: the release failure is
+			// a machine-reachable fact, joinable with any outcome.
+			err = errors.Join(err, fmt.Errorf("environment lock %s could not be released (manual cleanup required): %w: %w", lockDir, ErrLockReleaseFailed, relErr))
 		}
 	}()
 
@@ -244,6 +252,15 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	// neutral because the operation may authorize either marker or both:
 	// the confirmed ids carry the exact scope.
 	kind := "resolution.authorized"
+	// The authorization record is evidence: it must survive a cancelled
+	// caller context (an authorization that was given must be recorded
+	// even if the invocation was cancelled mid-flight), under the same
+	// bounded finalization context as the deploy/rollback recorders.
+	// A distinct name on purpose: the marker removals below MUST stay on
+	// the caller's context — evidence finalization must not become
+	// permission to continue lifecycle work.
+	evctx, cancel := evidenceCtx()
+	defer cancel()
 	data := map[string]any{
 		"authorization":       "manual",
 		"actor":               in.Owner,
@@ -256,7 +273,7 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 			"operationId": rep.ObservedOperationID,
 		},
 	}
-	seq, herr := in.Target.AppendHistory(ctx, rep.Project, rep.Environment, target.Entry{
+	seq, herr := in.Target.AppendHistory(evctx, rep.Project, rep.Environment, target.Entry{
 		Time: now().UTC().Format(time.RFC3339),
 		Type: kind,
 		Data: data,

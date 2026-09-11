@@ -68,6 +68,15 @@ var lockCleanupTimeout = 30 * time.Second
 // exists, so an operation may be executing right now. Every other
 // acquisition failure (transport death, filesystem trouble) is
 // infrastructure.
+
+// ErrLockReleaseFailed marks a lock-RELEASE failure: the operation
+// could not remove its own environment lock, so the lock survives and
+// blocks every future deployment of the environment until an operator
+// removes it manually. It is joined with the operation's own outcome
+// error so that rendering can represent the COMPOUND state — e.g. an
+// evidence refusal whose release also failed must surface both facts;
+// the cleanup problem must never hide behind the classification.
+var ErrLockReleaseFailed = errors.New("environment lock could not be released")
 var ErrEnvLockHeld = errors.New("environment lock is held")
 
 // AcquireEnvLock creates the lock directory atomically. Callers must

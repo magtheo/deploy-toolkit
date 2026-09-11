@@ -127,7 +127,12 @@ where it has always been: the human merge of the promotion PR.
 Three facts are deliberately kept apart:
 
 - the **environment lock** (`.locks/<env>/`) means *someone may be executing
-  right now* — active concurrency control;
+  right now* — active concurrency control. This includes deliberate
+  **retention**: when a lifecycle hook's execution fate cannot be
+  established (cancellation, transport loss mid-run — no transport can
+  prove a process tree has stopped), the runner skips lock release
+  entirely, making a controlled uncertainty behave exactly like a crash.
+  See `data.lockRetained` in `docs/cli-v1.md`;
 - the **attempt marker** (`attempts/<env>.json`) means *a deployment was not
   reconciled* — WHY recovery is needed (an attempt `A → B` may have
   executed consequential work with an unknown outcome);

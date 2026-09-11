@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
 	"github.com/magtheo/deploy-toolkit/internal/target"
@@ -92,7 +93,36 @@ func runStageStep(ctx context.Context, tr transport.Transport, name, dir string,
 	}
 	res, err := tr.Run(ctx, transport.RunRequest{Argv: step.Argv, Dir: dir, Env: henv})
 	if err != nil {
-		return StageResult{Name: name, Failed: true, InfraError: true}, err
+		// Fate decides safety, and it is VALIDATED, not trusted. Only
+		// two combinations prove "nothing can be running" and may skip
+		// retention: RunNotStarted (definite dispatch failure) and
+		// RunExited WITH a StartError (the SSH 126/127 convention — the
+		// documented exception, not a general one). RunExited with an
+		// arbitrary error is a contract violation: an exit code that
+		// arrives with "connection disappeared" proves nothing — treated
+		// as unknown. RunUnknown — the zero value — and any invalid
+		// fate value also retain the lock, so a transport that forgets
+		// to set Fate, or invents a value this version does not know,
+		// fails closed.
+		var unknown bool
+		switch {
+		case res.Fate == transport.RunNotStarted:
+			unknown = false
+		case res.Fate == transport.RunExited:
+			var startErr *transport.StartError
+			unknown = !errors.As(err, &startErr)
+		default:
+			unknown = true
+		}
+		return StageResult{Name: name, Failed: true, InfraError: true, Unknown: unknown}, err
+	}
+	// A nil error is only defined for a determined exit. Any other fate
+	// with nil error is a transport-contract violation and fails closed:
+	// reported as an infrastructure error with unknown fate (lock
+	// retained), never as a successful or determined hook.
+	if res.Fate != transport.RunExited {
+		return StageResult{Name: name, Failed: true, InfraError: true, Unknown: true},
+			fmt.Errorf("hook %s: transport contract violation: Run returned fate %d with nil error; treated as unknown fate (lock retained)", name, int(res.Fate))
 	}
 	return StageResult{
 		Name:     name,
@@ -101,6 +131,30 @@ func runStageStep(ctx context.Context, tr transport.Transport, name, dir string,
 		Stdout:   res.Stdout,
 		Stderr:   res.Stderr,
 	}, nil
+}
+
+// evidenceFinalizationTimeout bounds history (evidence) writes so a
+// stuck target cannot hang finalization forever. Var for test
+// overriding.
+var evidenceFinalizationTimeout = 30 * time.Second
+
+// evidenceCtx is the context for DURABLE EVIDENCE WRITES ONLY: history
+// outcome records. It is deliberately independent of the caller's
+// context — a cancelled deadline must not cost the operator the
+// historical record of what happened — and bounded so a stuck target
+// cannot hang finalization forever.
+//
+// The boundary is strict. Evidence finalization may persist facts the
+// lifecycle already established; it must never CREATE permission:
+//
+//   - no lifecycle hook is executed on this context (it only carries
+//     file reads/writes of the history log);
+//   - observed-state commits, marker writes and marker clears stay on
+//     the caller's context — an uncertain outcome stays uncertain, a
+//     retained lock stays retained;
+//   - a failed evidence write is still a joined error, never swallowed.
+func evidenceCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), evidenceFinalizationTimeout)
 }
 
 // errContractRefused marks a staged-contract violation: an outcome of the

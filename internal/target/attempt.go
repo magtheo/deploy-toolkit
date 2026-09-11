@@ -83,11 +83,11 @@ func (t *Target) ReadAttempt(ctx context.Context, project, env string) (AttemptM
 	if err != nil {
 		return AttemptMarker{}, err
 	}
-	present, err := t.exists(ctx, path)
+	absent, err := t.absent(ctx, path)
 	if err != nil {
 		return AttemptMarker{}, err
 	}
-	if !present {
+	if absent {
 		return AttemptMarker{}, fmt.Errorf("%s/%s: %w", project, env, ErrAttemptAbsent)
 	}
 	raw, err := t.ReadFile(ctx, path)

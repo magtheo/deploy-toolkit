@@ -2,7 +2,9 @@ package manifest
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 
@@ -147,7 +149,35 @@ func decodeStrict(data []byte, out any) error {
 	return dec.Decode(out)
 }
 
+// ensureSingleDocument enforces the exact-one-document discipline every
+// other layer of the toolkit already has: unknown fields are refused,
+// trailing JSON after a history record is refused, extra argv is
+// refused. A second YAML document after `---` would otherwise be
+// silently ignored by every reader here — outside schema validation,
+// strict decoding and semantic checks entirely — while a human or a
+// merge diff believes it is part of the manifest. Only the first
+// document is the manifest; anything else is refused.
+func ensureSingleDocument(data []byte) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var first any
+	if err := dec.Decode(&first); err != nil {
+		return fmt.Errorf("manifest must contain exactly one YAML document: %w", err)
+	}
+	var extra any
+	switch err := dec.Decode(&extra); {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err != nil:
+		return fmt.Errorf("manifest must contain exactly one YAML document: %w", err)
+	default:
+		return fmt.Errorf("manifest contains more than one YAML document; exactly one is required")
+	}
+}
+
 func Parse(data []byte, wantKind string) (*Parsed, error) {
+	if err := ensureSingleDocument(data); err != nil {
+		return nil, err
+	}
 	h, err := parseHeader(data)
 	if err != nil {
 		return nil, err

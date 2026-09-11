@@ -98,12 +98,12 @@ $ deployctl release create --revision abc123
 ✓ manifest validated
 
 Created:
-.deploy/releases/platform-core-0.1.17.yaml
+.deploy/releases/example-service-0.1.17.yaml
 
 $ deployctl promotion propose production --release 0.1.17
 
 Opened:
-deploy: promote platform-core 0.1.17 to production
+deploy: promote example-service 0.1.17 to production
 ```
 
 ## Promotion PR
@@ -111,7 +111,7 @@ deploy: promote platform-core 0.1.17 to production
 The human gate. Machine-generated, boring, and read like a changelog:
 
 ```
-Deploy platform-core 0.1.17
+Deploy example-service 0.1.17
 
 Source              abc123def456
 Current production  0.1.16 (89123ab)
@@ -158,8 +158,8 @@ The toolkit owns the state machine; the project's hooks supply the commands
 (see [consumer-contract-v1.md](consumer-contract-v1.md)).
 
 Structured stage outcomes are recorded in the deployment history
-(`history.jsonl` on the target) and reported as a GitHub Deployment status —
-an audit/UI projection, never the source of truth. Raw hook stdout/stderr
+(`history.jsonl` on the target) — the source of truth. A GitHub Deployments
+status projection (audit/UI only) is planned, not implemented. Raw hook stdout/stderr
 is returned to the caller for diagnosis but never persisted into history.
 
 ### Uncertain and unreconciled outcomes: the attempt marker
@@ -259,8 +259,8 @@ with a reverse diff:
 
 ```diff
  spec:
--  release: .deploy/releases/platform-core-0.1.17.yaml
-+  release: .deploy/releases/platform-core-0.1.16.yaml
+-  release: .deploy/releases/example-service-0.1.17.yaml
++  release: .deploy/releases/example-service-0.1.16.yaml
 ```
 
 PR title: `deploy: roll production back to 0.1.16`. Human merges; the toolkit
@@ -282,7 +282,7 @@ emergency rollback` to restore the invariant.
 ```
 Git desired state          authoritative intent
 Server observed state      authoritative observation
-GitHub Deployments         audit / UI projection
+GitHub Deployments         audit / UI projection (planned, not implemented)
 ```
 
 ## Implementation sequence
@@ -296,5 +296,5 @@ GitHub Deployments         audit / UI projection
 7. ~~Server-side staging, observed state, history~~ **done**
 8. ~~Lifecycle execution + verification~~ **done**
 9. ~~Rollback/recovery engine (recovery + auto + manual authorization paths)~~ **done**
-10. `platform-core` integration, then `examples/static-site`
+10. First external-consumer rehearsal (production-shaped), then `examples/static-site`
 11. GitHub wiring: reconcile PRs after auto/emergency rollback, workflow + CLI surfacing

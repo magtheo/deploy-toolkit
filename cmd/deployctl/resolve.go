@@ -154,26 +154,30 @@ func canonicalResolveSentence(envName string, sc resolveScope) string {
 // sentence names. The engine re-reads those markers under the lock and
 // refuses on any mismatch.
 func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	_, _, jsonMode, missingValue := lexArgs(args[1:], map[string]bool{"repo-dir": true, "owner": true, "confirm": true})
+	// The shared lexer processes the ENTIRE argv after `resolve`, exactly
+	// once — it is the single authority for flag arity, machine-mode
+	// detection, flag/selector interleaving and missing-value detection,
+	// exactly as for the other operational commands. positional[0] is
+	// the environment; positional[1:] are the recovery/attempt
+	// selectors. The lexer is never re-run with a different slice or
+	// interpretation.
+	lexFlags, positional, jsonMode, missingValue := lexArgs(args, map[string]bool{"repo-dir": true, "owner": true, "confirm": true})
 	if missingValue != "" {
 		if jsonMode {
-			envName := ""
-			if len(args) > 0 && !isFlagToken(args[0]) {
-				envName = args[0]
-			}
-			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "--"+missingValue+" requires a value"))
+			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envNameOr(positional), "--"+missingValue+" requires a value"))
 		}
 		fmt.Fprintf(stderr, "deployctl recovery resolve: --%s requires a value\n", missingValue)
 		return exitUsage
 	}
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+	if len(positional) == 0 {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, "", "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>]"))
 		}
 		fmt.Fprintln(stderr, "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>] [--repo-dir .] [--owner identity] [--confirm \"...\"]")
 		return exitUsage
 	}
-	envName := args[0]
+	envName := positional[0]
+	selectors := positional[1:]
 	if strings.Contains(envName, "/") {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "environment must be a bare name"))
@@ -187,10 +191,6 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	owner := fs.String("owner", "", "identity recorded as resolution evidence (default user@host)")
 	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
-	// One lexer owns flag arity AND machine-mode detection: selectors
-	// and flags may interleave, a value flag can never swallow a
-	// flag-shaped token, and --json is machine mode only as a flag.
-	lexFlags, selectors, _, _ := lexArgs(args[1:], map[string]bool{"repo-dir": true, "owner": true, "confirm": true})
 	if err := fs.Parse(lexFlags); err != nil {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "invalid flags: "+err.Error()))
@@ -275,7 +275,7 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	blocked := aerr == nil || rerr == nil
 	refuseJSON := func(format string, args ...any) int {
 		if jsonMode {
-			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: true, Message: fmt.Sprintf(format, args...), Data: blockData()})
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmdRecoveryResolve, Outcome: outcomeRefused, Project: project, Environment: envName, RecoveryRequired: blocked, Message: fmt.Sprintf(format, args...), Data: blockData()})
 		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %s\n", envName, fmt.Sprintf(format, args...))
 		fmt.Fprintln(stderr, "  Unreadable evidence must be repaired, not resolved. Run `deployctl status`.")
@@ -410,8 +410,14 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 			return emitJSON(stdout, mustEnvelope(resolveResult(rep, err, errors.Is(err, lifecycle.ErrResolveRefused))))
 		}
 		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
-		fmt.Fprintln(stderr, "  The markers were NOT removed — the block is still in place.")
-		fmt.Fprintln(stderr, "  Run `deployctl status` and follow its guidance.")
+		warnLockReleaseFailed(stderr, err)
+		if rep != nil && !rep.RecoveryRequired {
+			fmt.Fprintln(stderr, "  Marker resolution completed, but the environment lock could not be")
+			fmt.Fprintln(stderr, "  released — manual cleanup required. Run `deployctl status`.")
+		} else {
+			fmt.Fprintln(stderr, "  The block remains: unresolved marker(s) are still on the target.")
+			fmt.Fprintln(stderr, "  Run `deployctl status` and follow its guidance.")
+		}
 		return exitFailed
 	}
 	if env, code := resolveResult(rep, nil, false); jsonMode {

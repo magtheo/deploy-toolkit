@@ -96,11 +96,11 @@ func (t *Target) ReadRecovery(ctx context.Context, project, env string) (Recover
 	if err != nil {
 		return RecoveryMarker{}, err
 	}
-	present, err := t.exists(ctx, path)
+	absent, err := t.absent(ctx, path)
 	if err != nil {
 		return RecoveryMarker{}, err
 	}
-	if !present {
+	if absent {
 		return RecoveryMarker{}, fmt.Errorf("%s/%s: %w", project, env, ErrRecoveryAbsent)
 	}
 	raw, err := t.ReadFile(ctx, path)

@@ -169,10 +169,20 @@ func TestDeployTransportLossDuringApplyLeavesUnresolvedAttempt(t *testing.T) {
 	if !attemptPresent(t, f) {
 		t.Fatal("uncertain apply outcome must leave the attempt marker behind")
 	}
+	// The unknown fate also retains the environment lock: a controlled
+	// crash. The retry refuses on the held lock BEFORE anything runs.
+	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	if !errors.Is(err, ErrEnvLockHeld) {
+		t.Fatalf("retry err = %v, want held-lock refusal while the retained lock exists", err)
+	}
+	// Operator procedure: verify the target, remove the lock by hand.
+	if err := os.RemoveAll(f.lockDir()); err != nil {
+		t.Fatal(err)
+	}
 	// Like any failure after the marker exists, the transport loss keeps
 	// the marker; only committed observed state or explicit recovery
-	// removes it. A normal retry therefore refuses.
-	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	// removes it. The retry now refuses on the unresolved attempt.
+	rep, err = deploy(t, f, "my-app", "1.0.0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,6 +197,47 @@ func TestDeployAlreadyCurrentSelfHealsStaleMarker(t *testing.T) {
 	// the marker must describe EXACTLY this attempt (toRelease and
 	// bundleDigest matching the requested release) — and heals the
 	// leftover instead of demanding recovery.
+	f := newFixture(t, "my-app", nil)
+	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
+	// The real crash window: the first deploy commits (signing observed
+	// state with ITS attempt id) and dies before clearing the marker —
+	// so the stale marker carries the SAME id the commit was signed
+	// with.
+	first, err := Deploy(t.Context(), DeployInput{
+		Target: f.target, TargetManifest: f.targetManifest(),
+		Environment: f.environment("my-app", "1.0.0"), Release: rel, Bundle: bundleBytes, Owner: "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.target.WriteAttempt(t.Context(), target.AttemptMarker{
+		AttemptID:    first.AttemptID,
+		Project:      "my-app",
+		Environment:  "production",
+		ToRelease:    "1.0.0",
+		BundleDigest: rel.Bundle.Digest,
+		StartedAt:    time.Unix(1700000000, 0).UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.AlreadyCurrent || rep.RecoveryRequired {
+		t.Errorf("rep = %+v, want self-healed already-current", rep)
+	}
+	if attemptPresent(t, f) {
+		t.Error("stale marker was not healed")
+	}
+}
+
+func TestDeploySelfHealRequiresCommitSignature(t *testing.T) {
+	// Release and digest match the observed state, but the marker's id
+	// is NOT the id the observed state was signed with — the state is
+	// proof of SOME operation, not of THIS marker's attempt. A hand-made
+	// or schema-skewed marker naming the current release is never
+	// erased: the environment stays blocked pending explicit recovery.
 	f := newFixture(t, "my-app", nil)
 	rel, bundleBytes := f.preparedBytes(t, "my-app", "1.0.0")
 	if _, err := Deploy(t.Context(), DeployInput{
@@ -206,14 +257,11 @@ func TestDeployAlreadyCurrentSelfHealsStaleMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	rep, err := deploy(t, f, "my-app", "1.0.0", nil)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || !rep.RecoveryRequired || rep.AlreadyCurrent {
+		t.Fatalf("rep = %+v err = %v, want refusal with recovery required", rep, err)
 	}
-	if !rep.AlreadyCurrent || rep.RecoveryRequired {
-		t.Errorf("rep = %+v, want self-healed already-current", rep)
-	}
-	if attemptPresent(t, f) {
-		t.Error("stale marker was not healed")
+	if !attemptPresent(t, f) {
+		t.Error("the forged-identity marker must survive")
 	}
 }
 

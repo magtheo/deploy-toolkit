@@ -456,6 +456,27 @@ func TestDeployLockHeldFailsClosed(t *testing.T) {
 	defer lock.Release(t.Context())
 	if _, err := deploy(t, f, "my-app", "1.0.0", nil); err == nil || !strings.Contains(err.Error(), "held by another deployment") {
 		t.Fatalf("err = %v, want lock-held failure", err)
+	} else if !errors.Is(err, ErrEnvLockHeld) {
+		t.Fatalf("err = %v, want errors.Is(ErrEnvLockHeld): the CLI classifies this sentinel as a refusal", err)
+	}
+	if len(history(t, f)) != 0 {
+		t.Error("a lock refusal must not write history")
+	}
+}
+
+// Rollback mirrors deploy: a held lock must surface the ErrEnvLockHeld
+// sentinel so the CLI can classify it as a refusal rather than
+// safe-to-retry infrastructure.
+func TestRollbackLockHeldCarriesRefusalSentinel(t *testing.T) {
+	f := newFixture(t, "my-app", nil)
+	lock, err := AcquireEnvLock(t.Context(), f.target.Transport(), f.lockDir(), LockOwner{User: "someone-else"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release(t.Context())
+	in := rollbackInput(t, f, f.revision, "2.0.0", f.revision, "1.0.0", RollbackRecovery)
+	if _, err := Rollback(t.Context(), in); err == nil || !errors.Is(err, ErrEnvLockHeld) {
+		t.Fatalf("err = %v, want errors.Is(ErrEnvLockHeld)", err)
 	}
 	if len(history(t, f)) != 0 {
 		t.Error("a lock refusal must not write history")

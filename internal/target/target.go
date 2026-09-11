@@ -33,35 +33,70 @@ func New(tr transport.Transport, deployRoot string) (*Target, error) {
 	return &Target{tr: tr, layout: layout}, nil
 }
 
-// exists reports whether path exists on the target. test is a POSIX
-// utility: exit 0 = true, 1 = false, anything else is a target error.
-func (t *Target) exists(ctx context.Context, path string) (bool, error) {
-	res, err := t.tr.Run(ctx, transport.RunRequest{Argv: []string{"test", "-e", path}, Dir: "/"})
+// probePath classifies a toolkit-owned target path. The transport probe
+// returns proven absence, proven presence (with kind), or an error —
+// "could not establish" is never mapped to absence. The wrapped error
+// is deliberately opaque about cause: callers classify ERRORS as
+// infrastructure/unreadable and only PathAbsent as evidence absence.
+func (t *Target) probePath(ctx context.Context, path string) (transport.PathState, error) {
+	st, err := t.tr.ProbePath(ctx, path)
 	if err != nil {
-		return false, fmt.Errorf("target: test -e %s: %w", path, err)
+		return transport.PathUnknown, fmt.Errorf("target: probe %s: %w", path, err)
 	}
-	switch res.ExitCode {
-	case 0:
-		return true, nil
-	case 1:
-		return false, nil
+	// Validate the enum instead of trusting implementations: the zero
+	// value (PathUnknown) and any value outside this version's enum
+	// mean the transport claimed NOTHING — that is an error, never
+	// absence. Mirrors the RunFate validation in the lifecycle.
+	switch st {
+	case transport.PathAbsent, transport.PathFile, transport.PathDirectory:
+		return st, nil
 	default:
-		return false, fmt.Errorf("target: test -e %s: exit %d: %s", path, res.ExitCode, firstLine(res.Stderr))
+		return transport.PathUnknown, fmt.Errorf("target: probe %s: transport returned unproven state %d (contract violation, treated as error)", path, int(st))
 	}
 }
 
-// Exists is the exported read-only existence check for toolkit-owned
-// paths — the status interface uses it to report a held environment lock
-// without acquiring anything.
+// absent is the one shared decision for evidence paths: only a
+// transport-PROVEN absence may become an Err*Absent sentinel. A
+// directory where evidence is expected, a permission failure, a broken
+// hierarchy and a dead transport are all errors.
+func (t *Target) absent(ctx context.Context, path string) (bool, error) {
+	st, err := t.probePath(ctx, path)
+	switch {
+	case err != nil:
+		return false, err
+	case st == transport.PathAbsent:
+		return true, nil
+	case st == transport.PathDirectory:
+		return false, fmt.Errorf("%s is a directory where evidence was expected (broken target hierarchy)", path)
+	default:
+		return false, nil
+	}
+}
+
+// Exists reports whether ANY object occupies a toolkit-owned path.
+// Its contract is strict: true, nil = positively present; false, nil =
+// positively absent; a non-nil error = could not establish. Type-aware
+// callers (the lock) use ProbePath instead, because "something occupies
+// this pathname" is not evidence that an environment is locked.
 func (t *Target) Exists(ctx context.Context, path string) (bool, error) {
-	return t.exists(ctx, path)
+	st, err := t.probePath(ctx, path)
+	if err != nil {
+		return false, err
+	}
+	return st != transport.PathAbsent, nil
+}
+
+// ProbePath exposes the transport's proven presence/absence/kind probe
+// for type-aware substrate consumers (the status lock classification).
+func (t *Target) ProbePath(ctx context.Context, path string) (transport.PathState, error) {
+	return t.probePath(ctx, path)
 }
 
 // ReadFile reads a toolkit-owned file from the target — staged contract
-// bytes, state snapshots, history logs. Callers must gate it behind
-// exists() when absence is meaningful: cat reports both absence and
-// unreadability as a non-zero exit and the two cannot be distinguished
-// through the transport contract.
+// bytes, state snapshots, history logs. Callers must gate it behind the
+// path/evidence probe (probePath / absent) when absence is meaningful:
+// cat reports both absence and unreadability as a non-zero exit and the
+// two cannot be distinguished through the transport contract.
 func (t *Target) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	res, err := t.tr.Run(ctx, transport.RunRequest{Argv: []string{"cat", path}, Dir: "/"})
 	if err != nil {

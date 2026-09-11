@@ -51,15 +51,16 @@ exactly ONE deployctl.result/v1 document on stdout
 
 ```jsonc
 {
-  "schema":           "deployctl.result/v1",  // always
-  "command":          "deploy",               // enum, below
-  "outcome":          "success",              // enum, below
-  "project":          "my-app",               // when known
-  "environment":      "production",           // when known
-  "recoveryRequired": false,                  // always
-  "safeToRetry":      true,                   // always
-  "message":          "...",                  // NON-CONTRACTUAL, below
-  "data":             { }                     // per-command shape, below
+  "schema":              "deployctl.result/v1",  // always
+  "command":             "deploy",               // enum, below
+  "outcome":             "success",              // enum, below
+  "project":             "my-app",               // when known
+  "environment":         "production",           // when known
+  "recoveryRequired":    false,                  // always
+  "safeToRetry":         true,                   // always
+  "lockReleaseFailed":   false,                  // (v1 additive; present only when true)
+  "message":             "...",                  // NON-CONTRACTUAL, below
+  "data":                { }                     // per-command shape, below
 }
 ```
 
@@ -72,6 +73,7 @@ exactly ONE deployctl.result/v1 document on stdout
 | `environment`       | when known      | Same rule.                                                                                                                                                    |
 | `recoveryRequired`  | always          | The toolkit's **authoritative conclusion** that recovery or resolution is currently required. Raw marker presence is a separate fact, reported in `data.attempt` / `data.recovery` — `false` does **not** imply marker absence, especially while the environment is `locked` or `degraded`. See the semantics section. |
 | `safeToRetry`       | always          | `true` **only** when re-running the same command after the infrastructure problem is fixed is known-safe (no consequential work executed). `false` otherwise.  |
+| `lockReleaseFailed` | v1 additive; present only when `true` | The invocation could not release its acquired environment lock — the environment stays locked until manual cleanup, **whatever the `outcome`**. Records a fact; it does not change the classification. See `lockRetained` for the deliberate-retention counterpart. |
 | `message`           | always          | **Explicitly non-contractual.** Human-oriented prose. Never parse it, never branch on it, never assert on it in tests. All machine decisions come from the fields. |
 | `data`              | per command     | Command-specific shape. Absent only when there is nothing meaningful to report.                                                                               |
 
@@ -151,6 +153,66 @@ Automation must treat post-boundary `failure` and `uncertain` alike as
 “find the marker, resolve deliberately” — never as “rerun and
 see”.
 
+### `lockRetained` (v1 additive extension)
+
+Deploy and rollback may emit `data.lockRetained: true`. Per the
+versioning policy this is a **compatible** addition (an optional
+field); v1 automations that do not know it see it as absent.
+
+```text
+lockRetained = true
+
+The invocation deliberately did NOT release its acquired
+environment lock because a lifecycle hook's execution fate
+could not be established (context cancellation, transport
+loss mid-run, or a bounded pipe wait). The hook process may
+still be running.
+```
+
+It is a **controlled crash**: the environment lock — the mechanism
+that already makes a controller crash fail closed — is deliberately
+left in place, so no second operation can start while the old hook's
+process may still exist. No transport can prove that a process, let
+alone a descendant tree, has stopped; the toolkit never claims it.
+
+The remedy is always the same, in this order:
+
+```text
+verify the target by hand (nothing still executing)
+        ↓
+remove the environment lock by hand
+        ↓
+resolve the attempt/recovery marker if one exists
+(recoveryRequired carries that fact)
+```
+
+`lockRetained` may accompany either classification of unknown hook
+fate:
+
+| Situation                                             | Outcome                  | `recoveryRequired` | `safeToRetry` | `lockRetained` |
+| ----------------------------------------------------- | ------------------------ | ------------------ | ------------- | -------------- |
+| hook fate unknown before the durable attempt boundary | `infrastructure-failure` | `false`            | `false`       | `true`         |
+| hook fate unknown after the boundary                  | `uncertain`              | `true`             | `false`       | `true`         |
+
+`lockRetained` is deliberately **not** set when a lock-release attempt
+failed — that is a different situation and surfaces as the envelope
+fact `lockReleaseFailed: true` (joined with the operation's own
+outcome, never changing its classification). The two facts are
+mutually exclusive:
+
+```text
+lockRetained      = the lock was deliberately NOT released
+                    (a hook's execution fate is unknown)
+lockReleaseFailed = the lock release was attempted and failed
+                    (manual cleanup required)
+```
+
+A `resolution` whose markers were removed and whose lock release then
+failed reports `outcome: infrastructure-failure` with
+`lockReleaseFailed: true` and `recoveryRequired: false` — the block is
+down; only cleanup failed. When markers remain, `recoveryRequired` is
+`true` and `data.remaining*Id` names exactly what survives.
+
 ### Evidence taxonomy (recovery resolve preflight)
 
 ```text
@@ -176,6 +238,7 @@ absent means unset/zero, which for booleans means `false`.
   "committed":            false,  // (always) observed state committed
   "alreadyCurrent":       false,  // (always) requested release already current
   "consequentialStarted": false,  // (always) durable attempt marker written
+  "lockRetained":         false,  // (v1 additive; present only when true)
   "attemptId":            "...",  // boundary identity, when written
   "version":              "1.0.0",
   "bundleDigest":         "sha256:...",
@@ -197,6 +260,7 @@ names are non-contract (see below); the `status` enum is not.
   "committed":        false,  // (always) restored state committed
   "alreadyRecovered": false,  // (always) recovery already committed; nothing executed
   "recoveryStarted":  false,  // (always) durable recovery marker written
+  "lockRetained":     false,  // (v1 additive; present only when true)
   "recoveryId":       "...",  // boundary identity, when written
   "fromVersion":      "2.0.0",
   "toVersion":        "1.0.0",
@@ -204,6 +268,7 @@ names are non-contract (see below); the `status` enum is not.
   "stages":           [ ]
 }
 ```
+
 
 ### `status`
 
