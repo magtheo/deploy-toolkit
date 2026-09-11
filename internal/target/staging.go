@@ -116,34 +116,6 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 		return StageNotAttempted, fmt.Errorf("refusing to stage %s %s: bundle bytes hash to %s but the release pins %s", rel.Metadata.Project, rel.Metadata.Version, actual, rel.Bundle.Digest)
 	}
 
-	st, err := t.probePath(ctx, releaseDir)
-	if err != nil {
-		return StageNotAttempted, err
-	}
-	if st == transport.PathFile {
-		return StageNotAttempted, fmt.Errorf("release directory %s is not a directory (broken target hierarchy)", releaseDir)
-	}
-	if st == transport.PathDirectory {
-		m, err := t.readMarker(ctx, markerPath)
-		if err != nil {
-			return StageNotAttempted, fmt.Errorf("release directory %s exists but is not a complete stage (interrupted stages must be removed manually): %w", releaseDir, err)
-		}
-		if m.Project != rel.Metadata.Project || m.Version != rel.Metadata.Version {
-			return StageNotAttempted, fmt.Errorf("staged marker %s records %s %s, refusing to treat it as %s %s", markerPath, m.Project, m.Version, rel.Metadata.Project, rel.Metadata.Version)
-		}
-		if m.BundleDigest != rel.Bundle.Digest {
-			return StageNotAttempted, fmt.Errorf("refusing to stage %s %s: already staged with bundle digest %s, this bundle is %s — release directories are immutable", rel.Metadata.Project, rel.Metadata.Version, m.BundleDigest, rel.Bundle.Digest)
-		}
-		// The marker's word is not proof: verify that the directory still
-		// contains exactly the canonical bundle before declaring the
-		// stage reusable. A yesterday's assertion does not protect
-		// against altered bytes on the target.
-		if verr := t.verifyStagedFiles(ctx, releaseDir, bundle); verr != nil {
-			return StageNotAttempted, fmt.Errorf("staged release %s no longer matches its marker (%w) — altered staged material is never executed or reused", releaseDir, verr)
-		}
-		return StageAlreadyStaged, nil
-	}
-
 	files, err := readBundleFiles(bundle)
 	if err != nil {
 		return StageNotAttempted, err
@@ -203,6 +175,33 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 		}
 	}()
 
+	st, err := t.probePath(ctx, releaseDir)
+	if err != nil {
+		return StageNotAttempted, err
+	}
+	if st == transport.PathFile {
+		return StageNotAttempted, fmt.Errorf("release directory %s is not a directory (broken target hierarchy)", releaseDir)
+	}
+	if st == transport.PathDirectory {
+		m, err := t.readMarker(ctx, markerPath)
+		if err != nil {
+			return StageNotAttempted, fmt.Errorf("release directory %s exists but is not a complete stage (interrupted stages must be removed manually): %w", releaseDir, err)
+		}
+		if m.Project != rel.Metadata.Project || m.Version != rel.Metadata.Version {
+			return StageNotAttempted, fmt.Errorf("staged marker %s records %s %s, refusing to treat it as %s %s", markerPath, m.Project, m.Version, rel.Metadata.Project, rel.Metadata.Version)
+		}
+		if m.BundleDigest != rel.Bundle.Digest {
+			return StageNotAttempted, fmt.Errorf("refusing to stage %s %s: already staged with bundle digest %s, this bundle is %s — release directories are immutable", rel.Metadata.Project, rel.Metadata.Version, m.BundleDigest, rel.Bundle.Digest)
+		}
+		// The marker's word is not proof: verify that the directory still
+		// contains exactly the canonical bundle before declaring the
+		// stage reusable. A yesterday's assertion does not protect
+		// against altered bytes on the target.
+		if verr := t.verifyStagedFiles(ctx, releaseDir, bundle); verr != nil {
+			return StageNotAttempted, fmt.Errorf("staged release %s no longer matches its marker (%w) — altered staged material is never executed or reused", releaseDir, verr)
+		}
+		return StageAlreadyStaged, nil
+	}
 	for _, f := range files {
 		if err := t.tr.Put(ctx, transport.PutRequest{
 			Path:    releaseDir + "/" + f.relPath,
