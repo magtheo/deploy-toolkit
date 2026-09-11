@@ -76,7 +76,18 @@ Cancellation / transport-loss coverage per boundary — proven by
    directory (no marker yet) and failed "interrupted stage" — a
    false interrupted-stage claim and a violation of environment
    independence. Found by `TestLockChurnParallelEnvironments` within
-   minutes of existing. Fix: project-scoped staging lock
+   minutes of existing. Two distinct ordering defects had to be fixed:
+   (a) the losers' directory probe ran BEFORE the staging lock, so a
+   concurrent environment's mid-stage directory was still misread —
+   CI reproduced this consistently while local `-race` runs passed, a
+   genuinely scheduling-sensitive hazard; (b) the lock's release defer
+   was registered after the already-staged probe block, so every
+   `already-staged` stage leaked the lock and permanently blocked
+   future stages of that version — caught by the sequential churn
+   immediately after. Both orderings now have adversarial coverage:
+   only pure client-side validation precedes the lock, and the defer
+   is registered immediately after acquisition. The churn tests fail
+   deterministically on either defect. Fix: project-scoped staging lock
    (`.staging/<version>/`, atomic mkdir, crash leaves it for manual
    removal, refusal-class sentinel `target.ErrStageLockHeld`, bounded
    mkdir/probe handoff for the winner-releases-lock window; CLI renders
