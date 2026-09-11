@@ -475,6 +475,11 @@ func randomHexID() (string, error) {
 }
 
 func recordOutcome(ctx context.Context, in DeployInput, now func() time.Time, rep *Report, kind string) error {
+	// Evidence finalization deliberately ignores the caller's context: a
+	// cancelled deadline must not cost the operator the record of what
+	// happened. See evidenceCtx for the strict boundary.
+	ctx, cancel := evidenceCtx()
+	defer cancel()
 	data := outcomeData(rep, in)
 	if kind == "deploy.succeeded" {
 		// The state commit is part of the success fact.

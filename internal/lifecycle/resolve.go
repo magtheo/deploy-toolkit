@@ -247,6 +247,15 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 	// neutral because the operation may authorize either marker or both:
 	// the confirmed ids carry the exact scope.
 	kind := "resolution.authorized"
+	// The authorization record is evidence: it must survive a cancelled
+	// caller context (an authorization that was given must be recorded
+	// even if the invocation was cancelled mid-flight), under the same
+	// bounded finalization context as the deploy/rollback recorders.
+	// A distinct name on purpose: the marker removals below MUST stay on
+	// the caller's context — evidence finalization must not become
+	// permission to continue lifecycle work.
+	evctx, cancel := evidenceCtx()
+	defer cancel()
 	data := map[string]any{
 		"authorization":       "manual",
 		"actor":               in.Owner,
@@ -259,7 +268,7 @@ func Resolve(ctx context.Context, in ResolveInput) (*ResolveReport, error) {
 			"operationId": rep.ObservedOperationID,
 		},
 	}
-	seq, herr := in.Target.AppendHistory(ctx, rep.Project, rep.Environment, target.Entry{
+	seq, herr := in.Target.AppendHistory(evctx, rep.Project, rep.Environment, target.Entry{
 		Time: now().UTC().Format(time.RFC3339),
 		Type: kind,
 		Data: data,

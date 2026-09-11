@@ -672,6 +672,9 @@ func validateRollbackTransition(in RollbackInput) error {
 // the durable marker, not the invocation finishing the bookkeeping, is
 // authoritative for who changed production.
 func recordRollbackOutcome(ctx context.Context, in RollbackInput, now func() time.Time, rep *RollbackReport, kind, authorization string) error {
+	// Mirror deploy: evidence finalization is context-independent.
+	ctx, cancel := evidenceCtx()
+	defer cancel()
 	stages := make(map[string]any, len(rep.Stages))
 	for _, s := range rep.Stages {
 		switch {

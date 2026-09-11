@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/magtheo/deploy-toolkit/internal/manifest"
 	"github.com/magtheo/deploy-toolkit/internal/target"
@@ -117,6 +118,30 @@ func runStageStep(ctx context.Context, tr transport.Transport, name, dir string,
 		Stdout:   res.Stdout,
 		Stderr:   res.Stderr,
 	}, nil
+}
+
+// evidenceFinalizationTimeout bounds history (evidence) writes so a
+// stuck target cannot hang finalization forever. Var for test
+// overriding.
+var evidenceFinalizationTimeout = 30 * time.Second
+
+// evidenceCtx is the context for DURABLE EVIDENCE WRITES ONLY: history
+// outcome records. It is deliberately independent of the caller's
+// context — a cancelled deadline must not cost the operator the
+// historical record of what happened — and bounded so a stuck target
+// cannot hang finalization forever.
+//
+// The boundary is strict. Evidence finalization may persist facts the
+// lifecycle already established; it must never CREATE permission:
+//
+//   - no lifecycle hook is executed on this context (it only carries
+//     file reads/writes of the history log);
+//   - observed-state commits, marker writes and marker clears stay on
+//     the caller's context — an uncertain outcome stays uncertain, a
+//     retained lock stays retained;
+//   - a failed evidence write is still a joined error, never swallowed.
+func evidenceCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), evidenceFinalizationTimeout)
 }
 
 // errContractRefused marks a staged-contract violation: an outcome of the
