@@ -39,6 +39,12 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runPromotion(args[1:], stdout, stderr)
 	case "deploy":
 		return runDeploy(context.Background(), args[1:], stdout, stderr)
+	case "prepare":
+		return runPrepare(context.Background(), args[1:], stdout, stderr)
+	case "deploy-prepared":
+		return runDeployPrepared(context.Background(), args[1:], stdout, stderr)
+	case "rollback-prepared":
+		return runRollbackPrepared(context.Background(), args[1:], stdout, stderr)
 	case "rollback":
 		return runRollback(context.Background(), args[1:], stdout, stderr)
 	case "status":
@@ -67,10 +73,14 @@ Usage:
   deployctl promotion propose <env> [flags]  open the human-authorization PR for a release
   deployctl promotion check [flags]          verify a promotion diff against the Promotion Diff Policy
   deployctl deploy <env> [flags]             deploy the release the environment pins
+  deployctl prepare <env> [flags]            build the immutable prepared deployment artifact (no target access)
+  deployctl deploy-prepared [flags]          deploy a prepared artifact (no source checkout, target credential only)
+  deployctl rollback-prepared [flags]        restore the previous release from two prepared artifacts
   deployctl rollback <env> [flags]           emergency/manual recovery: restore a previous release
   deployctl status <env> [flags]             report desired vs observed state and all recovery facts
   deployctl recovery resolve <env> [selectors] [flags]
                                              explicitly resolve unresolved markers after manual verification
+                                             (also: --prepared <dir> resolves from a prepared artifact, no checkout)
   deployctl version                          print version
 
 Operational exit codes (deploy, rollback, status, recovery resolve):
