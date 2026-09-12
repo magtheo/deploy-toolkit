@@ -51,6 +51,12 @@ type resultEnvelope struct {
 	// environment stays locked until manual cleanup, whatever the
 	// outcome classification. See cli-v1.md.
 	LockReleaseFailed bool `json:"lockReleaseFailed,omitempty"`
+	// StagingLockReleaseFailed (compatible v1 envelope extension): the
+	// invocation's staging lock (.staging/<version>) could not be
+	// released — future stages of that release version refuse until
+	// manual cleanup, whatever the outcome classification. Distinct
+	// from lockReleaseFailed, which means the environment lock.
+	StagingLockReleaseFailed bool `json:"stagingLockReleaseFailed,omitempty"`
 	// RecoveryRequired: an unresolved attempt/recovery marker (or a
 	// partial resolution leaving one) blocks normal operation.
 	RecoveryRequired bool `json:"recoveryRequired"`
@@ -229,6 +235,7 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 		env.Message = "deploy failed: " + rep.FailureReason
 	}
 	noteLockReleaseFailed(env, err)
+	noteStagingLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
 }
 
@@ -243,6 +250,22 @@ func noteLockReleaseFailed(env *resultEnvelope, err error) {
 	// The structured fact is the contract; the prose is a courtesy.
 	env.LockReleaseFailed = true
 	env.Message += " — THE ENVIRONMENT LOCK COULD NOT BE RELEASED: manual cleanup is required; no other operation may start until it is removed"
+}
+
+// noteStagingLockReleaseFailed mirrors noteLockReleaseFailed for the
+// staging lock: a release-failure of .staging/<version> blocks every
+// future stage of that version, so it must surface as a structured
+// fact on any outcome — deploy and rollback both stage.
+func noteStagingLockReleaseFailed(env *resultEnvelope, err error) {
+	if err == nil || !errors.Is(err, target.ErrStageLockReleaseFailed) {
+		return
+	}
+	env.StagingLockReleaseFailed = true
+	// A leftover staging lock refuses every future stage of this
+	// version until an operator removes it, so a rerun is NOT known-
+	// safe — the same reasoning as a retained environment lock.
+	env.SafeToRetry = false
+	env.Message += " — THE STAGING LOCK COULD NOT BE RELEASED: manual cleanup is required; future stages of this release version refuse until it is removed"
 }
 
 // ---- rollback ----------------------------------------------------------
@@ -341,6 +364,7 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 		env.Message = "rollback failed: " + rep.FailureReason
 	}
 	noteLockReleaseFailed(env, err)
+	noteStagingLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
 }
 

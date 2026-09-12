@@ -63,6 +63,14 @@ var StagingCleanupTimeout = 30 * time.Second
 // manual removal — never silently broken.
 var ErrStageLockHeld = errors.New("staging lock is held")
 
+// ErrStageLockReleaseFailed marks a staging-lock RELEASE failure: the
+// operation staged its release, then could not remove
+// .staging/<version>. The lock survives, so every future stage of that
+// version refuses until an operator removes it. Like the environment
+// lock's counterpart, it is joined into the operation's own error — a
+// primary staging failure never swallows it.
+var ErrStageLockReleaseFailed = errors.New("staging lock could not be released")
+
 // StagedMarker records what a staged release directory contains. It is an
 // observed fact about bytes on the target, not desired state.
 type StagedMarker struct {
@@ -168,10 +176,10 @@ func (t *Target) Stage(ctx context.Context, rel *manifest.Release, bundle []byte
 		}
 		if rerr != nil {
 			// A leftover staging lock blocks future stages of this
-			// version; the error must never be swallowed.
-			if retErr == nil {
-				retErr = fmt.Errorf("staging lock %s could not be released (manual cleanup required): %w", lockDir, rerr)
-			}
+			// version; the failure must never be swallowed — not even
+			// behind a primary staging error. Always join, so both
+			// facts survive to the caller.
+			retErr = errors.Join(retErr, fmt.Errorf("staging lock %s could not be released (manual cleanup required): %w: %w", lockDir, ErrStageLockReleaseFailed, rerr))
 		}
 	}()
 

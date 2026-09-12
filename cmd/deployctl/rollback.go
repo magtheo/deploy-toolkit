@@ -227,6 +227,13 @@ func reportRollback(rep *lifecycle.RollbackReport, err error, envName string, st
 			fmt.Fprintln(stderr, "  recovery procedure. Do NOT edit observed state merely to make this proceed.")
 			return exitFailed
 		}
+		if errors.Is(err, target.ErrStageLockHeld) {
+			fmt.Fprintf(stderr, "✗ rollback %s: refused: this release version is being staged by\nanother operation right now (the .staging/<version> lock is held).\n", envName)
+			warnLockReleaseFailed(stderr, err)
+			fmt.Fprintln(stderr, "  Wait for the other operation to finish. Only remove the staging lock by")
+			fmt.Fprintln(stderr, "  hand after verifying no stage is in flight — a crashed stager leaves it.")
+			return exitFailed
+		}
 		fmt.Fprintf(stderr, "✗ rollback %s: infrastructure failure: %v\n", envName, err)
 		warnLockReleaseFailed(stderr, err)
 		switch {

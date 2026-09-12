@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -197,4 +199,112 @@ func TestResolveLockReleaseFailedRendering(t *testing.T) {
 			t.Errorf("remaining attempt id = %+v, want the survivor", data)
 		}
 	})
+}
+
+// A staging-lock release failure is a structured envelope fact: it must
+// appear whatever the outcome classification, and it must never bleed
+// into (or hide behind) the environment-lock fact.
+func TestStagingLockReleaseFailureSurfaces(t *testing.T) {
+	primary := errors.New("staging my-app/1.0.0/deploy/run.sh: forced put failure")
+	joined := errors.Join(primary, fmt.Errorf("staging lock /srv/my-app/.staging/1.0.0 could not be released (manual cleanup required): %w: rmdir: not empty", target.ErrStageLockReleaseFailed))
+	successful := errors.Join(fmt.Errorf("staging lock /srv/my-app/.staging/1.0.0 could not be released (manual cleanup required): %w: rmdir: not empty", target.ErrStageLockReleaseFailed))
+
+	t.Run("deploy json staging failure plus release failure", func(t *testing.T) {
+		doc, code := deployResult(nil, joined)
+		if code != exitInfra || doc.Outcome != outcomeInfraFailed {
+			t.Fatalf("shape = %v/%d, want infrastructure-failure/3", doc.Outcome, code)
+		}
+		if doc.StagingLockReleaseFailed != true {
+			t.Errorf("stagingLockReleaseFailed = %v, want true (cli-v1: never parse the message)", doc.StagingLockReleaseFailed)
+		}
+		if doc.LockReleaseFailed {
+			t.Errorf("lockReleaseFailed = %v, want false — the environment lock is a distinct fact", doc.LockReleaseFailed)
+		}
+		if doc.SafeToRetry {
+			t.Errorf("safeToRetry = true, want false while the staging lock blocks this version")
+		}
+	})
+	t.Run("rollback json staging failure plus release failure", func(t *testing.T) {
+		doc, code := rollbackResult(nil, joined)
+		if code != exitInfra || doc.Outcome != outcomeInfraFailed {
+			t.Fatalf("shape = %v/%d, want infrastructure-failure/3", doc.Outcome, code)
+		}
+		if doc.StagingLockReleaseFailed != true {
+			t.Errorf("stagingLockReleaseFailed = %v, want true", doc.StagingLockReleaseFailed)
+		}
+	})
+	t.Run("successful stage still reports the release failure", func(t *testing.T) {
+		// The stage itself succeeded; only the deferred lock release
+		// failed. The classification is unchanged; the cleanup fact
+		// must still be machine-visible.
+		doc, code := deployResult(nil, successful)
+		if code != exitInfra || doc.Outcome != outcomeInfraFailed {
+			t.Fatalf("shape = %v/%d, want infrastructure-failure/3", doc.Outcome, code)
+		}
+		if doc.StagingLockReleaseFailed != true {
+			t.Errorf("stagingLockReleaseFailed = %v, want true", doc.StagingLockReleaseFailed)
+		}
+		if doc.LockReleaseFailed {
+			t.Errorf("lockReleaseFailed = %v, want false", doc.LockReleaseFailed)
+		}
+	})
+	t.Run("absent on clean failure", func(t *testing.T) {
+		doc, _ := deployResult(nil, errors.New("git fetch failed"))
+		if doc.StagingLockReleaseFailed || doc.LockReleaseFailed {
+			t.Errorf("facts = %v/%v, want absent", doc.StagingLockReleaseFailed, doc.LockReleaseFailed)
+		}
+	})
+}
+
+// The held-staging-lock refusal must classify identically on both
+// surfaces: refused, exit 1 — not infrastructure failure, exit 3.
+func TestStageLockHeldRefusalOnBothSurfaces(t *testing.T) {
+	held := fmt.Errorf("stage release: %w: /srv/my-app/.staging/1.0.0 is being staged by another operation", target.ErrStageLockHeld)
+
+	t.Run("deploy human", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := reportDeploy(nil, held, &stdout, &stderr)
+		if code != exitFailed {
+			t.Errorf("exit = %d, want %d (refused)", code, exitFailed)
+		}
+		if !strings.Contains(stderr.String(), "refused") || !strings.Contains(stderr.String(), "staging") {
+			t.Errorf("stderr = %q, want a staging-lock refusal", stderr.String())
+		}
+	})
+	t.Run("rollback human", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		code := reportRollback(nil, held, "production", &stdout, &stderr)
+		if code != exitFailed {
+			t.Errorf("exit = %d, want %d (refused)", code, exitFailed)
+		}
+		if !strings.Contains(stderr.String(), "refused") || !strings.Contains(stderr.String(), "staging") {
+			t.Errorf("stderr = %q, want a staging-lock refusal", stderr.String())
+		}
+	})
+	t.Run("deploy json", func(t *testing.T) {
+		doc, code := deployResult(nil, held)
+		if code != exitFailed || doc.Outcome != outcomeRefused {
+			t.Errorf("shape = %v/%d, want refused/%d", doc.Outcome, code, exitFailed)
+		}
+	})
+}
+
+// End to end: a staging lock pre-created on the target (as a crashed
+// stager would leave it) refuses a human deploy with exit 1.
+func TestStageLockHeldEndToEndRefusal(t *testing.T) {
+	f := newCLIFixture(t)
+	lockDir := filepath.Join(f.deployDir, "my-app", ".staging", "1.0.0")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errOut := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test")
+	if code != exitFailed {
+		t.Fatalf("exit = %d, want %d (refused)", code, exitFailed)
+	}
+	if !strings.Contains(errOut, "refused") || !strings.Contains(errOut, "staging") {
+		t.Errorf("stderr = %q", errOut)
+	}
+	if out != "" {
+		t.Errorf("stdout = %q, want empty", out)
+	}
 }

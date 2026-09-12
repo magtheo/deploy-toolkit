@@ -59,6 +59,7 @@ exactly ONE deployctl.result/v1 document on stdout
   "recoveryRequired":    false,                  // always
   "safeToRetry":         true,                   // always
   "lockReleaseFailed":   false,                  // (v1 additive; present only when true)
+  "stagingLockReleaseFailed": false,             // (v1 additive; present only when true)
   "message":             "...",                  // NON-CONTRACTUAL, below
   "data":                { }                     // per-command shape, below
 }
@@ -74,6 +75,7 @@ exactly ONE deployctl.result/v1 document on stdout
 | `recoveryRequired`  | always          | The toolkit's **authoritative conclusion** that recovery or resolution is currently required. Raw marker presence is a separate fact, reported in `data.attempt` / `data.recovery` — `false` does **not** imply marker absence, especially while the environment is `locked` or `degraded`. See the semantics section. |
 | `safeToRetry`       | always          | `true` **only** when re-running the same command after the infrastructure problem is fixed is known-safe (no consequential work executed). `false` otherwise.  |
 | `lockReleaseFailed` | v1 additive; present only when `true` | The invocation could not release its acquired environment lock — the environment stays locked until manual cleanup, **whatever the `outcome`**. Records a fact; it does not change the classification. See `lockRetained` for the deliberate-retention counterpart. |
+| `stagingLockReleaseFailed` | v1 additive; present only when `true` | The invocation could not release its staging lock (`.staging/<version>`) — future stages of that release version refuse until manual cleanup, **whatever the `outcome`**. Records a fact; it does not change the classification, but implies `safeToRetry: false` (a rerun would refuse on the leftover lock). Distinct from `lockReleaseFailed`: the environment lock is *not* affected. `deploy` and `rollback` only. |
 | `message`           | always          | **Explicitly non-contractual.** Human-oriented prose. Never parse it, never branch on it, never assert on it in tests. All machine decisions come from the fields. |
 | `data`              | per command     | Command-specific shape. Absent only when there is nothing meaningful to report.                                                                               |
 
@@ -206,6 +208,13 @@ lockRetained      = the lock was deliberately NOT released
 lockReleaseFailed = the lock release was attempted and failed
                     (manual cleanup required)
 ```
+
+The staging lock has the same release-failure shape: when
+`.staging/<version>` cannot be removed after staging, the envelope
+carries `stagingLockReleaseFailed: true` (joined with the operation's
+own outcome, never changing its classification). A leftover staging
+lock makes every future stage of that version refuse, exactly like a
+crashed stager's lock.
 
 A `resolution` whose markers were removed and whose lock release then
 failed reports `outcome: infrastructure-failure` with
