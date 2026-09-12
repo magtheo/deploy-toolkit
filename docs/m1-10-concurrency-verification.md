@@ -100,6 +100,17 @@ Cancellation / transport-loss coverage per boundary — proven by
    M1-6 amendment review (unnamed returns); included here in the
    register for completeness.
 
+4. **Staging-lock release failure could be silently lost** (review
+   amendment to this phase). The staging lock's release defer recorded
+   the rmdir failure only when no primary staging error existed,
+   contradicting its own "never swallowed" comment. Now:
+   `target.ErrStageLockReleaseFailed` is always `errors.Join`ed — both
+   facts survive. The CLI surfaces it as the structured
+   `stagingLockReleaseFailed` envelope fact (distinct from the
+   environment lock's `lockReleaseFailed`, implying `safeToRetry:
+   false`), and the held-staging-lock refusal now classifies
+   identically on human and JSON surfaces (refused, exit 1).
+
 ## ENOTEMPTY flake verdict (PR #1 CI, `Release` rmdir)
 
 Not reproduced: 40-deploy sequential churn, 6×8 parallel-environment
