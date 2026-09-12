@@ -82,8 +82,11 @@ exactly ONE deployctl.result/v1 document on stdout
 ## Command enum
 
 ```text
-deploy | rollback | status | recovery-resolve
+deploy | rollback | status | recovery-resolve | prepare
 ```
+
+`prepare` (v1 additive) is the artifact-building command of the prepare/
+deploy trust split; it never contacts a target.
 
 ## Outcome enum and exit codes
 
@@ -235,10 +238,44 @@ genuinely held lock             → refused  (exit 1)
 The refusal documents carry the same marker facts the engine would
 report: what is on the target remains on the target.
 
+## Prepared-material verification refusals
+
+`deploy-prepared`, `rollback-prepared` and `recovery resolve --prepared`
+verify the artifact **before any target contact**. Any verification
+failure — digest mismatch, unknown schema, identity mismatch, truncated
+artifact — is `refused` (exit 1), `safeToRetry: false`: the material is
+the problem, nothing was contacted, nothing was executed, and retrying
+with the same bytes cannot succeed. Flag/grammar errors on these
+commands remain `usage-error` (exit 2); target connection failures keep
+the standard classification.
+
 ## Per-command `data` shapes
 
 Fields marked *(always)* are always emitted. Others use `omitempty`:
 absent means unset/zero, which for booleans means `false`.
+
+### `deploy` and `rollback` — the `invocation` field
+
+*(v1 additive; present only when `"prepared"`)* The operation ran from a
+verified prepared artifact (`prepared.deployment/v1`): the deploy side
+re-verified every binding before target contact and used **no repository
+checkout**. Absent for the direct repository-backed invocation.
+
+### `prepare`
+
+```jsonc
+{
+  "preparedDir":    "...",           // artifact directory written
+  "releasePath":    ".deploy/releases/my-app-1.0.0.yaml",
+  "bundleDigest":   "sha256:...",
+  "contractDigest": "sha256:...",
+  "sourceRevision": "<full 40-hex sha>"
+}
+```
+
+Prepare failures are `usage-error` (exit 2): the repository state is the
+problem — nothing was contacted and nothing was written. Filesystem write
+failures are `infrastructure-failure`.
 
 ### `deploy`
 
@@ -338,9 +375,13 @@ something failed — which is exactly when the distinction matters.
 
 ```text
 deployctl deploy <env> [flags]
+deployctl prepare <env> --out <dir> [--release <version>] [flags]
+deployctl deploy-prepared --prepared <dir> [--environment <name>] [flags]
+deployctl rollback-prepared --from <dir> --to <dir> [--environment <name>] [flags]
 deployctl rollback <env> --to <version> --confirm "rollback <env> to <version>" [flags]
 deployctl status <env> [flags]
 deployctl recovery resolve <env> [recovery <id>] [attempt <id>] --confirm "..." [flags]
+deployctl recovery resolve --prepared <dir> [selectors] --confirm "..." [flags]
 ```
 
 - The confirmation sentence is exactly the canonical sentence for the

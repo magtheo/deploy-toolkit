@@ -225,6 +225,33 @@ deploy (only the target connection credential)
 Production application secrets never enter GitHub at all. They live on the
 target, outside the release.
 
+## The prepared artifact boundary
+
+The two trust stages are separated by a **prepared artifact** — an immutable,
+deterministic, secret-free directory containing the exact release manifest
+bytes, the exact environment and target manifests, the canonical bundle
+bytes, and an integrity manifest (`prepared.json`) that digest-binds every
+member and every identity (schema `prepared.deployment/v1`,
+`docs/prepared-artifact-v1.md`).
+
+```
+prepare                       deploy-prepared
+deployctl prepare <env>       deployctl deploy-prepared --prepared <dir>
+  owns the repository           owns the target credential
+  builds the artifact    ──►    re-verifies EVERY binding
+  zero target credential        zero repository access
+```
+
+The deploy side re-parses every manifest through the same validation
+pipeline and re-checks the full digest web **before any target contact**;
+a failure is a refusal, never an infrastructure retry. The lifecycle engine
+is unchanged: it already consumed prepared bytes — the artifact merely
+formalizes the boundary as a versioned, tamper-evident contract.
+
+The direct `deployctl deploy <env>` path remains for local and manual use.
+It may build the bundle and deploy in one process; the production path may
+not.
+
 ## Server filesystem model
 
 Releases are environment-independent; state and history are

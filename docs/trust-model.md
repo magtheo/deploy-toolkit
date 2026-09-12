@@ -69,6 +69,22 @@ deploy  — only the target connection credential
 The deploy job never checks out application source. Application secrets never
 enter GitHub; they live on the target, outside the release.
 
+## The prepared artifact is the trust boundary
+
+The two stages exchange a versioned artifact (`prepared.deployment/v1`), not
+ad-hoc files. Its integrity web binds each manifest's exact bytes and the
+bundle bytes so that no member can be swapped, truncated or edited without
+failing closed on the deploy side — which re-verifies everything before
+contacting the target. To forge a fully self-consistent artifact an
+adversary must produce bytes matching a digest pinned inside a release
+manifest — that is, must already hold the exact release material. Signature
+key management is deliberately out of scope; provenance between the jobs of
+one run is carried by the CI system's artifact scoping.
+
+The artifact is **non-secret by construction**: the target manifest names
+environment variables, never values; prepare runs with zero credentials and
+refuses key material in any member.
+
 ## Strict host verification
 
 The target pins its SSH host key (`hostKeyFrom` in the Target manifest). Deploy

@@ -363,6 +363,17 @@ digest (bundle bytes against `bundle.digest` before staging; the staged
 hook runs). `BuildFromRevision` — deriving the include list from the
 revision's own manifest — belongs to the prepare side.
 
+The boundary is a versioned artifact: **`prepared.deployment/v1`** (candidate,
+`docs/prepared-artifact-v1.md`). `deployctl prepare` builds it with
+repository authority and zero target credential; `deployctl
+deploy-prepared` / `deployctl rollback-prepared` consume it with the target
+credential and zero source access. The deploy side re-parses every manifest
+through the standard validation pipeline and re-verifies the full digest
+web — schema, identities, environment↔target↔release pins, bundle digest,
+contract digest — before any target contact; verification failures are
+`refused` (exit 1). The prepared artifact never contains secret material:
+the target manifest names environment variables, never values.
+
 ### SSH target prerequisites (V1)
 
 An SSH target must provide, and the toolkit may rely on:
@@ -386,17 +397,36 @@ follow the POSIX dispatch convention and are reported as start failures; a
 target command that deliberately exits 126/127 is therefore
 indistinguishable from a start failure — a documented protocol limit.
 
-## GitHub workflow interface (planned for consumers)
+## GitHub workflow interface
 
 ```yaml
 jobs:
   deploy:
-    uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-sha>
+    uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-toolkit-sha>
     with:
-      toolkit_ref: <full-sha>
-      environment: production
+      environment: production      # required
+      toolkit_ref: <full-toolkit-sha>  # required, validated as 40-hex
+      ref: ""                      # consumer repo ref (optional)
+      repo_dir: "."                # monorepo support (optional)
+      owner: ""                    # audit identity (optional)
+    secrets:
+      target_host: ${{ secrets.TARGET_HOST }}
+      target_ssh_key: ${{ secrets.TARGET_SSH_KEY }}
+      target_host_key: ${{ secrets.TARGET_HOST_KEY }}
 ```
 
-Consumers pin **full SHAs**, never tags or branches. Workflow inputs,
+The workflow implements the trust split as two jobs: `prepare` (repository
+checkout, `contents: read`, no secrets) and `deploy` (artifact download and
+deployment, `actions: read`, never checks out the consumer source). The
+target manifest must reference these variable names: `TOOLKIT_TARGET_HOST`
+(hostFrom), `TOOLKIT_TARGET_SSH_KEY_PATH` (credentialFrom),
+`TOOLKIT_TARGET_HOST_KEY_PATH` (hostKeyFrom); the SSH user is pinned
+statically in the manifest.
+
+The deploy job captures `deployctl.result/v1` as `result.json`, attached to
+the job summary and the `result` step output whatever the outcome. All
+third-party actions are pinned by full commit SHA; the toolkit itself must
+be consumed by a **full SHA**, never a tag or branch. Workflow inputs,
 permissions and secret names are contract items; changing them follows the
-versioning policy above.
+versioning policy above. These properties are pinned by tests
+(`cmd/deployctl/workflow_contract_test.go`).

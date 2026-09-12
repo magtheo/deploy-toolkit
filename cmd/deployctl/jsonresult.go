@@ -132,9 +132,13 @@ func usageErrorResult(command, envName, message string) *resultEnvelope {
 // ---- deploy ------------------------------------------------------------
 
 type deployResultData struct {
-	Committed            bool `json:"committed"`
-	AlreadyCurrent       bool `json:"alreadyCurrent"`
-	ConsequentialStarted bool `json:"consequentialStarted"`
+	Committed      bool `json:"committed"`
+	AlreadyCurrent bool `json:"alreadyCurrent"`
+	// Invocation (compatible v1 extension): "prepared" when the
+	// deployment ran from a verified prepared artifact (trust split),
+	// absent for the direct repository-backed invocation.
+	Invocation           string `json:"invocation,omitempty"`
+	ConsequentialStarted bool   `json:"consequentialStarted"`
 	// LockRetained (compatible v1 extension): the invocation
 	// deliberately did not release its acquired environment lock
 	// because a lifecycle hook's execution fate could not be
@@ -273,9 +277,11 @@ func noteStagingLockReleaseFailed(env *resultEnvelope, err error) {
 // ---- rollback ----------------------------------------------------------
 
 type rollbackResultData struct {
-	Committed            bool `json:"committed"`
-	AlreadyRecovered     bool `json:"alreadyRecovered"`
-	ConsequentialStarted bool `json:"recoveryStarted"`
+	Committed        bool `json:"committed"`
+	AlreadyRecovered bool `json:"alreadyRecovered"`
+	// Invocation (compatible v1 extension): see deployResultData.
+	Invocation           string `json:"invocation,omitempty"`
+	ConsequentialStarted bool   `json:"recoveryStarted"`
 	// LockRetained (compatible v1 extension): mirror of deploy.
 	LockRetained  bool           `json:"lockRetained,omitempty"`
 	RecoveryID    string         `json:"recoveryId,omitempty"`
@@ -434,6 +440,7 @@ const (
 	cmdRollback        = "rollback"
 	cmdStatus          = "status"
 	cmdRecoveryResolve = "recovery-resolve"
+	cmdPrepare         = "prepare"
 )
 
 type resolveResultData struct {
