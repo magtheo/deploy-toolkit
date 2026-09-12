@@ -446,6 +446,10 @@ func Deploy(ctx context.Context, in DeployInput) (rep *Report, err error) {
 		// the outcome uncertain (the service may be on the new release
 		// while observed state says otherwise). The attempt marker stays,
 		// so a retry is refused until recovery — never re-run blindly.
+		// RecoveryRequired is set HERE, not only in failDeployment: the
+		// marker exists, so recovery is a fact of this report regardless
+		// of which failure shape carries it.
+		rep.RecoveryRequired = true
 		return failInfra("observed state commit failed", err)
 	}
 	rep.Committed = true

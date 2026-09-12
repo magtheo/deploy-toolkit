@@ -51,6 +51,12 @@ type resultEnvelope struct {
 	// environment stays locked until manual cleanup, whatever the
 	// outcome classification. See cli-v1.md.
 	LockReleaseFailed bool `json:"lockReleaseFailed,omitempty"`
+	// StagingLockReleaseFailed (compatible v1 envelope extension): the
+	// invocation's staging lock (.staging/<version>) could not be
+	// released — future stages of that release version refuse until
+	// manual cleanup, whatever the outcome classification. Distinct
+	// from lockReleaseFailed, which means the environment lock.
+	StagingLockReleaseFailed bool `json:"stagingLockReleaseFailed,omitempty"`
 	// RecoveryRequired: an unresolved attempt/recovery marker (or a
 	// partial resolution leaving one) blocks normal operation.
 	RecoveryRequired bool `json:"recoveryRequired"`
@@ -185,6 +191,12 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 			// transport sense, never in the safe-to-retry sense.
 			env.Outcome = outcomeRefused
 			env.Message = "refused: durable evidence on the target exists but is invalid — run deployctl status, inspect the evidence and verify the target before recovery; do not rerun"
+		case errors.Is(err, target.ErrStageLockHeld):
+			// The release version is being staged by another
+			// environment's operation right now: refusal, same class
+			// as a held environment lock.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: this release version is being staged by another operation — wait for it to finish, or remove a crashed stager's lock after verifying"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"
@@ -223,6 +235,7 @@ func deployResult(rep *lifecycle.Report, err error) (*resultEnvelope, int) {
 		env.Message = "deploy failed: " + rep.FailureReason
 	}
 	noteLockReleaseFailed(env, err)
+	noteStagingLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
 }
 
@@ -237,6 +250,24 @@ func noteLockReleaseFailed(env *resultEnvelope, err error) {
 	// The structured fact is the contract; the prose is a courtesy.
 	env.LockReleaseFailed = true
 	env.Message += " — THE ENVIRONMENT LOCK COULD NOT BE RELEASED: manual cleanup is required; no other operation may start until it is removed"
+}
+
+// noteStagingLockReleaseFailed mirrors noteLockReleaseFailed for the
+// staging lock: a release-failure of .staging/<version> blocks every
+// future stage of that version, so it must surface as a structured
+// fact on any outcome — deploy and rollback both stage.
+func noteStagingLockReleaseFailed(env *resultEnvelope, err error) {
+	if err == nil || !errors.Is(err, target.ErrStageLockReleaseFailed) {
+		return
+	}
+	env.StagingLockReleaseFailed = true
+	// Deliberately NOT touching SafeToRetry, mirroring the environment
+	// lock's release failure: safeToRetry classifies a rerun AFTER the
+	// stated infrastructure problem is repaired — the operator removes
+	// the leftover lock, and staging (pre-consequential, idempotent)
+	// can simply run again. The cleanup prerequisite and the retry
+	// safety are orthogonal facts.
+	env.Message += " — THE STAGING LOCK COULD NOT BE RELEASED: manual cleanup is required; future stages of this release version refuse until it is removed"
 }
 
 // ---- rollback ----------------------------------------------------------
@@ -291,6 +322,12 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 			// Mirror deploy: invalid durable evidence is a refusal.
 			env.Outcome = outcomeRefused
 			env.Message = "refused: durable evidence on the target exists but is invalid — run deployctl status, inspect the evidence and verify the target before recovery; do not rerun"
+		case errors.Is(err, target.ErrStageLockHeld):
+			// The release version is being staged by another
+			// environment's operation right now: refusal, same class
+			// as a held environment lock.
+			env.Outcome = outcomeRefused
+			env.Message = "refused: this release version is being staged by another operation — wait for it to finish, or remove a crashed stager's lock after verifying"
 		case rep != nil && rep.Committed:
 			env.Outcome = outcomeInfraFailed
 			env.Message = "the observed state is committed; post-commit bookkeeping failed"
@@ -329,6 +366,7 @@ func rollbackResult(rep *lifecycle.RollbackReport, err error) (*resultEnvelope, 
 		env.Message = "rollback failed: " + rep.FailureReason
 	}
 	noteLockReleaseFailed(env, err)
+	noteStagingLockReleaseFailed(env, err)
 	return env, exitByOutcome(env.Outcome)
 }
 

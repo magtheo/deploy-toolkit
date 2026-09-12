@@ -129,3 +129,16 @@ func (l Layout) HistoryPath(project, env string) (string, error) {
 	}
 	return l.root + "/" + project + "/history/" + env + ".jsonl", nil
 }
+
+// StagingLockDir is the cross-environment staging lock for one release
+// version: <deployRoot>/<project>/.staging/<version>. It lives OUTSIDE
+// releases/ so it never enters a staged directory's content.
+func (l Layout) StagingLockDir(project, version string) (string, error) {
+	if err := checkSlug("project", project); err != nil {
+		return "", err
+	}
+	if err := CheckVersion(version); err != nil {
+		return "", err
+	}
+	return l.root + "/" + project + "/.staging/" + version, nil
+}

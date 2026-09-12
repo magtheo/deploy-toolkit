@@ -1,12 +1,17 @@
 package target
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/magtheo/deploy-toolkit/internal/transport"
+	"github.com/magtheo/deploy-toolkit/internal/transport/local"
 )
 
 func TestStageNew(t *testing.T) {
@@ -187,5 +192,79 @@ func TestStageCorruptMarkerRefused(t *testing.T) {
 		if _, err := tgt.Stage(t.Context(), rel, bundle, time.Now()); err == nil {
 			t.Errorf("%s: hostile marker must fail closed", c.name)
 		}
+	}
+}
+
+// failingTransport forwards to a real local transport but fails the
+// configured Run argv head and Put path prefix — used to force staging
+// and staging-lock-release failures deterministically.
+type failingTransport struct {
+	transport.Transport
+	killRun string // argv[0] to fail (e.g. "rmdir")
+	killPut string // Put path prefix to fail
+}
+
+func (f *failingTransport) Run(ctx context.Context, req transport.RunRequest) (transport.RunResult, error) {
+	if f.killRun != "" && len(req.Argv) > 0 && req.Argv[0] == f.killRun {
+		return transport.RunResult{ExitCode: 1, Stderr: []byte("forced failure")}, nil
+	}
+	return f.Transport.Run(ctx, req)
+}
+
+func (f *failingTransport) Put(ctx context.Context, req transport.PutRequest) error {
+	if f.killPut != "" && strings.HasPrefix(req.Path, f.killPut) {
+		return errors.New("forced put failure")
+	}
+	return f.Transport.Put(ctx, req)
+}
+
+// A successful stage whose staging lock cannot be released must still
+// fail: the leftover lock blocks every future stage of the version.
+func TestStageSuccessWithReleaseFailureJoins(t *testing.T) {
+	root := t.TempDir()
+	tgt, err := New(&failingTransport{Transport: local.New(), killRun: "rmdir"}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, digest := buildBundle(t, stageEntries)
+
+	status, err := tgt.Stage(t.Context(), testRelease("my-app", "1.0.0", digest), bundle, time.Unix(1700000000, 0))
+	if status != StageNew {
+		t.Errorf("status = %s, want new (the stage itself succeeded)", status)
+	}
+	if !errors.Is(err, ErrStageLockReleaseFailed) {
+		t.Fatalf("err = %v, want ErrStageLockReleaseFailed in chain", err)
+	}
+	if _, serr := os.Stat(filepath.Join(root, "my-app/.staging/1.0.0")); serr != nil {
+		t.Errorf("staging lock did not survive: %v", serr)
+	}
+}
+
+// A primary staging failure must NOT swallow a simultaneous staging
+// lock release failure: both facts survive in the joined error.
+func TestStageFailurePreservesReleaseFailure(t *testing.T) {
+	root := t.TempDir()
+	tgt, err := New(&failingTransport{
+		Transport: local.New(),
+		killRun:   "rmdir",
+		killPut:   filepath.Join(root, "my-app/releases"),
+	}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle, digest := buildBundle(t, stageEntries)
+
+	_, err = tgt.Stage(t.Context(), testRelease("my-app", "1.0.0", digest), bundle, time.Unix(1700000000, 0))
+	if err == nil {
+		t.Fatal("stage with forced put failure succeeded")
+	}
+	if errors.Is(err, ErrStageLockHeld) {
+		t.Fatalf("primary staging failure misread as held lock: %v", err)
+	}
+	if !strings.Contains(err.Error(), "forced put failure") {
+		t.Errorf("primary staging failure lost: %v", err)
+	}
+	if !errors.Is(err, ErrStageLockReleaseFailed) {
+		t.Errorf("release failure swallowed by primary staging failure: %v", err)
 	}
 }
