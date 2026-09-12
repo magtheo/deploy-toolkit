@@ -220,8 +220,12 @@ func TestStagingLockReleaseFailureSurfaces(t *testing.T) {
 		if doc.LockReleaseFailed {
 			t.Errorf("lockReleaseFailed = %v, want false — the environment lock is a distinct fact", doc.LockReleaseFailed)
 		}
-		if doc.SafeToRetry {
-			t.Errorf("safeToRetry = true, want false while the staging lock blocks this version")
+		// Pre-consequential staging is safe to rerun once the operator
+		// removes the leftover lock: the cleanup fact is orthogonal to
+		// retry safety (cli-v1: "after the infrastructure problem is
+		// fixed").
+		if doc.SafeToRetry != true {
+			t.Errorf("safeToRetry = %v, want true — retry is known-safe after the lock removal", doc.SafeToRetry)
 		}
 	})
 	t.Run("rollback json staging failure plus release failure", func(t *testing.T) {
@@ -235,8 +239,9 @@ func TestStagingLockReleaseFailureSurfaces(t *testing.T) {
 	})
 	t.Run("successful stage still reports the release failure", func(t *testing.T) {
 		// The stage itself succeeded; only the deferred lock release
-		// failed. The classification is unchanged; the cleanup fact
-		// must still be machine-visible.
+		// failed. The classification is unchanged and a rerun remains
+		// known-safe after cleanup; the cleanup fact must still be
+		// machine-visible.
 		doc, code := deployResult(nil, successful)
 		if code != exitInfra || doc.Outcome != outcomeInfraFailed {
 			t.Fatalf("shape = %v/%d, want infrastructure-failure/3", doc.Outcome, code)
@@ -246,6 +251,25 @@ func TestStagingLockReleaseFailureSurfaces(t *testing.T) {
 		}
 		if doc.LockReleaseFailed {
 			t.Errorf("lockReleaseFailed = %v, want false", doc.LockReleaseFailed)
+		}
+		if doc.SafeToRetry != true {
+			t.Errorf("safeToRetry = %v, want true — the cleanup fact must not suppress it", doc.SafeToRetry)
+		}
+	})
+	t.Run("unsafe underlying outcome keeps safeToRetry false for its own reasons", func(t *testing.T) {
+		// Orthogonality, both directions: when the underlying outcome
+		// is independently unsafe (consequential work may have run),
+		// the staging-lock fact neither causes nor repairs that —
+		// safeToRetry stays false because of the uncertainty.
+		doc, code := deployResult(&lifecycle.Report{Project: "my-app", Environment: "production", ConsequentialStarted: true, AttemptID: "attempt-1", LockRetained: true}, joined)
+		if code != exitInfra || doc.Outcome != outcomeUncertain {
+			t.Fatalf("shape = %v/%d, want uncertain/3", doc.Outcome, code)
+		}
+		if doc.StagingLockReleaseFailed != true {
+			t.Errorf("stagingLockReleaseFailed = %v, want true (the fact still surfaces)", doc.StagingLockReleaseFailed)
+		}
+		if doc.SafeToRetry != false {
+			t.Errorf("safeToRetry = %v, want false (from the uncertain outcome, not the staging fact)", doc.SafeToRetry)
 		}
 	})
 	t.Run("absent on clean failure", func(t *testing.T) {

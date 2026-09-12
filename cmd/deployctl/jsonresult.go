@@ -261,10 +261,12 @@ func noteStagingLockReleaseFailed(env *resultEnvelope, err error) {
 		return
 	}
 	env.StagingLockReleaseFailed = true
-	// A leftover staging lock refuses every future stage of this
-	// version until an operator removes it, so a rerun is NOT known-
-	// safe — the same reasoning as a retained environment lock.
-	env.SafeToRetry = false
+	// Deliberately NOT touching SafeToRetry, mirroring the environment
+	// lock's release failure: safeToRetry classifies a rerun AFTER the
+	// stated infrastructure problem is repaired — the operator removes
+	// the leftover lock, and staging (pre-consequential, idempotent)
+	// can simply run again. The cleanup prerequisite and the retry
+	// safety are orthogonal facts.
 	env.Message += " — THE STAGING LOCK COULD NOT BE RELEASED: manual cleanup is required; future stages of this release version refuse until it is removed"
 }
 

@@ -107,9 +107,12 @@ Cancellation / transport-loss coverage per boundary — proven by
    `target.ErrStageLockReleaseFailed` is always `errors.Join`ed — both
    facts survive. The CLI surfaces it as the structured
    `stagingLockReleaseFailed` envelope fact (distinct from the
-   environment lock's `lockReleaseFailed`, implying `safeToRetry:
-   false`), and the held-staging-lock refusal now classifies
-   identically on human and JSON surfaces (refused, exit 1).
+   environment lock's `lockReleaseFailed`), and the held-staging-lock
+   refusal now classifies identically on human and JSON surfaces
+   (refused, exit 1). The cleanup fact is deliberately orthogonal to
+   `safeToRetry`: retry safety is judged after the stated problem —
+   here the lock removal — is repaired, exactly as for the
+   environment lock's release failure.
 
 ## ENOTEMPTY flake verdict (PR #1 CI, `Release` rmdir)
 
