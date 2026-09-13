@@ -69,6 +69,22 @@ deploy  — only the target connection credential
 The deploy job never checks out application source. Application secrets never
 enter GitHub; they live on the target, outside the release.
 
+## The prepared artifact is the trust boundary
+
+The two stages exchange a versioned artifact (`prepared.deployment/v1`), not
+ad-hoc files. Its integrity web binds each manifest's exact bytes and the
+bundle bytes so that no member can be swapped, truncated or edited without
+failing closed on the deploy side — which re-verifies everything before
+contacting the target. To forge a fully self-consistent artifact an
+adversary must produce bytes matching a digest pinned inside a release
+manifest — that is, must already hold the exact release material. Signature
+key management is deliberately out of scope; provenance between the jobs of
+one run is carried by the CI system's artifact scoping.
+
+The artifact is **target-credential-free by construction**: the target manifest names
+environment variables, never values; prepare runs with zero credentials and
+refuses key material in any member.
+
 ## Strict host verification
 
 The target pins its SSH host key (`hostKeyFrom` in the Target manifest). Deploy
@@ -83,13 +99,15 @@ credentials.
 
 ## Pinned consumption
 
-Consumers will reference this repository's workflows and binary by **full
-commit SHA**. The reusable workflows (including `deploy.yml`) are planned, not
-published yet — until they exist, consumers run `deployctl` directly and own
-the wiring themselves:
+Consumers reference this repository's workflows and binary by **full
+commit SHA**. For the reusable deployment workflow the `uses:` pin is the
+single machinery trust anchor: both of its jobs rebuild `deployctl` from
+`job.workflow_repository@job.workflow_sha` and fail closed unless the
+workflow itself was invoked by a full SHA — so the workflow definition,
+the prepare binary and the deploy binary are always one pinned commit:
 
 ```
-uses: <org>/<toolkit>/.github/workflows/deploy.yml@<full-sha>   # planned
+uses: <org>/<toolkit>/.github/workflows/deploy.yml@<full-sha>   # published
 ```
 
 Readable release tags (`v0.4.0 → 12ab...`) are documentation above an

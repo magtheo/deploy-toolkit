@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/magtheo/deploy-toolkit/internal/lifecycle"
+	"github.com/magtheo/deploy-toolkit/internal/prepared"
 	"github.com/magtheo/deploy-toolkit/internal/target"
 )
 
@@ -153,6 +154,17 @@ func canonicalResolveSentence(envName string, sc resolveScope) string {
 // which observed state, then removes exactly the markers the typed
 // sentence names. The engine re-reads those markers under the lock and
 // refuses on any mismatch.
+// containsFlag reports whether the lexed flag tokens contain --name in
+// either --name value or --name=value form.
+func containsFlag(flags []string, name string) bool {
+	for _, f := range flags {
+		if f == "--"+name || strings.HasPrefix(f, "--"+name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
 func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	// The shared lexer processes the ENTIRE argv after `resolve`, exactly
 	// once — it is the single authority for flag arity, machine-mode
@@ -161,7 +173,7 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	// the environment; positional[1:] are the recovery/attempt
 	// selectors. The lexer is never re-run with a different slice or
 	// interpretation.
-	lexFlags, positional, jsonMode, missingValue := lexArgs(args, map[string]bool{"repo-dir": true, "owner": true, "confirm": true})
+	lexFlags, positional, jsonMode, missingValue := lexArgs(args, map[string]bool{"repo-dir": true, "owner": true, "confirm": true, "prepared": true})
 	if missingValue != "" {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envNameOr(positional), "--"+missingValue+" requires a value"))
@@ -169,15 +181,22 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		fmt.Fprintf(stderr, "deployctl recovery resolve: --%s requires a value\n", missingValue)
 		return exitUsage
 	}
-	if len(positional) == 0 {
+	if len(positional) == 0 && !containsFlag(lexFlags, "prepared") {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, "", "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>]"))
 		}
 		fmt.Fprintln(stderr, "usage: deployctl recovery resolve <environment> [recovery <id>] [attempt <id>] [--repo-dir .] [--owner identity] [--confirm \"...\"]")
 		return exitUsage
 	}
-	envName := positional[0]
-	selectors := positional[1:]
+	// With --prepared the environment identity comes from the verified
+	// artifact; a positional environment is then optional and only
+	// permitted to MATCH it (checked after the artifact loads).
+	envName := ""
+	selectors := positional
+	if len(positional) > 0 {
+		envName = positional[0]
+		selectors = positional[1:]
+	}
 	if strings.Contains(envName, "/") {
 		if jsonMode {
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "environment must be a bare name"))
@@ -188,6 +207,7 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 	fs := flag.NewFlagSet("recovery resolve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	repoDir := fs.String("repo-dir", ".", "checkout containing .deploy/")
+	preparedDir := fs.String("prepared", "", "prepared artifact directory (trust split: resolves from the artifact, no checkout)")
 	owner := fs.String("owner", "", "identity recorded as resolution evidence (default user@host)")
 	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
@@ -196,6 +216,23 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, "invalid flags: "+err.Error()))
 		}
 		return exitUsage
+	}
+
+	// Trust split: with --prepared the artifact loads BEFORE scope
+	// validation (it is read-only and never contacts a target), so the
+	// authorization sentence is validated against the artifact's
+	// environment identity. With --prepared, positional tokens are
+	// SELECTORS; the environment always comes from the verified
+	// artifact.
+	var art *prepared.Artifact
+	if *preparedDir != "" {
+		var lerr error
+		art, lerr = prepared.Load(*preparedDir)
+		if lerr != nil {
+			return reportVerificationFailure(jsonMode, stdout, stderr, cmdRecoveryResolve, envName, lerr)
+		}
+		envName = art.Manifest.Environment
+		selectors = positional
 	}
 
 	// Command SYNTAX is validated before any target access — and before
@@ -233,13 +270,18 @@ func runRecoveryResolve(ctx context.Context, args []string, stdout, stderr io.Wr
 		}
 	}
 
-	dc, err := loadDeploymentContext(*repoDir, envName)
-	if err != nil {
-		if jsonMode {
-			return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, err.Error()))
+	dc := &deploymentContext{}
+	if art != nil {
+		dc.Env, dc.Release, dc.Target = art.Environment, art.Release, art.Target
+	} else {
+		dc, err = loadDeploymentContext(*repoDir, envName)
+		if err != nil {
+			if jsonMode {
+				return emitJSON(stdout, usageErrorResult(cmdRecoveryResolve, envName, err.Error()))
+			}
+			fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
+			return exitUsage
 		}
-		fmt.Fprintf(stderr, "✗ recovery resolve %s: %v\n", envName, err)
-		return exitUsage
 	}
 	tgt, err := connect(ctx, dc.Target)
 	if err != nil {

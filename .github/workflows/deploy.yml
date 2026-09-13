@@ -1,0 +1,240 @@
+# Reusable deployment workflow for Deploy Toolkit consumers.
+#
+# The consumer's `uses:` pin is the SINGLE machinery trust anchor. Both
+# jobs rebuild deployctl from exactly the commit of the reusable
+# workflow that is running (job.workflow_repository / job.workflow_sha),
+# and both fail closed unless the workflow itself was invoked by a full
+# 40-hex commit SHA:
+#
+#   jobs:
+#     deploy:
+#       uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-sha>
+#       with:
+#         environment: production
+#       secrets: [see below]
+#
+#   workflow definition, prepare deployctl, deploy deployctl
+#     — all one pinned SHA, no duplicated pin input.
+#
+# The consumer commit prepared is ALWAYS the invoking caller's commit
+# (github.sha — in a reusable workflow that context belongs to the
+# CALLER). The workflow cannot itself prove that commit was promoted:
+# the consumer caller is responsible for invoking this workflow ONLY
+# from the trusted, human-promoted branch state. Deployment provenance
+# is that chain: promoted commit → pinned workflow SHA → trusted
+# prepare job → same-run artifact channel. There is deliberately no
+# arbitrary-ref input.
+#
+# Trust model (docs/trust-model.md, docs/prepared-artifact-v1.md):
+#
+#   prepare — checks out the consumer repository and builds the
+#             immutable prepared artifact from the promoted release
+#             state. NO target credential exists in this job.
+#   deploy  — checks out ONLY this toolkit (never the consumer source),
+#             independently re-verifies the prepared artifact, then
+#             deploys it. The target credential exists only here.
+#
+# The target manifest in the consumer repository must reference these
+# environment variable names (the manifest names variables, the deploy
+# job holds the values):
+#
+#   hostFrom:       TOOLKIT_TARGET_HOST
+#   credentialFrom: TOOLKIT_TARGET_SSH_KEY_PATH
+#   hostKeyFrom:    TOOLKIT_TARGET_HOST_KEY_PATH
+#
+# The SSH user is pinned statically in the target manifest — users are
+# not secrets, and secrets never travel in manifests.
+#
+# Machine result: the deploy job exposes the deployctl.result/v1 JSON
+# document as the workflow output `result` (plus `exit_code`), whatever
+# the outcome. Automation decides from the document, never from prose
+# or exit codes alone.
+
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environment to deploy (a .deploy/environments/<name>.yaml in the consumer repo)
+        required: true
+        type: string
+      repo_dir:
+        description: Path inside the consumer repository holding .deploy/ (monorepos)
+        required: false
+        type: string
+        default: "."
+      owner:
+        description: Identity recorded in the lock and history (default deployctl's user@host)
+        required: false
+        type: string
+        default: ""
+    secrets:
+      target_host:
+        description: Target hostname (value of the env var named by hostFrom)
+        required: true
+      target_ssh_key:
+        description: SSH private key, written to a temp file by the deploy job
+        required: true
+      target_host_key:
+        description: Pinned host key (authorized_keys format), written to a temp file by the deploy job
+        required: true
+    outputs:
+      result:
+        description: The deployctl.result/v1 JSON document, whatever the outcome
+        value: ${{ jobs.deploy.outputs.result }}
+      exit_code:
+        description: The deployctl process exit code
+        value: ${{ jobs.deploy.outputs.exit_code }}
+
+# The workflow grants nothing by default; each job declares its own
+# least-privilege scope.
+permissions: {}
+
+jobs:
+  prepare:
+    name: prepare (repository authority, zero target credential)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fail closed unless this workflow was invoked by full SHA
+        env:
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          case "${WORKFLOW_REF##*@}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "::error::invoke this workflow pinned to a full 40-hex commit SHA (uses: ...@<full-sha>); a floating ref is not a trust anchor"; exit 1 ;;
+          esac
+
+      - name: Check out the consumer repository at the promoted commit
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          persist-credentials: false
+
+      - name: Check out exactly the toolkit commit running this workflow
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: toolkit
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@34829cb9acb0c3aab260216f67d0867cc080dca5
+        with:
+          go-version-file: toolkit/go.mod
+
+      - name: Build deployctl from the workflow's own toolkit commit
+        run: go build -o /tmp/deployctl ./cmd/deployctl
+        working-directory: toolkit
+
+      - name: Prepare the immutable deployment artifact
+        run: |
+          /tmp/deployctl prepare "$ENVIRONMENT" --repo-dir "$REPO_DIR" --out prepared-deployment
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          REPO_DIR: ${{ inputs.repo_dir }}
+
+      - name: Upload the prepared artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: prepared-deployment
+          path: prepared-deployment/
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    name: deploy (target credential, zero source access)
+    needs: prepare
+    runs-on: ubuntu-latest
+    # actions:read is required to download this run's artifact.
+    # contents: none — this job never touches the consumer repository.
+    permissions:
+      actions: read
+    outputs:
+      result: ${{ steps.capture.outputs.result }}
+      exit_code: ${{ steps.capture.outputs.exit_code }}
+    steps:
+      - name: Fail closed unless this workflow was invoked by full SHA
+        env:
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          case "${WORKFLOW_REF##*@}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "::error::invoke this workflow pinned to a full 40-hex commit SHA (uses: ...@<full-sha>); a floating ref is not a trust anchor"; exit 1 ;;
+          esac
+
+      - name: Check out exactly the toolkit commit running this workflow (machinery only, never the consumer source)
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: toolkit
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@34829cb9acb0c3aab260216f67d0867cc080dca5
+        with:
+          go-version-file: toolkit/go.mod
+
+      - name: Build deployctl from the workflow's own toolkit commit (independent of prepare's binary)
+        run: go build -o /tmp/deployctl ./cmd/deployctl
+        working-directory: toolkit
+
+      - name: Download the prepared artifact
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317
+        with:
+          name: prepared-deployment
+          path: prepared-deployment
+
+      - name: Deploy the prepared artifact
+        id: deployctl
+        env:
+          TOOLKIT_TARGET_HOST: ${{ secrets.target_host }}
+          TOOLKIT_TARGET_SSH_KEY: ${{ secrets.target_ssh_key }}
+          TOOLKIT_TARGET_HOST_KEY: ${{ secrets.target_host_key }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          OWNER: ${{ inputs.owner }}
+        run: |
+          set -euo pipefail
+          key_file="$(mktemp)"
+          host_key_file="$(mktemp)"
+          trap 'rm -f "$key_file" "$host_key_file"' EXIT
+          printf '%s\n' "$TOOLKIT_TARGET_SSH_KEY" > "$key_file"
+          printf '%s\n' "$TOOLKIT_TARGET_HOST_KEY" > "$host_key_file"
+          chmod 600 "$key_file" "$host_key_file"
+          export TOOLKIT_TARGET_SSH_KEY_PATH="$key_file"
+          export TOOLKIT_TARGET_HOST_KEY_PATH="$host_key_file"
+          set +e
+          if [ -n "$OWNER" ]; then
+            /tmp/deployctl deploy-prepared --prepared prepared-deployment --environment "$ENVIRONMENT" --owner "$OWNER" --json > result.json
+          else
+            /tmp/deployctl deploy-prepared --prepared prepared-deployment --environment "$ENVIRONMENT" --json > result.json
+          fi
+          code=$?
+          set -e
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Capture the machine result
+        id: capture
+        if: always()
+        env:
+          DEPLOYCTL_CODE: ${{ steps.deployctl.outputs.code }}
+        run: |
+          {
+            echo '### deployctl.result/v1'
+            echo ''
+            echo '```json'
+            cat result.json
+            echo '```'
+            echo ''
+            echo "process exit code: $DEPLOYCTL_CODE"
+          } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "exit_code=$DEPLOYCTL_CODE"
+            echo 'result<<DEPLOYCTL_RESULT_EOF'
+            cat result.json
+            echo 'DEPLOYCTL_RESULT_EOF'
+          } >> "$GITHUB_OUTPUT"

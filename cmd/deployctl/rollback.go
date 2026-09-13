@@ -155,32 +155,18 @@ func runRollback(ctx context.Context, args []string, stdout, stderr io.Writer) i
 
 	// Typed confirmation BEFORE the target is contacted: the human
 	// authorization boundary is also the first production contact.
-	// Nothing — not even an authenticated connection — happens before
-	// the sentence matches. The sentence names environment and
-	// transition; near-misses are refused. This is deliberate friction
-	// by design.
+	// The gate is shared with rollback-prepared so both manual paths
+	// cannot drift.
 	sentence := fmt.Sprintf("rollback %s to %s", envName, toRel.Metadata.Version)
-	got := *confirm
-	if got == "" {
-		fmt.Fprintf(humanOut, "Environment   %s\n", envName)
-		fmt.Fprintf(humanOut, "Undoes        %s (%s)\n", fromRel.Metadata.Version, shortDigest(fromRel.Bundle.Digest))
-		fmt.Fprintf(humanOut, "Restores      %s (%s)\n", toRel.Metadata.Version, shortDigest(toRel.Bundle.Digest))
-		fmt.Fprintf(humanOut, "Authorization manual (emergency)\n\n")
-		fmt.Fprintf(humanOut, "A recovery may run the failed release's rollback hook and the restored\nrelease's apply/verify on production. Type the sentence to confirm:\n  %s\n> ", sentence)
-		reader := bufio.NewReader(os.Stdin)
-		line, rerr := reader.ReadString('\n')
-		if rerr != nil && line == "" {
-			fmt.Fprintf(stderr, "\n✗ rollback aborted: confirmation could not be read (%v)\n", rerr)
-			return exitFailed
-		}
-		got = strings.TrimSpace(line)
-	}
-	if got != sentence {
-		if jsonMode {
-			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: "rollback", Outcome: outcomeRefused, Environment: envName, Message: fmt.Sprintf("confirmation does not match %q — nothing was executed, the target was not contacted", sentence)})
-		}
-		fmt.Fprintf(stderr, "✗ rollback aborted: confirmation does not match %q — nothing was executed, the target was not contacted\n", sentence)
-		return exitFailed
+	code, ok := confirmManualRollback(jsonMode, cmdRollback, envName, *confirm, sentence, stdout, humanOut, stderr, func(w io.Writer) {
+		fmt.Fprintf(w, "Environment   %s\n", envName)
+		fmt.Fprintf(w, "Undoes        %s (%s)\n", fromRel.Metadata.Version, shortDigest(fromRel.Bundle.Digest))
+		fmt.Fprintf(w, "Restores      %s (%s)\n", toRel.Metadata.Version, shortDigest(toRel.Bundle.Digest))
+		fmt.Fprintf(w, "Authorization manual (emergency)\n\n")
+		fmt.Fprintf(w, "A recovery may run the failed release's rollback hook and the restored\nrelease's apply/verify on production. Type the sentence to confirm:\n  %s\n> ", sentence)
+	})
+	if !ok {
+		return code
 	}
 
 	tgt, err := connect(ctx, dc.Target)
@@ -296,4 +282,37 @@ func shortDigest(d string) string {
 		return d[:19] + "…"
 	}
 	return d
+}
+
+// confirmManualRollback is the typed-confirmation authorization gate
+// shared by repository-backed `rollback` and `rollback-prepared`: the
+// human authorization boundary is also the first production contact,
+// and nothing — not even an authenticated connection — happens before
+// the sentence matches. The sentence names environment and transition;
+// near-misses are refused. This is deliberate friction by design.
+//
+// printSummary renders the human-facing transition description and is
+// passed the same writer as the prompt (already silenced in JSON mode).
+// It returns (exitCode, authorized); on refusal the caller must stop
+// before any target access.
+func confirmManualRollback(jsonMode bool, cmd, envName, confirmFlag, sentence string, stdout, humanOut, stderr io.Writer, printSummary func(io.Writer)) (int, bool) {
+	got := confirmFlag
+	if got == "" {
+		printSummary(humanOut)
+		reader := bufio.NewReader(os.Stdin)
+		line, rerr := reader.ReadString('\n')
+		if rerr != nil && line == "" {
+			fmt.Fprintf(stderr, "\n✗ %s aborted: confirmation could not be read (%v)\n", cmd, rerr)
+			return exitFailed, false
+		}
+		got = strings.TrimSpace(line)
+	}
+	if got != sentence {
+		if jsonMode {
+			return emitJSON(stdout, &resultEnvelope{Schema: resultSchemaV1, Command: cmd, Outcome: outcomeRefused, Environment: envName, Message: fmt.Sprintf("confirmation does not match %q — nothing was executed, the target was not contacted", sentence)}), false
+		}
+		fmt.Fprintf(stderr, "✗ %s aborted: confirmation does not match %q — nothing was executed, the target was not contacted\n", cmd, sentence)
+		return exitFailed, false
+	}
+	return exitOK, true
 }
