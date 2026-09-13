@@ -74,6 +74,13 @@ Right: the project declares a `verify` hook in its own `project.yaml`.
   use `feature/<name>/phase/<n>` commits.
 - Plan documents are required for substantial features, before implementation.
 
+## Merge authority
+
+PRs are finalized (merged or otherwise closed) only on the repository
+owner's explicit authorization. A review verdict, a green CI run, or a
+recommendation to merge is **not** authorization. The default endpoint
+for agent work is: implement → push → verify → report → stop.
+
 ## Development
 
 ```
