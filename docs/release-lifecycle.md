@@ -21,7 +21,7 @@ build + test + publish  (SHA-tagged artifacts)
 deployctl release create --revision <sha>
         │  deterministic eligibility
         ▼
-deployctl promotion propose <env> --release <version>
+deployctl promotion propose <env> --release <release-manifest-path>
         │
 promotion PR
         │
@@ -46,7 +46,7 @@ and never changes an environment:
 5. migration semantics read from explicit inputs — never inferred;
 6. release manifest generated and validated.
 
-**`deployctl promotion propose production --release 0.1.17`** owns the
+**`deployctl promotion propose production --release .deploy/releases/example-service-0.1.17.yaml`** owns the
 environment change and the human gate:
 
 7. environment file updated to the new release;
@@ -100,7 +100,7 @@ $ deployctl release create --revision abc123
 Created:
 .deploy/releases/example-service-0.1.17.yaml
 
-$ deployctl promotion propose production --release 0.1.17
+$ deployctl promotion propose production --release .deploy/releases/example-service-0.1.17.yaml
 
 Opened:
 deploy: promote example-service 0.1.17 to production

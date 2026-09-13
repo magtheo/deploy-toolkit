@@ -198,8 +198,10 @@ A consuming repository declares itself under `.deploy/`:
 ├── project.yaml                  what the project is and how a release is applied
 ├── releases/                     generated, immutable release manifests
 │   └── my-app-0.1.17.yaml
-└── environments/
-    └── production.yaml           human-approved desired state
+├── environments/
+│   └── production.yaml           human-approved desired state
+└── targets/
+    └── production-primary.yaml   where and how releases are deployed
 ```
 
 Promotion is a one-line diff:
@@ -238,7 +240,9 @@ branch state. The workflow exposes the machine result as `result` (one
 `deployctl.result/v1` document) and `exit_code`, whatever the outcome.
 
 Start from [`templates/`](templates/) and read
-[docs/consumer-contract-v1.md](docs/consumer-contract-v1.md).
+[docs/consumer-contract-v1.md](docs/consumer-contract-v1.md); what a
+deployment target must provide — provider-neutrally — is
+[docs/target-prerequisites.md](docs/target-prerequisites.md).
 
 ## Design invariants
 
