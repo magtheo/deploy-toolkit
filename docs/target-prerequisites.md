@@ -13,8 +13,8 @@
 ## What Deploy Toolkit requires
 
 These are properties of the Target contract
-([`schemas/target.schema.json`](schemas/target.schema.json),
-[`templates/target.yaml`](templates/target.yaml)). Nothing here assumes
+([`schemas/target.schema.json`](../schemas/target.schema.json),
+[`templates/target.yaml`](../templates/target.yaml)). Nothing here assumes
 a particular runtime, registry, or hosting provider.
 
 1. **A reachable target using the declared transport.** `ssh` (default
@@ -35,7 +35,9 @@ a particular runtime, registry, or hosting provider.
    <deployRoot>/<project>/history/              deployment history
    ```
 
-   The declared user must be able to create and write this tree.
+   (Indicative, not exhaustive: the layout also owns environment locks,
+   staging directories, and attempt/recovery markers.) The declared user
+   must be able to create and write this tree.
 
 4. **Authentication material through the Target contract — never in
    Git.** The manifest names environment *variables*; the invoking
@@ -54,9 +56,9 @@ a particular runtime, registry, or hosting provider.
    `TOOLKIT_TARGET_SSH_KEY_PATH`, `TOOLKIT_TARGET_HOST_KEY_PATH`); a
    local `deployctl` invocation may use any names.
 
-5. **A pinned SSH host identity** (SSH targets). The host-key file uses
-   the public-key/authorized_keys format (`ssh-ed25519 AAAA… comment`),
-   one key per line. Host verification is strict by design; the toolkit
+5. **A pinned SSH host identity** (SSH targets). The host-key file
+   contains one pinned OpenSSH public host-key line, e.g.
+   `ssh-ed25519 AAAA… optional-comment`. Host verification is strict by design; the toolkit
    never disables host-key checking. Capture the key out of band (verify
    the fingerprint through the provider's panel or a first manual
    connection) — never blindly `ssh-keyscan` a host you haven't verified.
@@ -76,10 +78,13 @@ a particular runtime, registry, or hosting provider.
 
 7. **Target-owned state and secrets, outside the release trees.**
    Releases are immutable and replaceable; anything that must survive
-   them (application secrets, databases, uploaded data) lives elsewhere
-   on the target — conventionally `<deployRoot>/<project>/secrets/`,
-   created by your bootstrap and read by your hooks. Deploy Toolkit
-   never reads, writes, or transports application secrets.
+   them lives outside the release trees. Application secrets may
+   conventionally live at `<deployRoot>/<project>/secrets/`, created by
+   your bootstrap and read by your hooks; Deploy Toolkit never reads,
+   writes, or transports them. Other persistent application state —
+   databases, volumes, uploads — lives wherever the consumer's runtime
+   owns it, and must not depend on an immutable release directory if it
+   needs to survive release replacement.
 
 ## What Deploy Toolkit deliberately does NOT require
 
