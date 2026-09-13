@@ -159,7 +159,7 @@ same boundary rather than a hidden source-access path.
 
 ## Secrets
 
-The artifact is **non-secret by construction**:
+The artifact is **target-credential-free by construction**:
 
 - `target.yaml` names environment variables (`HostFrom`, `CredentialFrom`,
   `HostKeyFrom`); values are resolved only at deploy time from the deploy

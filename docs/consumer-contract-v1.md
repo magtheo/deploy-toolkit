@@ -424,8 +424,17 @@ eligibility → promotion → deployment chain intact.
 
 The workflow implements the trust split as two jobs: `prepare` (repository
 checkout, `contents: read`, no secrets) and `deploy` (artifact download and
-deployment, `actions: read`, never checks out the consumer source). The
-target manifest must reference these variable names: `TOOLKIT_TARGET_HOST`
+deployment, `actions: read`, never checks out the consumer source).
+
+The consumer commit prepared is the invoking caller's commit (`github.sha`;
+in a reusable workflow that context belongs to the caller). The workflow
+cannot itself prove that commit was promoted: **the consumer caller is
+responsible for invoking deployment only from the trusted, human-promoted
+branch state** — e.g. a caller workflow that runs on the promotion branch
+after merge. This obligation is pinned with the Platform Core caller
+workflow.
+
+The target manifest must reference these variable names: `TOOLKIT_TARGET_HOST`
 (hostFrom), `TOOLKIT_TARGET_SSH_KEY_PATH` (credentialFrom),
 `TOOLKIT_TARGET_HOST_KEY_PATH` (hostKeyFrom); the SSH user is pinned
 statically in the manifest.

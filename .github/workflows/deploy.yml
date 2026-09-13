@@ -16,10 +16,14 @@
 #   workflow definition, prepare deployctl, deploy deployctl
 #     — all one pinned SHA, no duplicated pin input.
 #
-# The consumer commit prepared is ALWAYS the invoking commit (github.sha)
-# — the promoted, human-authorized commit. Deployment provenance is that
-# chain: promoted commit → pinned workflow SHA → trusted prepare job →
-# same-run artifact channel. There is deliberately no arbitrary-ref input.
+# The consumer commit prepared is ALWAYS the invoking caller's commit
+# (github.sha — in a reusable workflow that context belongs to the
+# CALLER). The workflow cannot itself prove that commit was promoted:
+# the consumer caller is responsible for invoking this workflow ONLY
+# from the trusted, human-promoted branch state. Deployment provenance
+# is that chain: promoted commit → pinned workflow SHA → trusted
+# prepare job → same-run artifact channel. There is deliberately no
+# arbitrary-ref input.
 #
 # Trust model (docs/trust-model.md, docs/prepared-artifact-v1.md):
 #

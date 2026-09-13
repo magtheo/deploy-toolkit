@@ -153,7 +153,7 @@ func checkNoSecrets(members map[string][]byte) error {
 		b := members[name]
 		for _, marker := range secretMarkers {
 			if strings.Contains(string(b), marker) {
-				return verifyFailure("%s contains private-key material — prepared artifacts are non-secret by construction", name)
+				return verifyFailure("%s contains private-key material — prepared artifacts are target-credential-free by construction", name)
 			}
 		}
 	}
@@ -227,10 +227,32 @@ func Prepare(dir string, releaseBytes, envBytes, targetBytes, bundle []byte, str
 	}
 	manifestJSON = append(manifestJSON, '\n')
 
-	if prev, err := os.ReadFile(filepath.Join(dir, FileManifest)); err == nil {
-		prevMembers, rerr := readMembers(dir)
-		if rerr != nil ||
-			!sameBytes(prev, manifestJSON) ||
+	// Output-directory rule, enforced BEFORE any write:
+	//
+	//   path absent → create it and write the artifact
+	//   path exists and is an exact valid artifact with identical bytes
+	//              → idempotent success
+	//   anything else → refuse, writing nothing
+	//
+	// The existence check is Lstat-based and the member inspection uses
+	// checkMembers, so a pre-existing symlinked member is refused here —
+	// before os.WriteFile could ever follow it.
+	if fi, err := os.Lstat(dir); err == nil {
+		if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return nil, fmt.Errorf("refusing to prepare into %s: not a directory", dir)
+		}
+		if err := checkMembers(dir); err != nil {
+			return nil, fmt.Errorf("refusing to write into existing %s: %w", dir, err)
+		}
+		prevManifest, err := os.ReadFile(filepath.Join(dir, FileManifest))
+		if err != nil {
+			return nil, fmt.Errorf("refusing to write into existing %s: read %s: %w", dir, FileManifest, err)
+		}
+		prevMembers, err := readMembers(dir)
+		if err != nil {
+			return nil, fmt.Errorf("refusing to write into existing %s: %w", dir, err)
+		}
+		if !sameBytes(prevManifest, manifestJSON) ||
 			!sameBytes(prevMembers[FileRelease], releaseBytes) ||
 			!sameBytes(prevMembers[FileEnvironment], envBytes) ||
 			!sameBytes(prevMembers[FileTarget], targetBytes) ||
@@ -238,6 +260,8 @@ func Prepare(dir string, releaseBytes, envBytes, targetBytes, bundle []byte, str
 			return nil, fmt.Errorf("refusing to overwrite existing prepared artifact %s with different material", dir)
 		}
 		return &m, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err

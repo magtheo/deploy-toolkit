@@ -81,7 +81,7 @@ manifest — that is, must already hold the exact release material. Signature
 key management is deliberately out of scope; provenance between the jobs of
 one run is carried by the CI system's artifact scoping.
 
-The artifact is **non-secret by construction**: the target manifest names
+The artifact is **target-credential-free by construction**: the target manifest names
 environment variables, never values; prepare runs with zero credentials and
 refuses key material in any member.
 

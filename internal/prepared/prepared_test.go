@@ -247,7 +247,7 @@ func TestStrictReleasePin(t *testing.T) {
 	}
 }
 
-// Prepared artifacts are non-secret by construction: private-key
+// Prepared artifacts are target-credential-free by construction: private-key
 // material in any member is refused before anything is written.
 func TestSecretMaterialRefused(t *testing.T) {
 	releaseBytes, envBytes, _, bundleBytes := fixture()
@@ -309,6 +309,94 @@ func TestArtifactRejectsUnexpectedMembers(t *testing.T) {
 		}
 		if _, err := Load(dir); !errors.Is(err, ErrNotVerifiable) {
 			t.Errorf("Load with missing member: err = %v, want refusal", err)
+		}
+	})
+}
+
+// Prepare enforces the exact-member invariant BEFORE any write: a
+// pre-existing hostile or partial directory is refused untouched, a
+// pre-existing symlinked member is never followed, and an exact
+// identical artifact remains idempotent success.
+func TestPrepareRefusesHostileOutputDirectory(t *testing.T) {
+	releaseBytes, envBytes, targetBytes, bundleBytes := fixture()
+
+	t.Run("extra member refuses without mutation", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "prepared")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "attacker-or-stale-file"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Prepare(dir, releaseBytes, envBytes, targetBytes, bundleBytes, true); err == nil {
+			t.Fatal("Prepare succeeded over a directory with an unexpected member")
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 || entries[0].Name() != "attacker-or-stale-file" {
+			t.Errorf("directory was mutated: %d entries", len(entries))
+		}
+	})
+
+	t.Run("symlinked member refuses and outside file is unchanged", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "prepared")
+		outside := filepath.Join(t.TempDir(), "outside-file")
+		if err := os.WriteFile(outside, []byte("do not touch"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, filepath.Join(dir, FileRelease)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Prepare(dir, releaseBytes, envBytes, targetBytes, bundleBytes, true); err == nil {
+			t.Fatal("Prepare followed a pre-existing symlinked member")
+		}
+		raw, err := os.ReadFile(outside)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != "do not touch" {
+			t.Errorf("outside file was overwritten: %q", raw)
+		}
+		entries, _ := os.ReadDir(dir)
+		if len(entries) != 1 {
+			t.Errorf("directory was mutated: %d entries", len(entries))
+		}
+	})
+
+	t.Run("symlinked output directory refuses", func(t *testing.T) {
+		real := t.TempDir()
+		link := filepath.Join(t.TempDir(), "prepared-link")
+		if err := os.Symlink(real, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Prepare(link, releaseBytes, envBytes, targetBytes, bundleBytes, true); err == nil {
+			t.Fatal("Prepare followed a symlinked output directory")
+		}
+		entries, err := os.ReadDir(real)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Errorf("symlink target was written into: %d entries", len(entries))
+		}
+	})
+
+	t.Run("identical existing artifact is idempotent success", func(t *testing.T) {
+		dir := prepareVerifiedArtifact(t)
+		m, err := Prepare(dir, releaseBytes, envBytes, targetBytes, bundleBytes, true)
+		if err != nil {
+			t.Fatalf("re-prepare over identical artifact: %v", err)
+		}
+		if _, err := Load(dir); err != nil {
+			t.Errorf("artifact does not verify after idempotent re-prepare: %v", err)
+		}
+		if m.Version != "1.0.0" {
+			t.Errorf("manifest version = %s", m.Version)
 		}
 	})
 }
