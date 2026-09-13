@@ -263,3 +263,52 @@ func TestSecretMaterialRefused(t *testing.T) {
 		t.Errorf("secret-bearing artifact wrote %d files before refusing", len(entries))
 	}
 }
+
+// prepareVerifiedArtifact builds a fresh, verifiable artifact directory.
+func prepareVerifiedArtifact(t *testing.T) string {
+	t.Helper()
+	releaseBytes, envBytes, targetBytes, bundleBytes := fixture()
+	dir := filepath.Join(t.TempDir(), "prepared")
+	if _, err := Prepare(dir, releaseBytes, envBytes, targetBytes, bundleBytes, true); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// The artifact is EXACTLY its five members: extra entries and
+// non-regular members fail verification, not silently ride along.
+func TestArtifactRejectsUnexpectedMembers(t *testing.T) {
+	dir := prepareVerifiedArtifact(t)
+
+	t.Run("stray extra member", func(t *testing.T) {
+		extra := filepath.Join(dir, "notes.txt")
+		if err := os.WriteFile(extra, []byte("ride-along"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(dir); !errors.Is(err, ErrNotVerifiable) {
+			t.Errorf("Load with extra member: err = %v, want refusal", err)
+		}
+	})
+
+	t.Run("symlinked member", func(t *testing.T) {
+		sym := filepath.Join(dir, "bundle.tar")
+		if err := os.Remove(sym); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(dir, "release.yaml"), sym); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(dir); !errors.Is(err, ErrNotVerifiable) {
+			t.Errorf("Load with symlink member: err = %v, want refusal", err)
+		}
+	})
+
+	t.Run("missing member", func(t *testing.T) {
+		if err := os.Remove(filepath.Join(dir, "environment.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(dir); !errors.Is(err, ErrNotVerifiable) {
+			t.Errorf("Load with missing member: err = %v, want refusal", err)
+		}
+	})
+}

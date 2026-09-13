@@ -377,7 +377,7 @@ something failed — which is exactly when the distinction matters.
 deployctl deploy <env> [flags]
 deployctl prepare <env> --out <dir> [--release <version>] [flags]
 deployctl deploy-prepared --prepared <dir> [--environment <name>] [flags]
-deployctl rollback-prepared --from <dir> --to <dir> [--environment <name>] [flags]
+deployctl rollback-prepared --from <dir> --to <dir> [--environment <name>] --confirm "rollback <env> to <version>" [flags]
 deployctl rollback <env> --to <version> --confirm "rollback <env> to <version>" [flags]
 deployctl status <env> [flags]
 deployctl recovery resolve <env> [recovery <id>] [attempt <id>] --confirm "..." [flags]
@@ -386,6 +386,10 @@ deployctl recovery resolve --prepared <dir> [selectors] --confirm "..." [flags]
 
 - The confirmation sentence is exactly the canonical sentence for the
   scope being authorized. In JSON mode `--confirm` is **required**.
+  Manual rollback authorization is IDENTICAL on the repository-backed
+  and prepared paths (one shared gate): the typed sentence is checked
+  before the target is contacted, and a mismatch is a `refused`
+  outcome with nothing executed.
 - Selector/confirmation scope mismatches are `refused` (exit 1);
   grammar errors are `usage-error` (exit 2). Grammar is validated
   before any target access.

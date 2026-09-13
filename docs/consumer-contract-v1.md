@@ -405,8 +405,6 @@ jobs:
     uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-toolkit-sha>
     with:
       environment: production      # required
-      toolkit_ref: <full-toolkit-sha>  # required, validated as 40-hex
-      ref: ""                      # consumer repo ref (optional)
       repo_dir: "."                # monorepo support (optional)
       owner: ""                    # audit identity (optional)
     secrets:
@@ -414,6 +412,15 @@ jobs:
       target_ssh_key: ${{ secrets.TARGET_SSH_KEY }}
       target_host_key: ${{ secrets.TARGET_HOST_KEY }}
 ```
+
+The consumer's `uses:` SHA is the **single machinery trust anchor**: both
+jobs rebuild `deployctl` from `job.workflow_repository@job.workflow_sha` —
+exactly the commit of the workflow that is running — and both fail closed
+unless the workflow itself was invoked by a full 40-hex SHA. There is no
+caller-supplied toolkit pin (a duplicated pin input would defeat the
+anchor), and there is no arbitrary consumer `ref` input: deployment always
+prepares the promoted invoking commit (`github.sha`), keeping the
+eligibility → promotion → deployment chain intact.
 
 The workflow implements the trust split as two jobs: `prepare` (repository
 checkout, `contents: read`, no secrets) and `deploy` (artifact download and
@@ -424,9 +431,10 @@ target manifest must reference these variable names: `TOOLKIT_TARGET_HOST`
 statically in the manifest.
 
 The deploy job captures `deployctl.result/v1` as `result.json`, attached to
-the job summary and the `result` step output whatever the outcome. All
-third-party actions are pinned by full commit SHA; the toolkit itself must
-be consumed by a **full SHA**, never a tag or branch. Workflow inputs,
-permissions and secret names are contract items; changing them follows the
-versioning policy above. These properties are pinned by tests
-(`cmd/deployctl/workflow_contract_test.go`).
+the job summary and exposed through the full GitHub output chain — capture
+step → `jobs.deploy.outputs` → workflow outputs `result` and `exit_code` —
+whatever the outcome. All actions are pinned by full commit SHA; the
+toolkit itself must be consumed by a **full SHA**, never a tag or branch.
+Workflow inputs, outputs, permissions and secret names are contract items;
+changing them follows the versioning policy above. These properties are
+pinned by tests (`cmd/deployctl/workflow_contract_test.go`).

@@ -11,7 +11,7 @@ trust stages of a deployment:
 ```text
 PREPARE (repository authority, zero target credential)
     builds the artifact ↓
-ARTIFACT BOUNDARY (immutable, verifiable, secret-free)
+ARTIFACT BOUNDARY (immutable, verifiable, target-credential-free)
     ↓
 DEPLOY (target credential, zero repository/source access)
 ```
@@ -23,7 +23,9 @@ the artifact.
 
 ## Contents
 
-A prepared artifact is a **directory** with exactly five members:
+A prepared artifact is a **directory** with exactly five members —
+enforced, not conventional: `Load` rejects unexpected or non-regular
+entries before reading anything:
 
 | Member             | Content                                                          |
 | ------------------ | ---------------------------------------------------------------- |
@@ -84,12 +86,32 @@ before any target contact.
 5. Cross-manifest invariants: `environment.Spec.Target == target.Metadata.Name`,
    `environment.Spec.Release == .deploy/releases/<project>-<version>.yaml`.
 
-Consequence: to forge a fully self-consistent artifact, an adversary must
-produce a bundle whose digest matches the pin inside a release manifest —
-i.e. must already possess the exact release material. This phase
-deliberately does **not** add signature/key management; artifact *provenance*
-between the jobs of one workflow run is carried by the CI system (the deploy
-job downloads the artifact the prepare job of the same run uploaded).
+Consequence: the digest web proves **integrity and internal consistency** —
+it detects corruption and any edit or swap of individual members. It is NOT
+an authenticity property against an adversary who can replace the *complete*
+artifact: a wholly fabricated artifact (fresh release manifest, matching
+malicious bundle, consistent digests) is internally self-consistent by
+construction. There is deliberately no cryptographic root *inside* the
+artifact, and this phase adds no signature/key management.
+
+Authenticity — the answer to "who produced these bytes" — comes from the
+chain OUTSIDE the artifact:
+
+```
+human-approved promoted consumer commit
+      ↓
+prepare machinery pinned by the reusable workflow's own SHA
+      ↓
+same-run immutable CI artifact channel
+      ↓
+deploy job re-verifies the digest web (corruption / inconsistency)
+```
+
+A wholly fabricated artifact therefore requires control of that chain: a
+promoted consumer commit plus the ability to substitute the artifact within
+the CI run that produced it. That trade is deliberate for v1: no signing
+infrastructure is required, and the trust boundary is explicit instead of
+implied.
 
 ## Threat model
 
@@ -98,9 +120,10 @@ job downloads the artifact the prepare job of the same run uploaded).
 | Truncated / corrupted artifact in transit          | Member digests; tar/JSON parse failures   |
 | Byte-level tampering with any member               | The integrity web above — fails closed    |
 | Substituting another release, environment or target| Identity cross-checks + digests web       |
-| Secrets leaking through the artifact               | Target manifest holds env-var **names** only (schema-enforced); prepare refuses any member containing key material; prepare runs with zero credentials |
+| SSH credentials serialized into the artifact       | Target manifest holds env-var **names** only (schema-enforced); prepare refuses any member containing key material (defense-in-depth, not a general secret detector); prepare runs with zero credentials |
 | Deploy side silently regenerating material from Git| `deploy-prepared` has no `--repo-dir` input at all; verified in tests by deploying with no Git on PATH |
 | Swapping the artifact of a different workflow run  | CI artifact scoping; explicit `--environment` expectation flag |
+| Replacing the COMPLETE artifact with a fabricated one | Not detectable from the artifact itself (see Authenticity above) — prevented by the provenance chain: promoted commit + pinned reusable-workflow SHA + same-run artifact channel |
 
 ## Verification order (deploy side, fail closed before contact)
 
@@ -124,12 +147,15 @@ Rollback under the trust split uses **two** prepared artifacts — the
 currently deployed (failed) release and the release being restored:
 
 ```text
-deployctl rollback-prepared --from prepared-current/ --to prepared-previous/
+deployctl rollback-prepared --from prepared-current/ --to prepared-previous/   --confirm "rollback production to 1.2.3"
 ```
 
-Each is fully verified by the same rules; no bundle is fetched from Git. The
-artifact design makes rollback a first-class consumer of the same boundary
-rather than a hidden source-access path.
+Each is fully verified by the same rules; no bundle is fetched from Git.
+Authorization is identical to ordinary manual rollback — the same shared
+typed-confirmation gate, evaluated before the target is contacted.
+Prepared material changes where the bytes come from, never who authorizes
+recovery. The artifact design makes rollback a first-class consumer of the
+same boundary rather than a hidden source-access path.
 
 ## Secrets
 

@@ -1,25 +1,34 @@
 # Reusable deployment workflow for Deploy Toolkit consumers.
 #
-# Consumers invoke this workflow pinned to a FULL commit SHA of
-# magtheo/deploy-toolkit — the pin is the trust anchor for the machinery,
-# exactly as the contract requires:
+# The consumer's `uses:` pin is the SINGLE machinery trust anchor. Both
+# jobs rebuild deployctl from exactly the commit of the reusable
+# workflow that is running (job.workflow_repository / job.workflow_sha),
+# and both fail closed unless the workflow itself was invoked by a full
+# 40-hex commit SHA:
 #
 #   jobs:
 #     deploy:
 #       uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-sha>
 #       with:
 #         environment: production
-#         toolkit_ref: <full-sha>
 #       secrets: [see below]
+#
+#   workflow definition, prepare deployctl, deploy deployctl
+#     — all one pinned SHA, no duplicated pin input.
+#
+# The consumer commit prepared is ALWAYS the invoking commit (github.sha)
+# — the promoted, human-authorized commit. Deployment provenance is that
+# chain: promoted commit → pinned workflow SHA → trusted prepare job →
+# same-run artifact channel. There is deliberately no arbitrary-ref input.
 #
 # Trust model (docs/trust-model.md, docs/prepared-artifact-v1.md):
 #
 #   prepare — checks out the consumer repository and builds the
 #             immutable prepared artifact from the promoted release
 #             state. NO target credential exists in this job.
-#   deploy  — checks out ONLY the pinned toolkit (never the consumer
-#             source), independently re-verifies the prepared artifact,
-#             then deploys it. The target credential exists only here.
+#   deploy  — checks out ONLY this toolkit (never the consumer source),
+#             independently re-verifies the prepared artifact, then
+#             deploys it. The target credential exists only here.
 #
 # The target manifest in the consumer repository must reference these
 # environment variable names (the manifest names variables, the deploy
@@ -32,10 +41,10 @@
 # The SSH user is pinned statically in the target manifest — users are
 # not secrets, and secrets never travel in manifests.
 #
-# Machine result: the deploy step writes deployctl.result/v1 to
-# result.json, attached to the job summary and the `result` output,
-# whatever the outcome. Automation decides from the document, never
-# from prose or exit codes alone.
+# Machine result: the deploy job exposes the deployctl.result/v1 JSON
+# document as the workflow output `result` (plus `exit_code`), whatever
+# the outcome. Automation decides from the document, never from prose
+# or exit codes alone.
 
 name: Deploy
 
@@ -46,15 +55,6 @@ on:
         description: Environment to deploy (a .deploy/environments/<name>.yaml in the consumer repo)
         required: true
         type: string
-      toolkit_ref:
-        description: FULL 40-hex commit SHA of magtheo/deploy-toolkit
-        required: true
-        type: string
-      ref:
-        description: Consumer repository ref to prepare from (default the invoking ref)
-        required: false
-        type: string
-        default: ""
       repo_dir:
         description: Path inside the consumer repository holding .deploy/ (monorepos)
         required: false
@@ -75,6 +75,13 @@ on:
       target_host_key:
         description: Pinned host key (authorized_keys format), written to a temp file by the deploy job
         required: true
+    outputs:
+      result:
+        description: The deployctl.result/v1 JSON document, whatever the outcome
+        value: ${{ jobs.deploy.outputs.result }}
+      exit_code:
+        description: The deployctl process exit code
+        value: ${{ jobs.deploy.outputs.exit_code }}
 
 # The workflow grants nothing by default; each job declares its own
 # least-privilege scope.
@@ -87,26 +94,25 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Reject a floating toolkit pin
-        run: |
-          case "$TOOLKIT_REF" in
-            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-            *) echo "::error::toolkit_ref must be a full 40-hex commit SHA; a floating ref is not a trust anchor"; exit 1 ;;
-          esac
+      - name: Fail closed unless this workflow was invoked by full SHA
         env:
-          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          case "${WORKFLOW_REF##*@}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "::error::invoke this workflow pinned to a full 40-hex commit SHA (uses: ...@<full-sha>); a floating ref is not a trust anchor"; exit 1 ;;
+          esac
 
-      - name: Check out consumer repository
+      - name: Check out the consumer repository at the promoted commit
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
-          ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      - name: Check out the pinned Deploy Toolkit
+      - name: Check out exactly the toolkit commit running this workflow
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
-          repository: magtheo/deploy-toolkit
-          ref: ${{ inputs.toolkit_ref }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           path: toolkit
           persist-credentials: false
 
@@ -115,7 +121,7 @@ jobs:
         with:
           go-version-file: toolkit/go.mod
 
-      - name: Build deployctl from the pinned toolkit SHA
+      - name: Build deployctl from the workflow's own toolkit commit
         run: go build -o /tmp/deployctl ./cmd/deployctl
         working-directory: toolkit
 
@@ -142,21 +148,24 @@ jobs:
     # contents: none — this job never touches the consumer repository.
     permissions:
       actions: read
+    outputs:
+      result: ${{ steps.capture.outputs.result }}
+      exit_code: ${{ steps.capture.outputs.exit_code }}
     steps:
-      - name: Reject a floating toolkit pin
-        run: |
-          case "$TOOLKIT_REF" in
-            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-            *) echo "::error::toolkit_ref must be a full 40-hex commit SHA; a floating ref is not a trust anchor"; exit 1 ;;
-          esac
+      - name: Fail closed unless this workflow was invoked by full SHA
         env:
-          TOOLKIT_REF: ${{ inputs.toolkit_ref }}
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          case "${WORKFLOW_REF##*@}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "::error::invoke this workflow pinned to a full 40-hex commit SHA (uses: ...@<full-sha>); a floating ref is not a trust anchor"; exit 1 ;;
+          esac
 
-      - name: Check out the pinned Deploy Toolkit (machinery only, never the consumer source)
+      - name: Check out exactly the toolkit commit running this workflow (machinery only, never the consumer source)
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
-          repository: magtheo/deploy-toolkit
-          ref: ${{ inputs.toolkit_ref }}
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
           path: toolkit
           persist-credentials: false
 
@@ -165,7 +174,7 @@ jobs:
         with:
           go-version-file: toolkit/go.mod
 
-      - name: Build deployctl from the pinned toolkit SHA (independent of prepare's binary)
+      - name: Build deployctl from the workflow's own toolkit commit (independent of prepare's binary)
         run: go build -o /tmp/deployctl ./cmd/deployctl
         working-directory: toolkit
 
@@ -205,6 +214,7 @@ jobs:
           exit "$code"
 
       - name: Capture the machine result
+        id: capture
         if: always()
         env:
           DEPLOYCTL_CODE: ${{ steps.deployctl.outputs.code }}
@@ -219,6 +229,7 @@ jobs:
             echo "process exit code: $DEPLOYCTL_CODE"
           } >> "$GITHUB_STEP_SUMMARY"
           {
+            echo "exit_code=$DEPLOYCTL_CODE"
             echo 'result<<DEPLOYCTL_RESULT_EOF'
             cat result.json
             echo 'DEPLOYCTL_RESULT_EOF'

@@ -275,6 +275,33 @@ func readMember(dir, name string) ([]byte, error) {
 	return b, nil
 }
 
+// checkMembers enforces the exact artifact shape: precisely the five
+// declared members, every one a regular file. Symlinks, directories and
+// unexpected entries fail verification before any digest is read.
+func checkMembers(dir string) error {
+	known := map[string]bool{
+		FileManifest: true, FileRelease: true, FileEnvironment: true,
+		FileTarget: true, FileBundle: true,
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return verifyFailure("cannot read artifact directory: %v", err)
+	}
+	for _, e := range entries {
+		if !known[e.Name()] {
+			return verifyFailure("unexpected artifact member %q — the artifact is exactly its five declared members", e.Name())
+		}
+		if !e.Type().IsRegular() {
+			return verifyFailure("artifact member %q is not a regular file", e.Name())
+		}
+		delete(known, e.Name())
+	}
+	for name := range known {
+		return verifyFailure("member %s is missing (truncated artifact?)", name)
+	}
+	return nil
+}
+
 func readMembers(dir string) (map[string][]byte, error) {
 	members := make(map[string][]byte, 4)
 	for _, name := range []string{FileRelease, FileEnvironment, FileTarget, FileBundle} {
@@ -295,6 +322,12 @@ func readMembers(dir string) (map[string][]byte, error) {
 // release (rollback material legitimately differs); deployments must
 // additionally call LoadForDeploy.
 func Load(dir string) (*Artifact, error) {
+	// The artifact format is EXACTLY its five members: unexpected or
+	// non-regular entries fail verification (a symlinked or extra
+	// member is not material this contract defined).
+	if err := checkMembers(dir); err != nil {
+		return nil, err
+	}
 	manifestBytes, err := readMember(dir, FileManifest)
 	if err != nil {
 		return nil, err

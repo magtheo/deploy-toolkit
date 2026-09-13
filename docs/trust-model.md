@@ -99,13 +99,15 @@ credentials.
 
 ## Pinned consumption
 
-Consumers will reference this repository's workflows and binary by **full
-commit SHA**. The reusable workflows (including `deploy.yml`) are planned, not
-published yet — until they exist, consumers run `deployctl` directly and own
-the wiring themselves:
+Consumers reference this repository's workflows and binary by **full
+commit SHA**. For the reusable deployment workflow the `uses:` pin is the
+single machinery trust anchor: both of its jobs rebuild `deployctl` from
+`job.workflow_repository@job.workflow_sha` and fail closed unless the
+workflow itself was invoked by a full SHA — so the workflow definition,
+the prepare binary and the deploy binary are always one pinned commit:
 
 ```
-uses: <org>/<toolkit>/.github/workflows/deploy.yml@<full-sha>   # planned
+uses: <org>/<toolkit>/.github/workflows/deploy.yml@<full-sha>   # published
 ```
 
 Readable release tags (`v0.4.0 → 12ab...`) are documentation above an

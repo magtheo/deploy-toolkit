@@ -226,7 +226,7 @@ func runDeployPrepared(ctx context.Context, args []string, stdout, stderr io.Wri
 }
 
 func runRollbackPrepared(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	lexFlags, positional, jsonMode, missingValue := lexArgs(args, map[string]bool{"from": true, "to": true, "environment": true, "owner": true})
+	lexFlags, positional, jsonMode, missingValue := lexArgs(args, map[string]bool{"from": true, "to": true, "environment": true, "owner": true, "confirm": true})
 	if missingValue != "" {
 		return usageFailure(jsonMode, stdout, stderr, cmdRollback, "", "--"+missingValue+" requires a value")
 	}
@@ -239,9 +239,16 @@ func runRollbackPrepared(ctx context.Context, args []string, stdout, stderr io.W
 	to := fs.String("to", "", "prepared artifact of the release being restored (required)")
 	expectEnv := fs.String("environment", "", "refuse unless the artifacts were prepared for this environment")
 	owner := fs.String("owner", "", "identity recorded in the lock and history (default user@host)")
+	confirm := fs.String("confirm", "", "confirmation sentence; omit to be prompted interactively")
 	_ = fs.Bool("json", false, "emit a single deployctl.result/v1 JSON document on stdout")
 	if err := fs.Parse(lexFlags); err != nil {
 		return usageFailure(jsonMode, stdout, stderr, cmdRollback, "", "invalid flags: "+err.Error())
+	}
+	// JSON mode is explicitly NON-interactive, identically to ordinary
+	// manual rollback: a required confirmation without --confirm is a
+	// usage error before anything happens.
+	if jsonMode && *confirm == "" {
+		return usageFailure(jsonMode, stdout, stderr, cmdRollback, "", "--confirm is required in --json mode; the interactive prompt is never read")
 	}
 	if *from == "" || *to == "" {
 		return usageFailure(jsonMode, stdout, stderr, cmdRollback, "", "--from <dir> and --to <dir> are both required")
@@ -271,6 +278,27 @@ func runRollbackPrepared(ctx context.Context, args []string, stdout, stderr io.W
 		err := fmt.Errorf("artifacts were prepared for environment %q, but the invocation expects %q", fromArt.Manifest.Environment, *expectEnv)
 		return reportVerificationFailure(jsonMode, stdout, stderr, cmdRollback, *expectEnv, err)
 	}
+	// Authorization parity with ordinary manual rollback: the same
+	// typed sentence, evaluated BEFORE the target is contacted. Prepared
+	// material changes where the bytes come from — never who authorizes
+	// recovery.
+	envName := fromArt.Manifest.Environment
+	humanOut := io.Writer(stdout)
+	if jsonMode {
+		humanOut = io.Discard
+	}
+	sentence := fmt.Sprintf("rollback %s to %s", envName, toArt.Release.Metadata.Version)
+	code, ok := confirmManualRollback(jsonMode, cmdRollback, envName, *confirm, sentence, stdout, humanOut, stderr, func(w io.Writer) {
+		fmt.Fprintf(w, "Environment   %s\n", envName)
+		fmt.Fprintf(w, "Undoes        %s (%s)\n", fromArt.Release.Metadata.Version, shortDigest(fromArt.Release.Bundle.Digest))
+		fmt.Fprintf(w, "Restores      %s (%s)\n", toArt.Release.Metadata.Version, shortDigest(toArt.Release.Bundle.Digest))
+		fmt.Fprintf(w, "Authorization manual (emergency) — prepared material\n\n")
+		fmt.Fprintf(w, "A recovery may run the failed release's rollback hook and the restored\nrelease's apply/verify on production. Type the sentence to confirm:\n  %s\n> ", sentence)
+	})
+	if !ok {
+		return code
+	}
+
 	tgt, err := connect(ctx, fromArt.Target)
 	if err != nil {
 		return reportConnectFailure(err, cmdRollback, fromArt.Manifest.Environment, stderr, jsonMode, stdout)

@@ -160,7 +160,8 @@ func TestRollbackPreparedEndToEnd(t *testing.T) {
 	to := prepareArtifact(t, f, "--release", "1.0.0")
 
 	withoutGitOnPath(t)
-	code, doc := runJSON(t, "rollback-prepared", "--from", from, "--to", to, "--environment", "production")
+	code, doc := runJSON(t, "rollback-prepared", "--from", from, "--to", to, "--environment", "production",
+		"--confirm", "rollback production to 1.0.0")
 	if code != exitOK {
 		t.Fatalf("rollback-prepared: exit %d: %v", code, doc["message"])
 	}
@@ -252,4 +253,77 @@ func mutateLastByte(t *testing.T, dir, name string) {
 	if err := os.WriteFile(p, raw, 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// Authorization parity: rollback-prepared is gated by exactly the same
+// typed confirmation as ordinary manual rollback — and the target is
+// never contacted before the sentence matches.
+func TestRollbackPreparedAuthorizationParity(t *testing.T) {
+	f := newCLIFixture(t)
+	if code, out, _ := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy 1.0.0: %d %s", code, out)
+	}
+	f.writeEnv(t, "2.0.0")
+	gitf(t, f.repoDir, "add", "-A")
+	gitf(t, f.repoDir, "commit", "-q", "-m", "pin 2.0.0")
+	if code, out, _ := runCLI("deploy", "production", "--repo-dir", f.repoDir, "--owner", "test"); code != exitOK {
+		t.Fatalf("deploy 2.0.0: %d %s", code, out)
+	}
+	from := prepareArtifact(t, f)
+	to := prepareArtifact(t, f, "--release", "1.0.0")
+
+	t.Run("missing confirm in json mode is a usage error", func(t *testing.T) {
+		_ = os.Remove(f.marker)
+		withoutGitOnPath(t)
+		code, doc := runJSON(t, "rollback-prepared", "--from", from, "--to", to, "--environment", "production")
+		if code != exitUsage {
+			t.Fatalf("exit = %d, want usage error: %v", code, doc["message"])
+		}
+		if _, err := os.Stat(f.marker); err == nil {
+			t.Error("target was contacted although the confirmation was missing")
+		}
+	})
+
+	t.Run("wrong sentence is a refusal without target contact", func(t *testing.T) {
+		_ = os.Remove(f.marker)
+		withoutGitOnPath(t)
+		code, doc := runJSON(t, "rollback-prepared", "--from", from, "--to", to, "--environment", "production",
+			"--confirm", "rollback production to 9.9.9")
+		if code != exitFailed || doc["outcome"] != "refused" {
+			t.Fatalf("shape = %v/%d, want refused", doc["outcome"], code)
+		}
+		if msg := doc["message"].(string); !strings.Contains(msg, "nothing was executed") {
+			t.Errorf("message = %q", msg)
+		}
+		if _, err := os.Stat(f.marker); err == nil {
+			t.Error("target was contacted although the confirmation did not match")
+		}
+	})
+
+	t.Run("ordinary rollback refuses identically", func(t *testing.T) {
+		code, doc := runJSON(t, "rollback", "production", "--repo-dir", f.repoDir, "--to", "1.0.0",
+			"--confirm", "rollback production to 9.9.9")
+		if code != exitFailed || doc["outcome"] != "refused" {
+			t.Fatalf("shape = %v/%d, want refused", doc["outcome"], code)
+		}
+	})
+
+	t.Run("correct sentence authorizes and executes", func(t *testing.T) {
+		withoutGitOnPath(t)
+		code, doc := runJSON(t, "rollback-prepared", "--from", from, "--to", to, "--environment", "production",
+			"--confirm", "rollback production to 1.0.0")
+		if code != exitOK {
+			t.Fatalf("exit %d: %v", code, doc["message"])
+		}
+		mustStr(t, doc, "outcome", "success")
+		order, err := os.ReadFile(f.marker)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, hook := range []string{"rollback", "apply", "verify"} {
+			if !strings.Contains(string(order), hook) {
+				t.Errorf("hook order %q misses %q", order, hook)
+			}
+		}
+	})
 }

@@ -27,6 +27,10 @@ type workflowFile struct {
 			Secrets map[string]struct {
 				Required bool `yaml:"required"`
 			} `yaml:"secrets"`
+			Outputs map[string]struct {
+				Value       string `yaml:"value"`
+				Description string `yaml:"description"`
+			} `yaml:"outputs"`
 		} `yaml:"workflow_call"`
 	} `yaml:"on"`
 	Permissions map[string]any   `yaml:"permissions"`
@@ -34,9 +38,28 @@ type workflowFile struct {
 }
 
 type wfJob struct {
-	Needs       stringOrList     `yaml:"needs"`
-	Permissions map[string]any   `yaml:"permissions"`
-	Steps       []map[string]any `yaml:"steps"`
+	Needs       stringOrList      `yaml:"needs"`
+	Permissions map[string]any    `yaml:"permissions"`
+	Outputs     map[string]string `yaml:"outputs"`
+	Steps       []map[string]any  `yaml:"steps"`
+}
+
+// stepField pulls a step property out of the loosely typed step map.
+func stepField(step map[string]any, key string) string {
+	v, _ := step[key].(string)
+	return v
+}
+
+// findStep returns the step with the given id in a job.
+func findStep(t *testing.T, job wfJob, id string) map[string]any {
+	t.Helper()
+	for _, st := range job.Steps {
+		if stepField(st, "id") == id {
+			return st
+		}
+	}
+	t.Fatalf("no step with id %q in job", id)
+	return nil
 }
 
 // stringOrList accepts both `needs: prepare` and a list form.
@@ -88,10 +111,13 @@ func jobText(t *testing.T, raw, job string) string {
 func TestWorkflowIsReusableWithContractInputs(t *testing.T) {
 	wf, _ := loadWorkflow(t)
 	call := wf.On.WorkflowCall
-	for _, name := range []string{"environment", "toolkit_ref"} {
-		in, ok := call.Inputs[name]
-		if !ok || !in.Required {
-			t.Errorf("input %q must exist and be required", name)
+	in, ok := call.Inputs["environment"]
+	if !ok || !in.Required {
+		t.Errorf("input environment must exist and be required")
+	}
+	for _, banned := range []string{"toolkit_ref", "ref"} {
+		if _, ok := call.Inputs[banned]; ok {
+			t.Errorf("input %q must not exist — the workflow's own SHA anchors the machinery and the promoted commit anchors the source", banned)
 		}
 	}
 	for _, name := range []string{"target_host", "target_ssh_key", "target_host_key"} {
@@ -134,7 +160,7 @@ func TestWorkflowTrustSplit(t *testing.T) {
 		t.Fatal("deploy job must check out the pinned toolkit")
 	}
 	for _, repo := range repos {
-		if repo != "magtheo/deploy-toolkit" {
+		if repo != "${{ job.workflow_repository }}" {
 			t.Errorf("deploy job checks out %q — consumer source must never be checked out", repo)
 		}
 	}
@@ -154,7 +180,7 @@ func checkoutRepos(job string) []string {
 		if !strings.Contains(b, "actions/checkout@") {
 			continue
 		}
-		if m := regexp.MustCompile(`repository:\s*(\S+)`).FindStringSubmatch(b); m != nil {
+		if m := regexp.MustCompile(`repository:[ \t]+(.+)`).FindStringSubmatch(b); m != nil {
 			refs = append(refs, m[1])
 		} else {
 			refs = append(refs, "")
@@ -163,28 +189,39 @@ func checkoutRepos(job string) []string {
 	return refs
 }
 
-// Every third-party action is pinned by a full 40-hex commit SHA, and
-// the toolkit itself is consumed via inputs.toolkit_ref with an
-// explicit full-SHA validation step in each job.
-func TestWorkflowActionsPinnedByFullSHA(t *testing.T) {
+// Every action is pinned by a full 40-hex commit SHA, the toolkit is
+// rebuilt from job.workflow_repository + job.workflow_sha (the
+// reusable workflow's OWN commit — the single machinery trust anchor),
+// and each job fails closed unless the workflow itself was invoked by
+// full SHA (job.workflow_ref gate).
+func TestWorkflowAnchoredByItsOwnSHA(t *testing.T) {
 	_, raw := loadWorkflow(t)
+	if strings.Contains(raw, "toolkit_ref") {
+		t.Error("toolkit_ref must not exist anywhere — a duplicated caller-controlled pin defeats the trust anchor")
+	}
+	if strings.Contains(raw, "inputs.ref") {
+		t.Error("an arbitrary consumer ref must not exist — deployment prepares the promoted invoking commit only")
+	}
 	pins := regexp.MustCompile(`uses: ([\w.-]+/[\w.-]+)@(\S+)`).FindAllStringSubmatch(raw, -1)
 	if len(pins) == 0 {
 		t.Fatal("no action pins found")
 	}
 	for _, pin := range pins {
-		if pin[1] == "magtheo/deploy-toolkit" {
-			continue // pins the consumer-provided toolkit_ref, checked below
-		}
 		if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(pin[2]) {
 			t.Errorf("%s pinned by %q — actions must be pinned by full commit SHA", pin[1], pin[2])
 		}
 	}
-	if !strings.Contains(raw, "ref: ${{ inputs.toolkit_ref }}") {
-		t.Error("the toolkit checkout must be pinned by inputs.toolkit_ref")
+	for _, job := range []string{"prepare", "deploy"} {
+		jt := jobText(t, raw, job)
+		if !strings.Contains(jt, "repository: ${{ job.workflow_repository }}") || !strings.Contains(jt, "ref: ${{ job.workflow_sha }}") {
+			t.Errorf("%s job must build deployctl from job.workflow_repository@job.workflow_sha", job)
+		}
+		if !strings.Contains(jt, "WORKFLOW_REF: ${{ job.workflow_ref }}") || !strings.Contains(jt, "floating ref is not a trust anchor") {
+			t.Errorf("%s job must fail closed on a floating workflow invocation ref", job)
+		}
 	}
-	if strings.Count(raw, "floating") < 2 || strings.Count(raw, "full 40-hex commit SHA") < 2 {
-		t.Error("each job must reject a floating toolkit_ref with a full-SHA requirement")
+	if got := strings.Count(raw, "${{ job.workflow_sha }}"); got != 2 {
+		t.Errorf("job.workflow_sha used %d times, want exactly once per job", got)
 	}
 }
 
@@ -214,10 +251,13 @@ func TestWorkflowLeastPrivilege(t *testing.T) {
 	}
 }
 
-// The deploy step captures deployctl.result/v1 as the machine result —
-// job summary and step output — whatever the outcome.
+// The deployctl.result/v1 machine result must traverse the complete
+// GitHub output chain — capture step → deploy job → workflow_call —
+// whatever the outcome. Presence of the string GITHUB_OUTPUT alone
+// proves nothing; the mappings are parsed here.
 func TestWorkflowCapturesMachineResult(t *testing.T) {
-	_, raw := loadWorkflow(t)
+	wf, raw := loadWorkflow(t)
+	deploy := wf.Jobs["deploy"]
 	deployText := jobText(t, raw, "deploy")
 	if !strings.Contains(deployText, "--json") {
 		t.Error("the deploy step must run deployctl in --json machine mode")
@@ -225,10 +265,29 @@ func TestWorkflowCapturesMachineResult(t *testing.T) {
 	if !strings.Contains(deployText, "result.json") {
 		t.Error("the deploy step must write the machine result to result.json")
 	}
-	if !strings.Contains(deployText, "if: always()") {
-		t.Error("the result must be captured even when the deploy step fails")
+
+	for name, want := range map[string]string{
+		"result":    "${{ steps.capture.outputs.result }}",
+		"exit_code": "${{ steps.capture.outputs.exit_code }}",
+	} {
+		got, ok := deploy.Outputs[name]
+		if !ok || got != want {
+			t.Errorf("jobs.deploy.outputs.%s = %q, want %s", name, got, want)
+		}
+		wfOut, ok := wf.On.WorkflowCall.Outputs[name]
+		if !ok || wfOut.Value != "${{ jobs.deploy.outputs."+name+" }}" {
+			t.Errorf("workflow_call.outputs.%s = %+v, want the job output mapping", name, wfOut)
+		}
 	}
-	if !strings.Contains(deployText, "GITHUB_STEP_SUMMARY") || !strings.Contains(deployText, "GITHUB_OUTPUT") {
-		t.Error("the machine result must reach the job summary and the step output")
+
+	capture := findStep(t, deploy, "capture")
+	if stepField(capture, "if") != "always()" {
+		t.Errorf("capture step runs with if=%q, want always()", stepField(capture, "if"))
+	}
+	run := stepField(capture, "run")
+	for _, want := range []string{"GITHUB_STEP_SUMMARY", "GITHUB_OUTPUT", "result<<DEPLOYCTL_RESULT_EOF", "DEPLOYCTL_RESULT_EOF", "exit_code="} {
+		if !strings.Contains(run, want) {
+			t.Errorf("capture step run misses %q", want)
+		}
 	}
 }
