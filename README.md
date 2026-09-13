@@ -223,10 +223,14 @@ jobs:
     uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-sha>
     with:
       environment: production
-    secrets: [target_host, target_ssh_key, target_host_key]
+    secrets:
+      target_host: ${{ secrets.TARGET_HOST }}
+      target_ssh_key: ${{ secrets.TARGET_SSH_KEY }}
+      target_host_key: ${{ secrets.TARGET_HOST_KEY }}
 ```
 
-Its `prepare` job holds repository authority and no secrets; its `deploy`
+Its `prepare` job holds repository authority and is not given the target
+credentials; its `deploy`
 job holds the credential and never checks out consumer source. The
 prepared commit is the invoking caller's commit — the caller is
 responsible for invoking deployment only from the trusted, promoted
