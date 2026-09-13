@@ -119,6 +119,30 @@ authorization act** (see
 Requires `GITHUB_TOKEN` for the GitHub API; registry auth uses the standard
 OCI keychain, independent of `GITHUB_TOKEN`.
 
+### The trust split
+
+No production deployment process holds both repository authority and the
+production target credential. The deployment path is split around an
+immutable, target-credential-free **prepared artifact**
+(`prepared.deployment/v1`): exact manifest bytes, the canonical bundle,
+and an integrity manifest binding both
+([docs/prepared-artifact-v1.md](docs/prepared-artifact-v1.md)).
+
+```
+deployctl prepare production --out prepared/              # repository authority, zero target credential
+deployctl deploy-prepared --prepared prepared/            # target credential, zero source access
+deployctl rollback-prepared --from a/ --to b/             # two verified artifacts, no Git
+```
+
+The deploy side re-verifies the artifact fully — digest web, identity
+cross-checks, re-parse through the validation pipeline — before it
+contacts the target. `deploy-prepared` has no `--repo-dir` flag at all,
+and its tests prove deployment succeeds with no Git on `PATH`. A
+verification failure is a refusal before any production contact.
+`rollback-prepared` enforces the identical typed-confirmation
+authorization gate as ordinary manual rollback: prepared material
+changes where the bytes come from, never who authorizes recovery.
+
 ### Deploy, rollback, status
 
 The deployment side is a thin, deliberate wrapper over the engine: every
@@ -131,6 +155,7 @@ declared transport, and renders the report.
 deployctl deploy production                      # deploy the release the environment pins
 deployctl rollback production --to 0.1.16        # emergency recovery; typed confirmation
 deployctl status production                      # desired vs observed + all recovery facts
+deployctl recovery resolve production attempt <id> --confirm "..."   # authorize resolution of an unresolved marker
 ```
 
 Merging the promotion PR is the authorization for `deploy`; running the
@@ -139,8 +164,9 @@ command is not. `rollback` requires typing exactly
 path. Normal rollback of a healthy deployment is an ordinary promotion
 with a reverse diff, not `rollback`.
 
-Operational exit codes (deploy, rollback, status, recovery resolve):
-`0` success, `1` reported outcome failure (determined — history records
+Operational exit codes (deploy, prepare, deploy-prepared, rollback,
+rollback-prepared, status, recovery resolve): `0` success, `1` reported
+outcome failure (determined — history records
 what happened), `2` usage/configuration error, `3` infrastructure
 failure. The failure **report** — never the exit code alone —
 distinguishes pre-execution failures (nothing ran), bookkeeping failures
@@ -186,6 +212,31 @@ Promotion is a one-line diff:
 
 **Merge = authorize production.** Rollback is the same diff in reverse.
 
+Deployment runs through the reusable workflow, pinned to a full commit
+SHA — that pin is the **single machinery trust anchor**: both jobs build
+`deployctl` from the workflow's own commit, and the workflow refuses to
+run when invoked by anything else:
+
+```yaml
+jobs:
+  deploy:
+    uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-sha>
+    with:
+      environment: production
+    secrets:
+      target_host: ${{ secrets.TARGET_HOST }}
+      target_ssh_key: ${{ secrets.TARGET_SSH_KEY }}
+      target_host_key: ${{ secrets.TARGET_HOST_KEY }}
+```
+
+Its `prepare` job holds repository authority and is not given the target
+credentials; its `deploy`
+job holds the credential and never checks out consumer source. The
+prepared commit is the invoking caller's commit — the caller is
+responsible for invoking deployment only from the trusted, promoted
+branch state. The workflow exposes the machine result as `result` (one
+`deployctl.result/v1` document) and `exit_code`, whatever the outcome.
+
 Start from [`templates/`](templates/) and read
 [docs/consumer-contract-v1.md](docs/consumer-contract-v1.md).
 
@@ -193,6 +244,8 @@ Start from [`templates/`](templates/) and read
 
 - **Releases are immutable**: source revision + exact artifact digests + bundle + deployment contract + migration semantics, one canonical manifest, no `latest`.
 - **The deployment contract comes from the promoted release**, never from `main`'s current state. Old app + new deploy procedure is a bug class, not a feature.
+- **The prepare/deploy trust split.** No process holds both repository authority and the target credential; the deploy side consumes a fully verified prepared artifact and never touches source.
+- **Strict host verification.** Targets pin their SSH host key; insecure host-key options are never shipped.
 - **argv, not shell strings.** Lifecycle hooks are argv vectors or versioned scripts, never arbitrary shell programs.
 - **AI never decides that production changes.** Deterministic eligibility, human promotion, deterministic deployment.
 - **No environment branches.** `main` is the only branch; environments live in `.deploy/environments/`.
