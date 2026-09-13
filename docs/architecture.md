@@ -228,7 +228,7 @@ target, outside the release.
 ## The prepared artifact boundary
 
 The two trust stages are separated by a **prepared artifact** — an immutable,
-deterministic, secret-free directory containing the exact release manifest
+deterministic, target-credential-free directory containing the exact release manifest
 bytes, the exact environment and target manifests, the canonical bundle
 bytes, and an integrity manifest (`prepared.json`) that digest-binds every
 member and every identity (schema `prepared.deployment/v1`,

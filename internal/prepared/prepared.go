@@ -1,5 +1,5 @@
 // Package prepared implements the prepared deployment artifact — the
-// immutable, verifiable, secret-free material boundary between the
+// immutable, verifiable, target-credential-free material boundary between the
 // prepare stage (repository authority, zero target credential) and the
 // deploy stage (target credential, zero source access).
 //
