@@ -291,3 +291,34 @@ func TestWorkflowCapturesMachineResult(t *testing.T) {
 		}
 	}
 }
+
+// The caller permission floor published in docs/consumer-contract-v1.md
+// (contents: read, actions: read) must always COVER what the reusable
+// workflow itself requests: GitHub never grants a called workflow more
+// than the calling job holds, so any permission requested here beyond
+// the floor would silently break every documented caller. If this test
+// fails, a job gained a new permission — raise the documented floor in
+// the same change.
+func TestWorkflowPermissionFloorCoversAllJobs(t *testing.T) {
+	wf, _ := loadWorkflow(t)
+	floor := map[string]string{"contents": "read", "actions": "read"}
+	seen := map[string]bool{}
+	collect := func(name string, perms map[string]any) {
+		if len(perms) == 0 {
+			return // absent (inherit) or explicit `permissions: {}` — nothing granted
+		}
+		for scope, want := range perms {
+			if floor[scope] != want || floor[scope] == "" {
+				t.Errorf("%s requests %s: %v — beyond the documented caller floor %v; update docs/consumer-contract-v1.md in lockstep", name, scope, want, floor)
+			}
+			seen[scope] = true
+		}
+	}
+	collect("workflow", wf.Permissions)
+	for name, job := range wf.Jobs {
+		collect("job "+name, job.Permissions)
+	}
+	if len(seen) == 0 {
+		t.Fatal("no job-level permissions found — the floor test has nothing to pin")
+	}
+}

@@ -5,7 +5,12 @@ metadata:
   name: production
 
 spec:
-  release: .deploy/releases/my-app-0.1.0.yaml
+  # Bootstrap sentinel: this file is intentionally absent. The
+  # environment starts pointing at a release that does not exist so the
+  # FIRST real promotion is a genuine, atomically-reviewable transition:
+  # one PR adds the immutable release manifest and flips this pointer,
+  # and the owner's merge is the first deployment authorization.
+  release: .deploy/releases/my-app-0.0.0-bootstrap.yaml
 
   target: production-primary
 

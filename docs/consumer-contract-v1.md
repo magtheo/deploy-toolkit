@@ -402,6 +402,14 @@ indistinguishable from a start failure — a documented protocol limit.
 ```yaml
 jobs:
   deploy:
+    # Caller permissions are a CEILING the reusable workflow cannot
+    # elevate past. Grant at least the floor it needs:
+    #   contents: read — prepare's repository checkout
+    #   actions:  read — deploy's run-artifact download
+    # `permissions: {}` here breaks both jobs at run time.
+    permissions:
+      contents: read
+      actions: read
     uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-toolkit-sha>
     with:
       environment: production      # required
@@ -412,6 +420,14 @@ jobs:
       target_ssh_key: ${{ secrets.TARGET_SSH_KEY }}
       target_host_key: ${{ secrets.TARGET_HOST_KEY }}
 ```
+
+The caller's `permissions:` block is part of the contract: GitHub grants
+a called reusable workflow at most what the calling job holds, so the
+floor above (`contents: read`, `actions: read`) is the minimum a correct
+caller grants. Anything narrower silently breaks deployment mid-flight
+(`permissions: {}` = no checkout, no artifact download); anything
+broader is the caller's choice, not a toolkit need — the workflow itself
+requests only those two read scopes, split across its two jobs.
 
 The consumer's `uses:` SHA is the **single machinery trust anchor**: both
 jobs rebuild `deployctl` from `job.workflow_repository@job.workflow_sha` —
