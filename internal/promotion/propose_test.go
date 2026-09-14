@@ -895,3 +895,73 @@ func TestRenderBodyWarnings(t *testing.T) {
 		t.Error("unsafe-rollback warning missing")
 	}
 }
+
+// The v0.1 bootstrap convention: a fresh environment points at an
+// INTENTIONALLY ABSENT sentinel release (templates/environment.yaml
+// ships `.deploy/releases/<project>-0.0.0-bootstrap.yaml`). The first
+// real promotion is then a genuine transition: one PR adds the
+// immutable release manifest and flips spec.release, and the owner's
+// merge authorizes the first deployment. These tests pin that the
+// existing propose/check machinery supports that shape with no special
+// bootstrap state.
+
+const bootstrapRelConst = ".deploy/releases/my-app-0.0.0-bootstrap.yaml"
+
+func TestProposeFirstReleaseFromBootstrapSentinel(t *testing.T) {
+	bundler, store, res, releasePath := setupPropose(t)
+	store.files[checkBaseSHA][envPathConst] = envDoc(bootstrapRelConst)
+
+	prop, err := Propose(context.Background(), ProposeInput{
+		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",
+	}, store, res, bundler)
+	if err != nil {
+		t.Fatalf("Propose from bootstrap sentinel: %v", err)
+	}
+	if prop.Unchanged {
+		t.Error("first promotion reported unchanged")
+	}
+	if prop.From != bootstrapRelConst || prop.To != relPathConst {
+		t.Errorf("from/to = %q → %q, want %q → %q", prop.From, prop.To, bootstrapRelConst, relPathConst)
+	}
+	if !prop.IsNewRelease {
+		t.Error("expected IsNewRelease")
+	}
+	if store.createdPR == nil {
+		t.Fatal("no promotion PR created")
+	}
+}
+
+func TestCheckFirstPromotionFromBootstrapSentinel(t *testing.T) {
+	bundler, store, res, dir := checkFixture(t)
+	// Base: env at the absent sentinel; NO old release file anywhere.
+	store.files[checkBaseSHA][envPathConst] = envDoc(bootstrapRelConst)
+	store.blobs["envblob-base"] = envDoc(bootstrapRelConst)
+	delete(store.trees[checkBaseSHA], oldRelConst)
+	delete(store.trees[headSHA], oldRelConst)
+	delete(store.blobs, "oldrelblob")
+
+	outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Passed {
+		t.Errorf("first-promotion check must pass, got: %v", outcome.Messages)
+	}
+	if outcome.From != bootstrapRelConst || outcome.To != relPathConst {
+		t.Errorf("from/to = %q → %q", outcome.From, outcome.To)
+	}
+}
+
+func TestEnvironmentTemplateShipsBootstrapSentinel(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "templates", "environment.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := manifest.Parse(data, manifest.KindEnvironment)
+	if err != nil {
+		t.Fatalf("shipped environment template must parse: %v", err)
+	}
+	if got := res.Environment.Spec.Release; got != bootstrapRelConst {
+		t.Errorf("template spec.release = %q, want absent bootstrap sentinel %q", got, bootstrapRelConst)
+	}
+}

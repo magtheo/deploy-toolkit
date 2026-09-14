@@ -222,6 +222,9 @@ run when invoked by anything else:
 ```yaml
 jobs:
   deploy:
+    permissions:
+      contents: read   # prepare: repository checkout
+      actions: read    # deploy: run-artifact download
     uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-sha>
     with:
       environment: production
@@ -230,6 +233,11 @@ jobs:
       target_ssh_key: ${{ secrets.TARGET_SSH_KEY }}
       target_host_key: ${{ secrets.TARGET_HOST_KEY }}
 ```
+
+Caller permissions are a ceiling — the reusable workflow cannot elevate
+past them, so `permissions: {}` on the calling job breaks deployment at
+run time. The two read scopes above are the documented floor (see
+[docs/consumer-contract-v1.md](docs/consumer-contract-v1.md)).
 
 Its `prepare` job holds repository authority and is not given the target
 credentials; its `deploy`
