@@ -1,0 +1,27 @@
+name: Concurrency qualification
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: race + shuffle, repeated
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go test (concurrency-sensitive packages, repeated)
+        run: |
+          go test -race -shuffle=on -count=5 \
+            ./internal/lifecycle/... \
+            ./internal/target/... \
+            ./internal/transport/...
