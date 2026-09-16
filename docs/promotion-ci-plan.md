@@ -190,20 +190,37 @@ Semantics and hardening:
 ORDINARY vs INVALID is decided by **promotion intent**, detected
 semantically before any promotion rule is applied:
 
-> **Intent predicate:** the diff contains a semantic change to the
-> `spec.release` field of a `.deploy/environments/<environment>.yaml` file.
+> **Intent predicate:** the transition is promotion-sensitive if it
+> (a) contains a semantic change to the `spec.release` field of a
+> `.deploy/environments/<environment>.yaml` file, **or**
+> (b) adds, modifies, or removes any file under
+> `.deploy/releases/` (the release-manifest namespace).
 
-A deployment-state *pointer* transition is the authority-sensitive operation —
-nothing else is. Evaluator ordering (both modes):
+Clause (b) is not a path filter: `.deploy/releases/**` is special because it
+holds **immutable authority objects that become trusted-base inputs to future
+promotions**. The existing-release fast path treats the trusted-base copy as
+authoritative without re-running full eligibility — deliberately, so rollback
+is cheap. A release file that reached trusted main outside a verified
+promotion would poison that assumption: a later environment-only flip would
+consume it through the trusted-base path with no evidence check ever having
+run. Hence the invariant this encodes:
+
+> **A Release manifest may enter trusted main only as part of a valid
+> promotion transition.**
+
+(`promotion propose` already builds that atomic transition by construction;
+the classifier now enforces it against hand-made transitions too.)
+
+Evaluator ordering (both modes):
 
 ```text
 inspect the semantic transition
   (PR merge diff, or push before → after)
         ↓
-no spec.release transition anywhere
+no spec.release transition and no release-namespace mutation
         → ORDINARY   (no CAS, no evidence work; topology free)
         ↓
-spec.release transition present  → promotion attempt
+promotion-sensitive transition present  → promotion attempt
         ↓
 pr mode:   CAS freshness + tree policy + evidence
 push mode: live-head + ancestry + zero-SHA checks
@@ -226,13 +243,16 @@ environment spec.target/failurePolicy      → ORDINARY (administrative;
 environment file removed                   → ORDINARY (nothing is pointed
                                              anywhere; prepare/deploy fail
                                              closed on absent desired state)
-lone release-file addition, no flip        → ORDINARY (inert; evidence is
-                                             re-verified when a pointer
-                                             later targets it)
+lone release-file addition, no flip        → INVALID (release manifests enter
+                                              trusted main only via a valid
+                                              promotion transition)
+existing release modified                  → INVALID (immutable)
+existing release removed                   → INVALID (immutable)
 source + spec.release flip                 → INVALID
 spec.release + unrelated file              → INVALID
 malformed release addition + spec.release  → INVALID
 valid release + spec.release only          → PROMOTION
+environment-only flip to existing release  → PROMOTION (rollback class)
 environment-only flip to existing release  → PROMOTION (rollback class)
 ```
 
@@ -366,6 +386,7 @@ all** in this gate:
 | Human merge = authorization | unchanged |
 | Verification from trusted code, never PR code | base-version gate; deployctl built from pinned toolkit SHA |
 | New releases re-verified against current evidence | same evaluator in all three frontends |
+| Release manifests enter trusted main only via valid promotion transitions | release-namespace mutation is promotion-sensitive; without a valid pointer transition it is INVALID — the trusted-base fast path is never fed unaudited evidence |
 | Stale/modified proposals fail closed | CAS rules unchanged in pr mode |
 | Ordinary source changes get full required CI | `promotion_only=false` → all app jobs run |
 | Mixed PR never fast-paths | INVALID: full CI **and** failing gate |
@@ -382,10 +403,12 @@ all** in this gate:
 2. **Classification mapping:** PROMOTION/ORDINARY/INVALID/ERROR for
    representative diffs (including source + `spec.release` mixed → INVALID);
    exit codes and reasons. **Intent-ordering cases:** ordinary multi-commit
-   PR and out-of-date base → ORDINARY (CAS not applied); lone release-file
-   addition without a flip → ORDINARY; `spec.target` change → ORDINARY;
-   intent + each hardening failure (stale base, multi-commit head, force
-   push, zero-SHA) → INVALID.
+   PR and out-of-date base → ORDINARY (CAS not applied); `spec.target`
+   change → ORDINARY; intent + each hardening failure (stale base,
+   multi-commit head, force push, zero-SHA) → INVALID. **Release-namespace
+   cases:** lone release addition → INVALID; existing release modification →
+   INVALID; existing release removal → INVALID; valid release addition +
+   pointer flip → PROMOTION.
 3. **Eligibility asymmetry:** required check with conclusion `skipped` fails
    eligibility; `success` passes (pins the unreleasable-merge property).
 4. **Workflow contract test:** pin `promotion.yml` inputs/outputs/permissions/
