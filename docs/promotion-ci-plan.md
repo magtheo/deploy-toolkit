@@ -21,9 +21,11 @@
    promotions, not "cheap ordinary changes".
 3. **Authority runs from trusted surfaces; cost routing may not.** The
    promotion *gate* (merge authority) is hardened against PR control. The
-   *skip routing* (what CI may skip) is allowed to live in consumer CI files,
-   because its worst-case failure is wasted compute, and it is covered by an
-   explicit governance control (below).
+   *skip routing* (what CI may skip) lives in consumer CI files and is **not
+   itself a security authority**: its integrity depends on the required
+   governance control over `.github/workflows/**` (below). Without that
+   control, a PR can alter its own CI routing, and skipped CI becomes a
+   qualification bypass — not a cost defect.
 4. **Every failure falls closed toward the expensive path** (full CI), and the
    *gate* additionally fails closed on INVALID and ERROR.
 
@@ -87,18 +89,39 @@ permissions:
   contents: read
   checks: read
 jobs:
-  gate:
+  classify:
     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
+  gate:
+    needs: classify
+    if: always()             # a broken classifier must never skip the gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce the classification
+        env:
+          RESULT: ${{ needs.classify.result }}
+          CLASSIFICATION: ${{ needs.classify.outputs.classification }}
+          REASON: ${{ needs.classify.outputs.reason }}
+        run: |
+          case "$RESULT/$CLASSIFICATION" in
+            success/PROMOTION)  echo "promotion-only transition"; exit 0 ;;
+            success/ORDINARY)   echo "not a promotion; full CI applies"; exit 0 ;;
+            *)                  echo "gate fail: $CLASSIFICATION ($RESULT) — $REASON"; exit 1 ;;
+          esac
 ```
+
+The required check for branch protection is the **`gate` (enforce) job**, not
+the classifier.
 
 **Why the classify jobs differ in trust.** The gate workflow's definition is
 always taken from the **base branch** (`pull_request_target`), so a PR cannot
-alter the pin, the conditions, or the output mapping. It is a required check;
-INVALID and ERROR fail it and block the merge. The classify job inside
-`ci.yml` only routes cost; if a hostile PR tampers with it, the worst case is
-skipped application CI — which is exactly the pre-existing GitHub
-`pull_request` property (any PR can already edit the workflow that runs it),
-not a new weakness. The required mitigation is standard and cheap:
+alter the pin, the conditions, or the output mapping. The routing workflow
+inside `ci.yml`, by contrast, **is not itself a security authority**. Its
+integrity depends on the documented required governance control over
+`.github/workflows/**`: without that control, a PR can alter its own CI
+routing — and skipped CI is then a qualification bypass, not a cost defect.
+With the control, altering routing requires owner review — the same authority
+merging requires. This is part of the documented integration, not optional
+hardening:
 
 > **Required consumer control:** `.github/workflows/**` must be covered by
 > CODEOWNERS (or a ruleset) so any PR touching CI definitions requires owner
@@ -154,12 +177,36 @@ codes plus a human-readable reason (exact code values fixed at
 implementation; the observable distinctions the workflow needs are:
 promotion vs not, gate-pass vs gate-fail, and a reason string).
 
-| State | Meaning | `promotion_only` | Gate job | Full CI / publish |
+| State | Meaning | `promotion_only` | Authority gate (enforce job) | Full CI / publish |
 |---|---|---|---|---|
 | `PROMOTION` | valid promotion-only transition | `true` | pass | skip |
 | `ORDINARY` | ordinary source/administrative change | `false` | pass ("not a promotion") | run |
 | `INVALID` | mixed or malformed — e.g. source change + `spec.release` flip | `false` | **fail** with reason | run |
 | `ERROR` | cannot classify (API, data, unreadable) | `false` | **fail** (fail closed) | run |
+
+### Failure semantics: the classifier reports; it never rules
+
+`promotion.yml` **always concludes success and always sets its outputs**. The
+classify command's nonzero exits (INVALID, ERROR) are captured and *reported*
+as `classification` + `reason`; they are never surfaced as a failed job. This
+is deliberate GitHub-mechanics hygiene, not style:
+
+> A job that fails inside a `needs` chain causes dependent jobs to be
+> **skipped**. A failing routing classifier would therefore silently skip the
+> expensive path it exists to fall back to — inverting fail-closed. The
+> enforcement decision belongs to the gate's `gate` (enforce) job and, for
+> cost, to the plain `!= 'true'` output test — never to the classifier's
+> exit code.
+
+If the reusable workflow machinery itself breaks (checkout failure, bad pin,
+action error), the classify job fails with outputs absent. Two consequences,
+both safe:
+
+- **Authority:** the enforce job runs `if: always()`, sees
+  `needs.classify.result != 'success'`, and fails — the required check is
+  unsatisfied and the merge is blocked until classification works.
+- **Cost:** routing jobs would be skipped for this run. Stuck-but-blocked is
+  acceptable; the merge cannot proceed on missing evidence.
 
 Why INVALID must fail the gate and not merely "run full CI": a boolean model
 turns *mixed promotion + source* into a valid way to alter deployment state —
@@ -194,9 +241,11 @@ all** in this gate:
 - Permissions floor (contract item): `contents: read`, `checks: read`
   (check-run evidence reads; verify the exact fine-grained permission during
   implementation).
-- Outputs (contract items): `promotion_only` (`true`/`false`),
-  `classification`, `reason`. Gate-conclusion mapping: INVALID/ERROR → the
-  job exits nonzero so the required check fails.
+- Outputs (contract items): `promotion_only` (`true` only for PROMOTION),
+  `classification`, `reason` — **always set, whatever the classify command
+  reported, including ERROR**. The reusable workflow's jobs always conclude
+  success (see *Failure semantics* above): the classifier reports, the gate
+  decides.
 
 ## Consumer integration contract (documentation deliverable)
 
@@ -265,8 +314,16 @@ all** in this gate:
 3. **Eligibility asymmetry:** required check with conclusion `skipped` fails
    eligibility; `success` passes (pins the unreleasable-merge property).
 4. **Workflow contract test:** pin `promotion.yml` inputs/outputs/permissions/
-   runs-on/full-SHA guard.
-5. **Live proof (consumer rehearsal):** the skipped-satisfies-protection
+   runs-on/full-SHA guard — including the property that the workflow's jobs
+   conclude success with outputs set for INVALID and ERROR.
+5. **Failure semantics (contract-level, not implementation detail):**
+   - classifier infrastructure ERROR → `promotion_only=false` → full consumer
+     CI runs → authority gate fails → merge blocked;
+   - INVALID mixed PR → full consumer CI runs → authority gate fails →
+     merge blocked;
+   - classifier machinery failure (classify job fails, outputs absent) →
+     the `if: always()` enforce job still runs and fails → merge blocked.
+6. **Live proof (consumer rehearsal):** the skipped-satisfies-protection
    behavior and the gate-blocking-INVALID behavior are demonstrated on a real
    protected branch — not assumed from documentation.
 
