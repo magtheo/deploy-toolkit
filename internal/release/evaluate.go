@@ -40,7 +40,7 @@ func Evaluate(ctx context.Context, in EvalInput, src Source, resolver Resolver, 
 	}
 	runs, err := src.CheckRuns(ctx, in.Repo, in.Revision)
 	if err != nil {
-		return nil, err
+		return nil, infraErr(err)
 	}
 	checks, err := checkEligibility(policy.Release.RequiredChecks, runs)
 	if err != nil {
@@ -50,13 +50,13 @@ func Evaluate(ctx context.Context, in EvalInput, src Source, resolver Resolver, 
 	for name, a := range material.Artifacts {
 		digest, err := resolver.Resolve(ctx, a.Repository, in.Revision)
 		if err != nil {
-			return nil, fmt.Errorf("artifact %q: %w", name, err)
+			return nil, infraErr(fmt.Errorf("artifact %q: %w", name, err))
 		}
 		artifacts[name] = ResolvedArtifact{Repository: a.Repository, Digest: digest}
 	}
 	bres, err := bundler.Build(ctx, in.Revision, material.Bundle.Include)
 	if err != nil {
-		return nil, fmt.Errorf("build bundle: %w", err)
+		return nil, infraErr(fmt.Errorf("build bundle: %w", err))
 	}
 	return &Evaluation{
 		Repo: in.Repo, Revision: in.Revision, BranchHead: branchHead,

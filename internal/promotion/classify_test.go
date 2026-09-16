@@ -2,6 +2,7 @@ package promotion
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -179,6 +180,20 @@ func TestClassifyIntentOrdering(t *testing.T) {
 		out := classifyOnce(t, store, res, bundler, dir, ClassifyInput{Repo: "example/my-app", Mode: ModePR, Base: checkBaseSHA, Head: headSHA, RepoDir: dir})
 		classifyWant{classification: ClassificationInvalid, messagesContain: "releases are immutable"}.verify(t, out)
 	})
+	t.Run("added release with rollback to existing is INVALID", func(t *testing.T) {
+		// Valid release X added while the environment rolls back to an
+		// existing release: X must never be seeded into trusted main
+		// outside its own promotion.
+		bundler, store, res, dir := checkFixture(t)
+		midRel := ".deploy/releases/my-app-0.0.95.yaml"
+		store.trees[checkBaseSHA][midRel] = "midrelblob"
+		store.trees[headSHA][midRel] = "midrelblob"
+		store.blobs["midrelblob"] = []byte(strings.Replace(string(validOldRelease()), "version: 0.0.9", "version: 0.0.95", 1))
+		store.files[headSHA][envPathConst] = envDoc(midRel)
+		store.blobs["envblob-head"] = envDoc(midRel)
+		out := classifyOnce(t, store, res, bundler, dir, ClassifyInput{Repo: "example/my-app", Mode: ModePR, Base: checkBaseSHA, Head: headSHA, RepoDir: dir})
+		classifyWant{classification: ClassificationInvalid, messagesContain: "must be the promotion target"}.verify(t, out)
+	})
 	t.Run("source change plus spec.release flip is INVALID", func(t *testing.T) {
 		bundler, store, res, dir := checkFixture(t)
 		store.trees[headSHA]["src/app.ts"] = "srcblob"
@@ -191,6 +206,26 @@ func TestClassifyIntentOrdering(t *testing.T) {
 		delete(store.trees, headSHA) // tree read fails
 		out := classifyOnce(t, store, nil, nil, dir, ClassifyInput{Repo: "example/my-app", Mode: ModePR, Base: checkBaseSHA, Head: headSHA})
 		classifyWant{classification: ClassificationError, reasonContains: "read head tree"}.verify(t, out)
+	})
+	t.Run("check-runs API failure is ERROR, not INVALID", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		store.runsErr = fmt.Errorf("502 bad gateway")
+		out := classifyOnce(t, store, res, bundler, dir, ClassifyInput{Repo: "example/my-app", Mode: ModePR, Base: checkBaseSHA, Head: headSHA, RepoDir: dir})
+		classifyWant{classification: ClassificationError, reasonContains: "502 bad gateway"}.verify(t, out)
+	})
+	t.Run("OCI resolver failure is ERROR, not INVALID", func(t *testing.T) {
+		bundler, store, _, dir := checkFixture(t)
+		res := &fakeResolver{digests: map[string]string{}} // resolve fails: manifest unknown
+		out := classifyOnce(t, store, res, bundler, dir, ClassifyInput{Repo: "example/my-app", Mode: ModePR, Base: checkBaseSHA, Head: headSHA, RepoDir: dir})
+		classifyWant{classification: ClassificationError, reasonContains: `artifact "app"`}.verify(t, out)
+	})
+	t.Run("failed required check is INVALID, not ERROR", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		store.runs = []release.CheckRun{
+			{ID: 3, Name: "Tests", Status: "completed", Conclusion: "failure", AppID: 1, SuiteID: 10, StartedAt: baseTime()},
+		}
+		out := classifyOnce(t, store, res, bundler, dir, ClassifyInput{Repo: "example/my-app", Mode: ModePR, Base: checkBaseSHA, Head: headSHA, RepoDir: dir})
+		classifyWant{classification: ClassificationInvalid, messagesContain: "not eligible under current policy"}.verify(t, out)
 	})
 	t.Run("rollback environment-only flip on push is PROMOTION without registry", func(t *testing.T) {
 		_, store, _, dir := pushFixture(t)

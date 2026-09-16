@@ -107,21 +107,21 @@ func checkEligibility(required []string, runs []CheckRun) ([]CheckResult, error)
 func loadProjects(ctx context.Context, repo, revision string, src Source) (policy, material *manifest.Project, branchHead string, err error) {
 	branchHead, err = src.BranchHead(ctx, repo, TrustedBranch)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", infraErr(err)
 	}
 	if err := src.VerifyCommit(ctx, repo, revision); err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", infraErr(err)
 	}
 	ancestor, err := src.IsAncestor(ctx, repo, revision, branchHead)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, "", infraErr(err)
 	}
 	if !ancestor {
 		return nil, nil, "", fmt.Errorf("revision %s is not reachable from %s@%s (head %s)", revision, repo, TrustedBranch, branchHead)
 	}
 	policyBytes, err := src.FileAt(ctx, repo, ProjectPath, branchHead)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("read release policy: %w", err)
+		return nil, nil, "", infraErr(fmt.Errorf("read release policy: %w", err))
 	}
 	policyRes, err := manifest.Parse(policyBytes, manifest.KindProject)
 	if err != nil {
@@ -135,7 +135,7 @@ func loadProjects(ctx context.Context, repo, revision string, src Source) (polic
 	}
 	materialBytes, err := src.FileAt(ctx, repo, ProjectPath, revision)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("read deployment material: %w", err)
+		return nil, nil, "", infraErr(fmt.Errorf("read deployment material: %w", err))
 	}
 	materialRes, err := manifest.Parse(materialBytes, manifest.KindProject)
 	if err != nil {

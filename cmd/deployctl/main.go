@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -370,14 +371,36 @@ func runPromotionClassify(ctx context.Context, args []string, token string, stdo
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 2
 	}
-	res, err := promotion.Classify(ctx, *in, gh.New(token), oci.NewRemote(authn.DefaultKeychain), bundle.NewBuilder(in.RepoDir))
+	return runPromotionClassifyWith(ctx, in, jsonMode,
+		gh.New(token), oci.NewRemote(authn.DefaultKeychain), bundle.NewBuilder(in.RepoDir), stdout, stderr)
+}
+
+type classifyJSON struct {
+	Classification string `json:"classification"`
+	PromotionOnly  bool   `json:"promotionOnly"`
+	Reason         string `json:"reason"`
+}
+
+// runPromotionClassifyWith is the testable seam behind runPromotionClassify:
+// parsing and dependency construction stay in the outer function.
+func runPromotionClassifyWith(ctx context.Context, in *promotion.ClassifyInput, jsonMode bool, src promotion.Store, resolver release.Resolver, bundler release.Bundler, stdout, stderr io.Writer) int {
+	res, err := promotion.Classify(ctx, *in, src, resolver, bundler)
 	if err != nil {
 		fmt.Fprintf(stderr, "✗ promotion classify: %v\n", err)
 		return 2
 	}
 	if jsonMode {
-		fmt.Fprintf(stdout, "{\"classification\":%q,\"promotionOnly\":%t,\"reason\":%q}\n",
-			res.Classification, res.Classification == promotion.ClassificationPromotion, res.Reason)
+		b, err := json.Marshal(classifyJSON{
+			Classification: string(res.Classification),
+			PromotionOnly:  res.Classification == promotion.ClassificationPromotion,
+			Reason:         res.Reason,
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "✗ promotion classify: %v\n", err)
+			return 3
+		}
+		b = append(b, '\n')
+		stdout.Write(b)
 	} else {
 		fmt.Fprintf(stdout, "classification: %s\n", res.Classification)
 		fmt.Fprintf(stdout, "reason: %s\n", res.Reason)
