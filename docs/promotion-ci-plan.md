@@ -26,8 +26,13 @@
    governance control over `.github/workflows/**` (below). Without that
    control, a PR can alter its own CI routing, and skipped CI becomes a
    qualification bypass — not a cost defect.
-4. **Every failure falls closed toward the expensive path** (full CI), and the
-   *gate* additionally fails closed on INVALID and ERROR.
+4. **Classifier *result* failures fall closed toward the expensive path**
+   (full CI); the *gate* additionally fails closed on INVALID and ERROR.
+   Workflow-*machinery* failures (the classify job cannot run at all) fail
+   the run and require a rerun: on PRs the enforce job still blocks the
+   merge; on pushes, publish is skipped in a red run until rerun. Authority
+   never depends on machinery succeeding; machinery failures are visible and
+   retried.
 
 ## Architecture
 
@@ -138,7 +143,13 @@ classifier surface.
 CAS semantics: base must equal the live trusted head; head must be exactly one
 commit on it; full diff-policy walk; evidence re-verification (new-release
 case needs a checkout of the pinned source revision — without it, fail
-closed). This stays the named strict gate for `promotion propose` output.
+closed). This stays the named strict gate for `promotion propose` output: it
+evaluates **known promotion attempts** and keeps its strict behavior.
+
+The classifier's pr mode shares the engine but **runs intent detection first**
+(below): an ordinary source PR with many commits or an out-of-date base is
+ordinary work — it must never become INVALID for failing rules that only
+promotion attempts are subject to.
 
 ### Push mode (new): classify the ref transition
 
@@ -169,6 +180,61 @@ Semantics and hardening:
 - **Topology-agnostic by construction**: the content transition decides;
   merge, squash, rebase, and multi-commit pushes all reduce to
   `diff(before, after)`. Provenance remains branch protection's job.
+- The push-side hardening checks (live head, ancestry, zero-SHA) apply
+  **within promotion-attempt evaluation only** — they are part of what makes
+  an attempt PROMOTION vs INVALID, and never touch ORDINARY transitions
+  (see the ordering below).
+
+### Promotion intent detection and evaluator ordering
+
+ORDINARY vs INVALID is decided by **promotion intent**, detected
+semantically before any promotion rule is applied:
+
+> **Intent predicate:** the diff contains a semantic change to the
+> `spec.release` field of a `.deploy/environments/<environment>.yaml` file.
+
+A deployment-state *pointer* transition is the authority-sensitive operation —
+nothing else is. Evaluator ordering (both modes):
+
+```text
+inspect the semantic transition
+  (PR merge diff, or push before → after)
+        ↓
+no spec.release transition anywhere
+        → ORDINARY   (no CAS, no evidence work; topology free)
+        ↓
+spec.release transition present  → promotion attempt
+        ↓
+pr mode:   CAS freshness + tree policy + evidence
+push mode: live-head + ancestry + zero-SHA checks
+           + tree policy + evidence
+        ↓
+PROMOTION | INVALID
+        ↓
+read/infrastructure failure at any step
+        → ERROR
+```
+
+Consequences:
+
+```text
+app code only                              → ORDINARY
+.deploy/project.yaml policy change         → ORDINARY
+deploy scripts, Caddy config               → ORDINARY
+environment spec.target/failurePolicy      → ORDINARY (administrative;
+                                             branch protection reviews it)
+environment file removed                   → ORDINARY (nothing is pointed
+                                             anywhere; prepare/deploy fail
+                                             closed on absent desired state)
+lone release-file addition, no flip        → ORDINARY (inert; evidence is
+                                             re-verified when a pointer
+                                             later targets it)
+source + spec.release flip                 → INVALID
+spec.release + unrelated file              → INVALID
+malformed release addition + spec.release  → INVALID
+valid release + spec.release only          → PROMOTION
+environment-only flip to existing release  → PROMOTION (rollback class)
+```
 
 ### Classification states and observable mapping
 
@@ -205,8 +271,13 @@ both safe:
 - **Authority:** the enforce job runs `if: always()`, sees
   `needs.classify.result != 'success'`, and fails — the required check is
   unsatisfied and the merge is blocked until classification works.
-- **Cost:** routing jobs would be skipped for this run. Stuck-but-blocked is
-  acceptable; the merge cannot proceed on missing evidence.
+- **Cost:** routing jobs would be skipped for this run — the run is red and a
+  rerun is required. On PRs the merge is blocked regardless (authority); on
+  pushes, publish is skipped until the rerun. The invariant is deliberately
+  narrowed: **classifier *result* failures fall back to full CI;
+  workflow-*machinery* failures fail the run and require rerun.** Making even
+  machinery failures route to full CI would require `always()`/result-aware
+  conditions in every consumer job — complexity the design refuses.
 
 Why INVALID must fail the gate and not merely "run full CI": a boolean model
 turns *mixed promotion + source* into a valid way to alter deployment state —
@@ -310,7 +381,11 @@ all** in this gate:
    `after ≠ live head`, rebase and multi-commit transitions, squash.
 2. **Classification mapping:** PROMOTION/ORDINARY/INVALID/ERROR for
    representative diffs (including source + `spec.release` mixed → INVALID);
-   exit codes and reasons.
+   exit codes and reasons. **Intent-ordering cases:** ordinary multi-commit
+   PR and out-of-date base → ORDINARY (CAS not applied); lone release-file
+   addition without a flip → ORDINARY; `spec.target` change → ORDINARY;
+   intent + each hardening failure (stale base, multi-commit head, force
+   push, zero-SHA) → INVALID.
 3. **Eligibility asymmetry:** required check with conclusion `skipped` fails
    eligibility; `success` passes (pins the unreleasable-merge property).
 4. **Workflow contract test:** pin `promotion.yml` inputs/outputs/permissions/
