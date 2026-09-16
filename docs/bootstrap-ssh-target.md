@@ -91,7 +91,8 @@ admin
   - not used by CI
 ```
 
-For example:
+For example (Debian/Ubuntu; `adduser` and the `sudo` group are distribution-specific —
+other distributions use different tools and group names, e.g. `useradd` or a `wheel` group):
 
 ```bash
 sudo adduser admin
@@ -358,10 +359,10 @@ Those are architecture choices and should be introduced deliberately, not as inc
 
 Deploy Toolkit itself only needs connectivity for the declared transport, typically SSH.
 
-For an SSH target this usually means:
+For an SSH target this means: allow the SSH port declared by the Target manifest, normally 22.
 
 ```text
-deployment runner -> target TCP/22
+deployment runner -> target <declared SSH port, normally 22>
 ```
 
 Everything else is application-specific.
@@ -404,10 +405,12 @@ A common convention is:
 For example:
 
 ```bash
-sudo mkdir -p /srv/deploy/my-project/secrets
-sudo chown -R deploy:deploy /srv/deploy/my-project
-chmod 700 /srv/deploy/my-project/secrets
+sudo install -d -m 700 -o deploy -g deploy /srv/deploy/my-project/secrets
 ```
+
+This creates and owns only the consumer-managed secrets directory. Do not recursively `chown` the
+project tree: `releases/`, `state/`, and `history/` beneath `deployRoot` are toolkit-managed, and
+Deploy Toolkit creates its own tree.
 
 A consumer may then place files such as:
 
@@ -439,10 +442,12 @@ This is a **consumer/runtime requirement**, not a Deploy Toolkit requirement.
 If lifecycle hooks pull private OCI images, authenticate the deployment identity using the runtime's normal
 credential mechanism.
 
-For Docker and a private registry, that may be:
+For Docker and a private registry, perform the login **as the deployment identity**, not as root or the
+admin account — the credential is stored in that account's `~/.docker/config.json`, and a root login
+would leave the deployment identity without pull access:
 
 ```bash
-docker login registry.example
+sudo -u deploy -H docker login registry.example
 ```
 
 If the consumer only uses public artifacts, no registry login is needed.
@@ -462,21 +467,42 @@ deployment private key
 pinned server host key
 ```
 
-When using the Deploy Toolkit reusable GitHub Actions workflow, these are passed through the workflow's
-documented secret/environment convention.
+How those three pieces reach the runner depends on which machinery executes the deployment.
 
-Conceptually:
+**Generic Target contract.** The Target manifest never embeds credentials. It *names environment
+variables*, and the deployment process holds the values (for the key material, paths to files):
 
-```text
-TARGET_HOST
-TARGET_SSH_KEY
-TARGET_HOST_KEY
+```yaml
+hostFrom:       <env var holding the hostname>
+credentialFrom: <env var holding the path to the private-key file>
+hostKeyFrom:    <env var holding the path to the pinned host-key file>
 ```
 
-The exact variable names are part of the reusable-workflow contract and should be taken from the current
-Deploy Toolkit documentation.
+These variable names are the consumer's choice.
 
-The Target manifest should reference environment variables, never embed credentials directly.
+**The published reusable workflow.** Deploy Toolkit's reusable GitHub Actions workflow fixes the
+convention on both sides. When using it, the Target manifest must reference exactly:
+
+```yaml
+hostFrom:       TOOLKIT_TARGET_HOST
+credentialFrom: TOOLKIT_TARGET_SSH_KEY_PATH
+hostKeyFrom:    TOOLKIT_TARGET_HOST_KEY_PATH
+```
+
+while the workflow caller supplies the values as the workflow's documented secrets:
+
+```text
+target_host
+target_ssh_key
+target_host_key
+```
+
+The workflow writes the key material to temporary files and exports the `TOOLKIT_*` variables the
+manifest names. The `TOOLKIT_*` names are required only when using that workflow — the generic
+Target contract does not mandate them.
+
+In both cases, the Target manifest references environment variables, never embeds credentials
+directly.
 
 ---
 
