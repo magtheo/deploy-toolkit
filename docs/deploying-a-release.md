@@ -1,8 +1,8 @@
 # Deploying a Release — Operator Workflow
 
-> A practical, project-neutral runbook for moving a tested commit on `main` to a deployment target with Deploy Toolkit.
+> A practical, project-neutral runbook for moving an eligible revision on trusted `main` to a deployment target with Deploy Toolkit.
 >
-> This document describes **how to operate Deploy Toolkit**. It does not define how an individual application is built, provisioned, configured, or verified internally. Those details belong to the consuming project and its deployment contract.
+> This guide assembles the existing contracts into one operator path; it does not redefine them. Exact semantics belong to the owner documents linked throughout and listed at the end.
 
 ---
 
@@ -36,7 +36,7 @@ Release ≠ Promotion ≠ Deployment
 - A **promotion** changes an environment's desired release.
 - A **deployment** applies that already-authorized desired state to the target.
 
-Deploy Toolkit never treats "run the deploy command" as the authorization act. The authorization is the human-approved promotion.
+Deploy Toolkit never treats "run the deploy command" as the authorization act. The authorization is the human-approved promotion merge.
 
 ---
 
@@ -46,51 +46,25 @@ A consumer repository should already contain:
 
 ```text
 .deploy/
-├── project.yaml
+├── project.yaml          # the deployment contract: lifecycle hooks, artifacts, bundle
 ├── environments/
 │   └── <environment>.yaml
 ├── targets/
 │   └── <target>.yaml
-└── releases/
+└── releases/             # generated, immutable
 ```
 
-The project must also have a deployment contract declaring its lifecycle hooks, for example:
+The deployment contract — including the mandatory `apply` and `verify` hooks — is defined by [consumer-contract-v1.md](consumer-contract-v1.md).
 
-```yaml
-lifecycle:
-  preflight:
-    argv: ["./deploy/preflight.sh"]
-  migrate:
-    argv: ["./deploy/migrate.sh"]
-  apply:
-    argv: ["./deploy/apply.sh"]
-  verify:
-    argv: ["./deploy/verify.sh"]
-  rollback:
-    argv: ["./deploy/rollback.sh"]
-```
+The target must already satisfy the generic target contract. For SSH targets, [bootstrap-ssh-target.md](bootstrap-ssh-target.md) is the operational guide for preparing one; [target-prerequisites.md](target-prerequisites.md) is the normative reference. This guide does not repeat target preparation.
 
-`apply` and `verify` are mandatory. Other hooks are optional according to the consumer contract.
-
-Before the first real deployment, the target must satisfy the generic target prerequisites:
-
-- reachable by the declared transport;
-- deployment user exists;
-- deploy root is writable;
-- SSH host key is pinned when using SSH;
-- required runtime/tools for the project's hooks are installed;
-- registry authentication is configured if private artifacts must be pulled;
-- target-owned application secrets/configuration exist outside immutable release directories.
-
-Deploy Toolkit itself does not provision hosts, install Docker, configure DNS, create databases, or create application secrets.
+Deploy Toolkit does not provision hosts, install runtimes, configure DNS, create databases, or create application secrets.
 
 ---
 
-## 3. Step 1 — Wait for trusted `main` to be green
+## 3. Step 1 — Choose the eligible revision
 
-Start from an exact commit on the trusted integration branch.
-
-Record the full source SHA:
+Choose the exact eligible revision you want to release. In the common case of releasing the current trusted `main`, obtain it with:
 
 ```bash
 git rev-parse origin/main
@@ -98,41 +72,30 @@ git rev-parse origin/main
 
 Use the **full 40-character SHA** throughout release creation.
 
-Do not create a release from a PR head unless that exact revision has become part of trusted `main` and satisfies the project's release policy.
+Eligibility is decided by the actual policy at release creation: the revision must exist, belong to the permitted trusted branch, and have every required check concluded successfully for that exact SHA — missing, skipped, cancelled, in-progress, or failed checks are not eligible ([release-lifecycle.md](release-lifecycle.md)).
 
-The candidate revision must have all required checks completed successfully. Missing, skipped, cancelled, neutral, in-progress, or failed checks are not eligible.
+Do not create a release from a PR head unless that exact revision has become part of trusted `main`.
 
 ---
 
-## 4. Step 2 — Confirm releasable artifacts exist
+## 4. Step 2 — Confirm releasable artifacts are published
 
-For every OCI artifact declared by the project, CI should publish a temporary discovery tag using the full source SHA:
+Ensure the artifact-discovery requirements in [consumer-contract-v1.md](consumer-contract-v1.md) are satisfied: every releasable OCI artifact **MUST** be published with the full source Git SHA as a temporary discovery tag:
 
 ```text
 registry.example.com/project/app:<full-source-sha>
 registry.example.com/project/worker:<full-source-sha>
-registry.example.com/project/proxy:<full-source-sha>
 ```
 
-The names are project-specific.
+Release creation resolves each discovery tag to its immutable registry digest and records only the digest in the release manifest; the tag itself is disposable.
 
-These SHA tags are only used to discover the artifact produced from the source revision. Deploy Toolkit resolves each tag to its immutable registry digest:
-
-```text
-registry.example.com/project/app@sha256:...
-```
-
-Only the digest is recorded in the release manifest.
-
-If the target must pull private artifacts, verify that the deployment user can authenticate to the registry before the first deployment.
+If the target must pull private artifacts, verify the deployment identity's registry authentication before the first deployment (see [bootstrap-ssh-target.md](bootstrap-ssh-target.md)).
 
 ---
 
 ## 5. Step 3 — Decide the release metadata
 
-Release creation requires explicit migration semantics. Deploy Toolkit deliberately does not infer them.
-
-Choose:
+Release creation requires explicit migration semantics; Deploy Toolkit deliberately does not infer them. Choose:
 
 ```text
 version
@@ -150,20 +113,7 @@ mode:           forward-compatible
 rollback safe:  true
 ```
 
-Supported migration modes:
-
-| Mode | Meaning |
-|---|---|
-| `none` | No schema migration is part of this release |
-| `forward-compatible` | New schema remains compatible with the previous application version |
-| `maintenance-required` | Deployment requires an explicit maintenance window |
-| `irreversible` | Migration cannot safely be undone |
-
-`rollbackSafe: false` disables automatic rollback.
-
-`irreversible` must always be paired with `rollbackSafe: false`.
-
-These values are application claims. The operator or project must decide them deliberately.
+The meanings of the migration modes and their rules (`irreversible` requires `rollbackSafe: false`, and so on) are owned by [consumer-contract-v1.md](consumer-contract-v1.md). These values are application claims — the operator or project must decide them deliberately.
 
 ---
 
@@ -200,18 +150,7 @@ deployctl release create \
   --repo-dir .
 ```
 
-Release creation performs eligibility and materialization. It should verify, among other things:
-
-```text
-source revision exists
-source revision belongs to the permitted trusted branch
-required CI checks succeeded
-OCI artifacts resolve from the source-SHA discovery tags
-artifact digests are immutable
-deployment bundle can be built from the exact source tree
-deployment contract can be validated
-migration semantics are explicit
-```
+Release creation runs the deterministic eligibility pipeline — ancestry, required checks, artifact digest resolution, bundle and contract digests from the exact Git tree — described in [release-lifecycle.md](release-lifecycle.md).
 
 The result is an immutable release manifest:
 
@@ -245,15 +184,7 @@ deployctl promotion propose staging \
   --repo-dir .
 ```
 
-The promotion proposal should contain only the authorized deployment-state change:
-
-```text
-new immutable release manifest
-+
-environment spec.release pointer change
-```
-
-Conceptually:
+The proposal is one atomic commit containing only the authorized deployment-state change:
 
 ```diff
  spec:
@@ -261,17 +192,13 @@ Conceptually:
 +  release: .deploy/releases/acme-service-0.4.0.yaml
 ```
 
-For a first deployment, the environment may instead move from the project's bootstrap sentinel to the first real release.
+For a first deployment, the environment instead moves from the project's bootstrap sentinel to the first real release.
 
 ---
 
 ## 8. Step 6 — Verify the promotion PR
 
-Before authorization, the promotion diff should be checked by trusted automation.
-
-The promotion check validates that the PR has not smuggled unrelated changes into the authorization step and, for a newly-created release, re-verifies its eligibility evidence.
-
-Conceptually:
+Before authorization, the promotion diff is checked by trusted automation:
 
 ```bash
 deployctl promotion check \
@@ -281,15 +208,15 @@ deployctl promotion check \
   --repo-dir .
 ```
 
-Prefer running this in a trusted CI workflow rather than relying on a developer's local machine.
+The check enforces the Promotion Diff Policy — exact allowed diff shape, compare-and-swap freshness against the live trusted head, and re-verification of release evidence — and fails closed on anything else ([promotion-diff-policy.md](promotion-diff-policy.md)).
 
-The promotion should fail closed if the proposal includes unrelated files or if the release evidence no longer matches policy.
+Prefer running this in trusted CI rather than relying on a developer's local machine.
 
 ---
 
 ## 9. Step 7 — Human reviews and merges the promotion PR
 
-This is the authorization boundary.
+This is the authorization boundary:
 
 ```text
 promotion PR merge = authorization to change the environment
@@ -316,22 +243,21 @@ Do not let an agent merge unless a human has explicitly delegated that authority
 
 ## 10. Step 8 — Trigger the deployment workflow
 
-A consumer repository can invoke Deploy Toolkit through the published reusable workflow.
-
-A typical caller looks like:
+A consumer repository invokes Deploy Toolkit through the published reusable workflow:
 
 ```yaml
 jobs:
   deploy:
     permissions:
-      contents: read
-      actions: read
+      contents: read   # prepare: repository checkout
+      actions: read    # deploy: run-artifact download
 
-    uses: OWNER/deploy-toolkit/.github/workflows/deploy.yml@<full-toolkit-sha>
+    uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-toolkit-sha>
 
     with:
-      environment: staging
-      repo_dir: .
+      environment: staging        # required
+      # repo_dir: .               # optional (monorepos)
+      # owner: ""                 # optional audit identity
 
     secrets:
       target_host: ${{ secrets.TARGET_HOST }}
@@ -339,156 +265,55 @@ jobs:
       target_host_key: ${{ secrets.TARGET_HOST_KEY }}
 ```
 
-Always pin the toolkit workflow by a **full commit SHA**.
+Always pin the toolkit workflow by a **full commit SHA** — that pin is the machinery trust anchor ([consumer-contract-v1.md](consumer-contract-v1.md)).
 
-For a manual deployment workflow, ensure the caller can run only from the trusted branch or otherwise proves that the invoking commit is the promoted state.
+The caller is responsible for invoking deployment only from the trusted, human-promoted branch state — for example, a manual workflow restricted to the trusted branch.
 
-The reusable workflow intentionally splits authority:
+The workflow splits authority deliberately ([prepared-artifact-v1.md](prepared-artifact-v1.md), [trust-model.md](trust-model.md)):
 
 ```text
-prepare job
-  repository access
-  no target credential
-        ↓
-immutable prepared deployment artifact
-        ↓
-deploy job
-  target credential
-  no consumer source checkout
+prepare job: repository access, no target credential
+        ↓ immutable prepared deployment artifact
+deploy job: target credential, no consumer source checkout
 ```
 
-No single job should hold both repository authority and the production target credential.
+No single job holds both repository authority and the production target credential.
 
 ---
 
 ## 11. Step 9 — What Deploy Toolkit does on the target
 
-The deployment engine executes:
+The lifecycle engine executes one fixed ordering, owned by [release-lifecycle.md](release-lifecycle.md) and the hook protocol in [consumer-contract-v1.md](consumer-contract-v1.md):
 
 ```text
-VALIDATE
-   ↓
-STAGE
-   ↓
-PREFLIGHT
-   ↓
-MIGRATE
-   ↓
-APPLY
-   ↓
-VERIFY
-   ↓
-COMMIT OBSERVED STATE
+VALIDATE → STAGE → PREFLIGHT → MIGRATE → APPLY → VERIFY → COMMIT OBSERVED STATE
 ```
 
-### VALIDATE
+- **VALIDATE** — the prepared material and manifest relationships verify.
+- **STAGE** — the immutable bundle is staged into the release directory on the target; hooks execute from there.
+- **PREFLIGHT** — the project's optional preflight hook decides whether the staged release may begin consequential execution.
+- **MIGRATE** — the project's optional migrate hook runs; the toolkit records its result without interpreting it.
+- **APPLY** — the mandatory apply hook makes the target run the release, however the project defines that.
+- **VERIFY** — the mandatory verify hook is the authoritative application-level proof.
+- **COMMIT OBSERVED STATE** — only after verification succeeds is the release recorded as observed state.
 
-Validates the prepared material and manifest relationships.
-
-### STAGE
-
-Copies the immutable deployment bundle into the release directory on the target.
-
-Typical layout:
-
-```text
-<deployRoot>/<project>/
-├── releases/
-│   └── <version>/
-├── state/
-├── history/
-└── secrets/          # project convention; target-owned, not release-owned
-```
-
-### PREFLIGHT
-
-Runs the project's preflight hook, if declared.
-
-Examples of project-specific checks:
-
-```text
-required runtime exists
-required target-owned config exists
-required ports/files/directories are usable
-artifact variables are present
-application prerequisites are satisfied
-```
-
-### MIGRATE
-
-Runs the project's migration hook when declared.
-
-Deploy Toolkit does not interpret the application's database migration system; it executes the declared contract and records the result.
-
-### APPLY
-
-Runs the project's apply hook.
-
-This may mean:
-
-```text
-docker compose up
-systemctl restart
-helm upgrade
-copy binaries + restart service
-or another project-defined mechanism
-```
-
-Deploy Toolkit does not require Docker or any particular runtime.
-
-### VERIFY
-
-Runs the project's mandatory verify hook.
-
-This is the authoritative application-level proof that the deployment succeeded.
-
-The project should verify the state that matters to it, for example:
-
-```text
-process/service is running
-health endpoint responds
-database is reachable
-TLS edge is valid
-critical dependencies are ready
-version/release identity is correct
-```
-
-### COMMIT OBSERVED STATE
-
-Only after verification succeeds does Deploy Toolkit record the release as the environment's observed state.
+Deploy Toolkit owns the ordering and the evidence; the project's hooks own everything application-specific.
 
 ---
 
 ## 12. Step 10 — Read the deployment result
 
-The reusable workflow exposes a `deployctl.result/v1` result document.
+The deployment exposes a single `deployctl.result/v1` document. The document — not the process exit code — is the decision surface: its envelope carries `outcome`, `recoveryRequired`, and `safeToRetry`, with per-command facts (e.g. `committed`, `alreadyCurrent`, `attemptId`) in `data`. The result contract, outcome enum, and exit-code categories are owned by [cli-v1.md](cli-v1.md).
 
-Do not judge deployment state from the shell exit code alone.
+A normal successful deployment ends with observed state matching the promoted release.
 
-Inspect the structured result fields, especially:
-
-```text
-outcome
-committed
-alreadyCurrent
-recoveryRequired
-safeToRetry
-desired release
-observed release
-attempt identity
-recovery identity
-lock state
-```
-
-A normal successful deployment should end with observed state matching the promoted release.
-
-You can also query the target state with:
+Query target state directly with:
 
 ```bash
 deployctl status <environment> --repo-dir .
 ```
 
-or machine-readable output:
+or, machine-readable:
 
 ```bash
 deployctl status <environment> --repo-dir . --json
@@ -496,71 +321,32 @@ deployctl status <environment> --repo-dir . --json
 
 ---
 
-## 13. Failure handling
+## 13. When a deployment fails
 
-Deploy Toolkit distinguishes failures that happened before consequential execution from failures whose target outcome may be uncertain.
-
-### Safe pre-execution failure
-
-Examples:
+Two different questions, never collapsed into one:
 
 ```text
-invalid manifest
-prepared-artifact verification failure
-target unreachable before execution
-preflight rejection
+consequential work started?  → target-state risk (attempt/recovery marker; recoveryRequired)
+safeToRetry                  → whether re-running the SAME operation can succeed as-is
 ```
 
-These can often be corrected and retried.
+- **Nothing consequential ran** (for example, the target was unreachable before execution): `safeToRetry: true` — fix the cause and re-run.
+- **Refused before target contact** — policy gates, invalid evidence, prepared-material verification failures: `outcome: refused`, `safeToRetry: false`. Nothing was contacted or executed, but re-running the same bytes and inputs cannot succeed; fix the material or the state, then re-run.
+- **Consequential work started and the outcome is not safely known**: an attempt marker exists, `recoveryRequired: true`, `safeToRetry: false`. Normal deployment refuses to re-run into an unknown target state — inspect the target and follow the documented recovery path instead of retrying.
 
-### Consequential failure
-
-Once migration/apply/verification work may have changed target state, Deploy Toolkit records an attempt marker.
-
-If the outcome is not safely known, normal deployment refuses to run again blindly.
-
-The structured result may report:
-
-```text
-recoveryRequired: true
-safeToRetry: false
-```
-
-At that point, do not simply re-run deployment.
-
-Inspect the target and use the documented recovery path.
+Never infer retry safety merely from "the target looks unchanged." The complete outcome and retry taxonomy is [cli-v1.md](cli-v1.md); the marker model is [target-state.md](target-state.md).
 
 ---
 
 ## 14. Automatic rollback
 
-If the environment permits:
-
-```yaml
-failurePolicy:
-  autoRollback: safe-only
-```
-
-and the failed release declares:
-
-```yaml
-migration:
-  rollbackSafe: true
-```
-
-Deploy Toolkit may automatically recover the previous verified release.
-
-`rollbackSafe: false` disables this.
-
-An `irreversible` migration cannot be automatically or manually represented as safely reversible.
+If the environment declares `failurePolicy.autoRollback: safe-only` and the failed release declares `migration.rollbackSafe: true`, Deploy Toolkit may automatically recover the previous verified release. `off` and `rollbackSafe: false` always win; `irreversible` refuses rollback on every authorization path. The policy is owned by [consumer-contract-v1.md](consumer-contract-v1.md) and [release-lifecycle.md](release-lifecycle.md).
 
 ---
 
 ## 15. Normal rollback of a healthy deployment
 
-A normal rollback is not an emergency command.
-
-Promote the previous release again:
+A normal rollback is not an emergency command. Promote the previous release again:
 
 ```diff
  spec:
@@ -568,68 +354,46 @@ Promote the previous release again:
 +  release: .deploy/releases/acme-service-0.3.2.yaml
 ```
 
-Then follow the same promotion review and deployment path.
-
-This preserves the ordinary authorization model.
+Then follow the same promotion review and deployment path. This preserves the ordinary authorization model.
 
 ---
 
 ## 16. Emergency recovery
 
-Use the explicit rollback/recovery paths only when the currently-running environment must be restored outside the normal promotion flow.
-
-Example:
+Use the explicit rollback/recovery paths only when the currently-running environment must be restored outside the normal promotion flow:
 
 ```bash
-deployctl rollback <environment> --to <version>
+deployctl rollback <environment> --to <version> \
+  --confirm "rollback <environment> to <version>"
 ```
 
-Emergency rollback requires explicit confirmation and records its authority in deployment history.
+(`--confirm` may be omitted in interactive mode; the same sentence is then typed at the prompt. It is checked before any target contact, and it is required in `--json` mode.)
 
-If a deployment or recovery has an unresolved marker, follow the recovery procedure rather than repeatedly invoking deploy/rollback.
+Emergency rollback records its authority in deployment history and leaves Git desired state drifted until reconciled ([release-lifecycle.md](release-lifecycle.md)).
 
-The toolkit deliberately refuses ambiguous retry behavior.
+If a deployment or recovery has an unresolved marker, follow the recovery procedure — `deployctl recovery resolve` ([cli-v1.md](cli-v1.md)) — rather than repeatedly invoking deploy/rollback. The toolkit deliberately refuses ambiguous retries.
 
 ---
 
 ## 17. First deployment checklist
 
-The first deployment usually requires more preparation than later releases.
+The first deployment usually requires more preparation than later releases. Before promoting the first real release, confirm:
 
-Before promoting the first real release, confirm:
+- the target is bootstrapped and reachable — the full checklist is in [bootstrap-ssh-target.md](bootstrap-ssh-target.md);
+- target-owned application configuration and secrets exist outside immutable release trees;
+- the caller workflow has the required GitHub secrets and permission floor;
+- source-SHA discovery-tagged artifacts are published;
+- release migration semantics are decided;
+- the project's `verify` hook can prove the first deployment;
+- the environment points at its documented bootstrap sentinel.
 
-- target exists and is reachable;
-- deployment user and deploy root are ready;
-- SSH host key is pinned;
-- caller workflow has the required GitHub secrets;
-- target-owned application configuration exists;
-- registry login exists if artifacts are private;
-- source-SHA artifacts are published;
-- release migration semantics are known;
-- project verify hook can prove the first deployment;
-- environment currently points at its documented bootstrap state/sentinel.
-
-Project-specific bootstrap tasks belong in the consuming repository's documentation.
-
-Examples include:
-
-```text
-creating an identity-provider tenant
-provisioning DNS credentials
-creating a database
-configuring email
-creating application users
-loading TLS/DNS provider credentials
-bootstrapping object storage
-```
-
-Deploy Toolkit should not absorb these project-specific concerns.
+Project-specific bootstrap tasks — creating identity tenants, DNS records, databases, application users, provider credentials, and similar — belong in the consuming repository's documentation. Deploy Toolkit does not absorb them.
 
 ---
 
 ## 18. Routine release flow after bootstrap
 
-Once the first rehearsal is complete, the normal path should be short:
+Once the first rehearsal is complete, the normal path is short:
 
 ```text
 1. merge application change to trusted main
@@ -705,40 +469,41 @@ deployctl promotion check \
   --repo-dir .
 ```
 
+Deploy directly from a repository checkout (the reusable workflow instead runs the prepare/deploy-prepared trust split):
+
+```bash
+deployctl deploy <environment> --repo-dir .
+```
+
 Inspect target state:
 
 ```bash
-deployctl status <environment> --repo-dir .
+deployctl status <environment> --repo-dir . [--json]
 ```
 
-Machine-readable status:
+Emergency rollback (typed confirmation required):
 
 ```bash
-deployctl status <environment> --repo-dir . --json
-```
-
-Emergency rollback:
-
-```bash
-deployctl rollback <environment> --to <version>
+deployctl rollback <environment> --to <version> \
+  --confirm "rollback <environment> to <version>"
 ```
 
 ---
 
 ## Related documentation
 
-Use this document as the practical operator path. For exact guarantees and deeper semantics, see:
+Use this document as the practical operator path. Exact semantics are owned by:
 
 ```text
-README.md
 docs/consumer-contract-v1.md
+docs/cli-v1.md
 docs/release-lifecycle.md
 docs/promotion-diff-policy.md
 docs/prepared-artifact-v1.md
-docs/target-prerequisites.md
 docs/target-state.md
-docs/cli-v1.md
+docs/target-prerequisites.md
+docs/bootstrap-ssh-target.md
 docs/trust-model.md
 ```
 
-The operator workflow should stay short and project-neutral; project-specific deployment instructions belong in the consuming repository.
+Project-specific deployment instructions belong in the consuming repository.
