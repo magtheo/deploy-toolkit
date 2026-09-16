@@ -72,6 +72,7 @@ Usage:
   deployctl release create [flags]           run eligibility and create an immutable release manifest
   deployctl promotion propose <env> [flags]  open the human-authorization PR for a release
   deployctl promotion check [flags]          verify a promotion diff against the Promotion Diff Policy
+  deployctl promotion classify [flags]       classify a transition: PROMOTION, ORDINARY, INVALID or ERROR
   deployctl deploy <env> [flags]             deploy the release the environment pins
   deployctl prepare <env> [flags]            build the immutable prepared deployment artifact (no target access)
   deployctl deploy-prepared [flags]          deploy a prepared artifact (no source checkout, target credential only)
@@ -226,7 +227,7 @@ func runValidate(paths []string, stdout, stderr io.Writer) int {
 
 func runPromotion(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, `usage: deployctl promotion propose <env> [flags] | promotion check [flags]`)
+		fmt.Fprintln(stderr, `usage: deployctl promotion propose <env> [flags] | promotion check [flags] | promotion classify [flags]`)
 		return 2
 	}
 	token := os.Getenv("GITHUB_TOKEN")
@@ -240,6 +241,8 @@ func runPromotion(args []string, stdout, stderr io.Writer) int {
 		return runPromotionPropose(ctx, args[1:], token, stdout, stderr)
 	case "check":
 		return runPromotionCheck(ctx, args[1:], token, stdout, stderr)
+	case "classify":
+		return runPromotionClassify(ctx, args[1:], token, stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "deployctl promotion: unknown subcommand %q\n", args[0])
 		return 2
@@ -331,6 +334,68 @@ func runPromotionCheck(ctx context.Context, args []string, token string, stdout,
 	}
 	fmt.Fprintln(stdout, "✓ promotion diff policy satisfied")
 	return 0
+}
+
+func parseClassifyArgs(args []string) (*promotion.ClassifyInput, bool, error) {
+	fs := flag.NewFlagSet("promotion classify", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var (
+		repo    = fs.String("repo", "", "source repository owner/name")
+		mode    = fs.String("mode", "", "transition kind: pr (trusted base → PR head) or push (push.before → push.after)")
+		base    = fs.String("base", "", "pr: trusted base SHA; push: push.before SHA")
+		head    = fs.String("head", "", "pr: PR head SHA; push: push.after SHA")
+		repoDir = fs.String("repo-dir", "", "checkout containing the release source revision (required for new-release evidence)")
+		jsonOut = fs.Bool("json", false, "emit one classify result object on stdout (non-contract; consumed by the promotion workflow)")
+	)
+	if err := fs.Parse(args); err != nil {
+		return nil, false, err
+	}
+	return &promotion.ClassifyInput{
+		Repo:    *repo,
+		Mode:    promotion.Mode(*mode),
+		Base:    *base,
+		Head:    *head,
+		RepoDir: *repoDir,
+	}, *jsonOut, nil
+}
+
+// runPromotionClassify reports the classification. Exit codes follow the
+// deployctl operational convention: 0 determined yes (PROMOTION), 1
+// determined no (ORDINARY, INVALID — the classification value in the output
+// distinguishes them), 2 usage, 3 infrastructure (ERROR). The classification
+// itself is the decision surface, never the exit code alone.
+func runPromotionClassify(ctx context.Context, args []string, token string, stdout, stderr io.Writer) int {
+	in, jsonMode, err := parseClassifyArgs(args)
+	if err != nil {
+		fmt.Fprintf(stderr, "%v\n", err)
+		return 2
+	}
+	res, err := promotion.Classify(ctx, *in, gh.New(token), oci.NewRemote(authn.DefaultKeychain), bundle.NewBuilder(in.RepoDir))
+	if err != nil {
+		fmt.Fprintf(stderr, "✗ promotion classify: %v\n", err)
+		return 2
+	}
+	if jsonMode {
+		fmt.Fprintf(stdout, "{\"classification\":%q,\"promotionOnly\":%t,\"reason\":%q}\n",
+			res.Classification, res.Classification == promotion.ClassificationPromotion, res.Reason)
+	} else {
+		fmt.Fprintf(stdout, "classification: %s\n", res.Classification)
+		fmt.Fprintf(stdout, "reason: %s\n", res.Reason)
+		if res.Environment != "" {
+			fmt.Fprintf(stdout, "transition: %s %s → %s\n", res.Environment, res.From, res.To)
+		}
+		for _, m := range res.Messages {
+			fmt.Fprintf(stdout, "  - %s\n", m)
+		}
+	}
+	switch res.Classification {
+	case promotion.ClassificationPromotion:
+		return 0
+	case promotion.ClassificationError:
+		return 3
+	default:
+		return 1
+	}
 }
 
 func shortSHA(sha string) string {

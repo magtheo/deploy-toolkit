@@ -75,9 +75,51 @@ func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resol
 	if err != nil {
 		return nil, err
 	}
-	changed := treeDiff(baseLeaves, headLeaves)
 
-	trustedProjectBytes, err := src.FileAt(ctx, in.Repo, release.ProjectPath, liveHead)
+	out, err := evaluatePolicy(ctx, policyInput{Repo: in.Repo, Base: in.Base, Head: in.Head, RepoDir: in.RepoDir},
+		diffTrees{baseLeaves: baseLeaves, headLeaves: headLeaves}, src, resolver, bundler)
+	if err != nil {
+		return nil, err
+	}
+	if out.Passed {
+		out.Messages = append(out.Messages, "promotion diff policy satisfied")
+	}
+	return out, nil
+}
+
+// policyInput carries the identities evaluatePolicy reads content for.
+type policyInput struct {
+	Repo    string
+	Base    string
+	Head    string
+	RepoDir string
+}
+
+// diffTrees holds the complete Git-tree leaf sets of the two sides of a
+// transition. An empty leaf map stands for a zero SHA (branch creation or
+// deletion) — callers that substitute it must say so via zeroTransition.
+type diffTrees struct {
+	baseLeaves     map[string]TreeLeaf
+	headLeaves     map[string]TreeLeaf
+	zeroTransition bool
+}
+
+// evaluatePolicy is the semantic core shared by Check and Classify: the
+// Promotion Diff Policy tree walk plus release-evidence re-verification over
+// one base→head transition. Freshness — CAS, single-commit head, live head,
+// ancestry — is the caller's responsibility and happens before this runs.
+// Infrastructure failures (API, read) return an error; every policy failure
+// is reported in the outcome, never as an error.
+func evaluatePolicy(ctx context.Context, in policyInput, trees diffTrees, src Store, resolver release.Resolver, bundler release.Bundler) (*CheckOutcome, error) {
+	res := &CheckOutcome{Passed: true}
+	fail := func(format string, args ...any) {
+		res.Passed = false
+		res.Messages = append(res.Messages, fmt.Sprintf(format, args...))
+	}
+
+	changed := treeDiff(trees.baseLeaves, trees.headLeaves)
+
+	trustedProjectBytes, err := src.FileAt(ctx, in.Repo, release.ProjectPath, in.Base)
 	if err != nil {
 		fail("trusted %s could not be read from base: %v", release.ProjectPath, err)
 		return res, nil
@@ -130,7 +172,7 @@ func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resol
 		if m == nil {
 			fail("added release file %s does not match canonical naming %s/<project>-<version>.yaml", addedRelease, ReleasesDir)
 		} else {
-			content, err := src.BlobAt(ctx, in.Repo, headLeaves[addedRelease].OID)
+			content, err := src.BlobAt(ctx, in.Repo, trees.headLeaves[addedRelease].OID)
 			if err != nil {
 				return nil, err
 			}
@@ -215,11 +257,11 @@ func Check(ctx context.Context, in CheckInput, src Store, resolver release.Resol
 			fail("spec.release target %q belongs to project %q, not trusted project %q", target, m[1], trusted.Metadata.Name)
 		}
 		if target != addedRelease {
-			if _, ok := baseLeaves[target]; !ok {
+			if _, ok := trees.baseLeaves[target]; !ok {
 				fail("spec.release points at %q which does not exist in the trusted base", target)
 				return res, nil
 			}
-			content, err := src.BlobAt(ctx, in.Repo, baseLeaves[target].OID)
+			content, err := src.BlobAt(ctx, in.Repo, trees.baseLeaves[target].OID)
 			if err != nil {
 				return nil, err
 			}
