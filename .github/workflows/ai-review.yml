@@ -1,0 +1,37 @@
+name: ai-review
+
+# Advisory first-pass review via magtheo/ci-toolkit.
+# Not a required check — the AI layer of the Review Model; humans
+# decide merges.
+#
+# Security posture:
+#   - pull_request_target: the secret-receiving workflow file always
+#     comes from the trusted base branch — a PR cannot rewrite its own
+#     reviewer to exfiltrate the secret. Safe because the reviewer
+#     never checks out or executes PR head (diff fetched as API data).
+#   - secrets mapped EXPLICITLY (never `inherit` — least privilege).
+#   - both layers pinned to the same immutable reviewed ci-toolkit
+#     commit; upgrades are deliberate reviewed changes.
+#   - fork guard is load-bearing policy under pull_request_target.
+
+on:
+  pull_request_target:
+    paths-ignore:
+      # no blanket "**.md" ignore — .ai-review-rubric.md (if this repo
+      # ever adds one) is trusted policy and must be reviewable
+      - "docs/**"
+      - "plans/**"
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  ai-review:
+    if: ${{ !github.event.pull_request.head.repo.fork }}
+    uses: magtheo/ci-toolkit/.github/workflows/ai-review.yml@e59239f485fd2d4d3ef3a2647b791c53cb3a5963
+    with:
+      toolkit_ref: e59239f485fd2d4d3ef3a2647b791c53cb3a5963
+      model: z-ai/glm-5.3-flash
+    secrets:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
