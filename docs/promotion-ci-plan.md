@@ -253,7 +253,6 @@ spec.release + unrelated file              → INVALID
 malformed release addition + spec.release  → INVALID
 valid release + spec.release only          → PROMOTION
 environment-only flip to existing release  → PROMOTION (rollback class)
-environment-only flip to existing release  → PROMOTION (rollback class)
 ```
 
 ### Classification states and observable mapping

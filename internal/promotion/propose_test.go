@@ -73,6 +73,7 @@ type fakeStore struct {
 	leaves         map[string]map[string]TreeLeaf
 	parents        map[string][]string
 	runs           []release.CheckRun
+	runsErr        error
 	anc            bool
 	blobs          map[string][]byte
 	branches       map[string]bool
@@ -147,6 +148,9 @@ func (f *fakeStore) FileAtOptional(ctx context.Context, repo, path, ref string) 
 	return b, true, nil
 }
 func (f *fakeStore) CheckRuns(ctx context.Context, repo, ref string) ([]release.CheckRun, error) {
+	if f.runsErr != nil {
+		return nil, f.runsErr
+	}
 	return f.runs, nil
 }
 func (f *fakeStore) CommitParents(ctx context.Context, repo, sha string) ([]string, error) {
@@ -675,12 +679,31 @@ func TestCheckDiffPolicy(t *testing.T) {
 			t.Errorf("expected pass, got: %v", outcome.Messages)
 		}
 	})
+	t.Run("added release with rollback to existing rejected", func(t *testing.T) {
+		// Adds a fully valid release X while flipping the environment to an
+		// existing older release: both halves validate in isolation, but the
+		// promotion adds X without promoting it — seeding X into trusted
+		// main without authorization. The transition must be rejected.
+		bundler, store, res, dir := checkFixture(t)
+		midRel := ".deploy/releases/my-app-0.0.95.yaml"
+		store.trees[checkBaseSHA][midRel] = "midrelblob"
+		store.trees[headSHA][midRel] = "midrelblob"
+		store.blobs["midrelblob"] = []byte(strings.Replace(string(validOldRelease()), "version: 0.0.9", "version: 0.0.95", 1))
+		store.files[headSHA][envPathConst] = envDoc(midRel)
+		store.blobs["envblob-head"] = envDoc(midRel)
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !contains("must be the promotion target", outcome.Messages) {
+			t.Errorf("outcome = %+v", outcome)
+		}
+	})
 	t.Run("env only pointing at foreign project rejected", func(t *testing.T) {
 		_, store, _, _ := checkFixture(t)
 		store.trees[headSHA] = map[string]string{
 			release.ProjectPath: "pblob",
 			envPathConst:        "envblob-head",
-			relPathConst:        "relblob",
 		}
 		store.files[headSHA][envPathConst] = envDoc(".deploy/releases/other-9.9.9.yaml")
 		store.blobs["envblob-head"] = envDoc(".deploy/releases/other-9.9.9.yaml")
@@ -689,6 +712,43 @@ func TestCheckDiffPolicy(t *testing.T) {
 			t.Fatal(err)
 		}
 		if outcome.Passed || !strings.Contains(strings.Join(outcome.Messages, "; "), "belongs to project") {
+			t.Errorf("outcome = %+v", outcome)
+		}
+	})
+}
+
+// TestCheckInfraFailuresAreErrors pins Check's contract under the typed
+// ERROR/INVALID split: infrastructure failures inside the shared core
+// (trusted-state reads, check-runs API) surface as errors — the gate still
+// fails, exit code 1, with the reason text preserved — while candidate
+// verdicts such as a failed required check remain Passed=false outcomes.
+func TestCheckInfraFailuresAreErrors(t *testing.T) {
+	t.Run("trusted project read failure is an error", func(t *testing.T) {
+		_, store, _, _ := checkFixture(t)
+		store.fileAtErr = fmt.Errorf("500 internal error")
+		_, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA}, store, nil, nil)
+		if err == nil || !strings.Contains(err.Error(), "could not be read from base") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("check-runs API failure is an error", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		store.runsErr = fmt.Errorf("502 bad gateway")
+		_, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err == nil || !strings.Contains(err.Error(), "502 bad gateway") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("failed required check stays a policy verdict", func(t *testing.T) {
+		bundler, store, res, dir := checkFixture(t)
+		store.runs = []release.CheckRun{
+			{ID: 3, Name: "Tests", Status: "completed", Conclusion: "failure", AppID: 1, SuiteID: 10, StartedAt: baseTime()},
+		}
+		outcome, err := Check(context.Background(), CheckInput{Repo: "example/my-app", Base: checkBaseSHA, Head: headSHA, RepoDir: dir}, store, res, bundler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if outcome.Passed || !contains("not eligible under current policy", outcome.Messages) {
 			t.Errorf("outcome = %+v", outcome)
 		}
 	})
@@ -756,14 +816,18 @@ func TestProposeIdempotentRefusesDifferentTransition(t *testing.T) {
 		t.Fatal(err)
 	}
 	wireVerifiedProposal(store, relBytes)
-	altRel := strings.Replace(string(validOldRelease()), `version: 0.0.9`, `version: 0.2.0`, 1)
-	store.trees[checkBaseSHA][relPathConst+".placeholder"] = "x"
-	delete(store.trees[checkBaseSHA], relPathConst+".placeholder")
-	store.trees[checkBaseSHA][".deploy/releases/my-app-0.2.0.yaml"] = "rel020"
-	store.blobs["rel020"] = []byte(altRel)
-	store.trees[headSHA][".deploy/releases/my-app-0.2.0.yaml"] = "rel020"
-	store.blobs["envblob-head"] = envDoc(".deploy/releases/my-app-0.2.0.yaml")
-	store.files[headSHA][envPathConst] = envDoc(".deploy/releases/my-app-0.2.0.yaml")
+	_ = res
+	// The existing branch must verify cleanly (so the refusal comes from
+	// the transition comparison, not the diff policy): it rolls the
+	// environment to an existing release instead of promoting 0.1.0, and
+	// adds no release file.
+	midRel := ".deploy/releases/my-app-0.0.95.yaml"
+	store.trees[checkBaseSHA][midRel] = "midrelblob"
+	store.trees[headSHA][midRel] = "midrelblob"
+	store.blobs["midrelblob"] = []byte(strings.Replace(string(validOldRelease()), "version: 0.0.9", "version: 0.0.95", 1))
+	delete(store.trees[headSHA], relPathConst)
+	store.files[headSHA][envPathConst] = envDoc(midRel)
+	store.blobs["envblob-head"] = envDoc(midRel)
 
 	_, err = Propose(context.Background(), ProposeInput{
 		Repo: "example/my-app", Environment: "production", ReleasePath: releasePath, RepoDir: ".",

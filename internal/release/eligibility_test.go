@@ -68,3 +68,22 @@ func TestCheckEligibilityUnconcludedFailsClosed(t *testing.T) {
 		t.Error("unconcluded check must fail closed")
 	}
 }
+
+// TestCheckEligibilitySkippedFailsClosed pins the promotion-aware CI
+// asymmetry (docs/promotion-ci-plan.md): GitHub branch protection accepts
+// conclusion "skipped" for required checks, but eligibility accepts only
+// "success" — so a promotion merge commit whose qualification jobs were
+// skipped can never masquerade as a qualified source revision.
+func TestCheckEligibilitySkippedFailsClosed(t *testing.T) {
+	t0 := baseTime()
+	runs := []CheckRun{{ID: 1, Name: "Tests", Status: "completed", Conclusion: "skipped", AppID: 1, SuiteID: 10, StartedAt: t0}}
+	if _, err := checkEligibility([]string{"Tests"}, runs); err == nil {
+		t.Fatal("skipped check must fail closed: skipped satisfies branch protection but is not qualification")
+	} else if !strings.Contains(err.Error(), "only success is eligible") {
+		t.Errorf("wrong error: %v", err)
+	}
+	neutral := []CheckRun{{ID: 1, Name: "Tests", Status: "completed", Conclusion: "neutral", AppID: 1, SuiteID: 10, StartedAt: t0}}
+	if _, err := checkEligibility([]string{"Tests"}, neutral); err == nil {
+		t.Error("neutral check must fail closed")
+	}
+}
