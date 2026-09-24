@@ -147,6 +147,16 @@ func TestWorkflowTrustSplit(t *testing.T) {
 	if !strings.Contains(prepareText, "actions/checkout@") {
 		t.Error("prepare job must check out the consumer repository (repository authority lives here)")
 	}
+	consumerCheckout := checkoutBlockContainingCheckout(prepareText)
+	if consumerCheckout == "" {
+		t.Fatal("no consumer checkout step found in prepare")
+	}
+	if !strings.Contains(consumerCheckout, "fetch-depth: 0") {
+		t.Error("consumer checkout must set fetch-depth: 0 — the release pins a revision older than the promotion merge, so a depth-1 checkout can never resolve it")
+	}
+	if !strings.Contains(consumerCheckout, "persist-credentials: false") {
+		t.Error("consumer checkout must set persist-credentials: false")
+	}
 	if strings.Contains(prepareText, "secrets.") {
 		t.Error("prepare job must not reference any secret — it runs with zero target credential")
 	}
@@ -176,10 +186,7 @@ func TestWorkflowTrustSplit(t *testing.T) {
 // references ("" when default — i.e. the invoking consumer repository).
 func checkoutRepos(job string) []string {
 	var refs []string
-	for _, b := range strings.Split(job, "- name:") {
-		if !strings.Contains(b, "actions/checkout@") {
-			continue
-		}
+	for _, b := range checkoutBlocks(job) {
 		if m := regexp.MustCompile(`repository:[ \t]+(.+)`).FindStringSubmatch(b); m != nil {
 			refs = append(refs, m[1])
 		} else {
@@ -187,6 +194,25 @@ func checkoutRepos(job string) []string {
 		}
 	}
 	return refs
+}
+
+// checkoutBlockContainingCheckout returns the step block of a job that
+// invokes actions/checkout@ ("" when none).
+func checkoutBlockContainingCheckout(job string) string {
+	for _, b := range checkoutBlocks(job) {
+		return b
+	}
+	return ""
+}
+
+func checkoutBlocks(job string) []string {
+	var blocks []string
+	for _, b := range strings.Split(job, "- name:") {
+		if strings.Contains(b, "actions/checkout@") {
+			blocks = append(blocks, b)
+		}
+	}
+	return blocks
 }
 
 // Every action is pinned by a full 40-hex commit SHA, the toolkit is
