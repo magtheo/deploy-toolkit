@@ -107,10 +107,19 @@ jobs:
             *) echo "::error::invoke this workflow pinned to a full 40-hex commit SHA (uses: ...@<full-sha>); a floating ref is not a trust anchor"; exit 1 ;;
           esac
 
-      - name: Check out the consumer repository at the promoted commit
+      - name: Check out the consumer repository with full history
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
           persist-credentials: false
+          # prepare must read the PROMOTED revision's tree (release
+          # bundle, deployment contract) — the revision the release
+          # manifest pins, which by construction is older than the
+          # caller's tip: the promotion merge itself lands after the
+          # release was cut. A shallow (depth-1) checkout cannot resolve
+          # it and `git cat-file <rev>:<path>` fails with "path exists
+          # on disk, but not in '<rev>'". Full history is required to
+          # honor invariant #2 (deploy revision X from X's own tree).
+          fetch-depth: 0
 
       - name: Check out exactly the toolkit commit running this workflow
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
