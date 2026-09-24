@@ -61,6 +61,13 @@ func New(ctx context.Context, cfg Config) (*Transport, error) {
 		conn, chans, reqs, err := gossh.NewClientConn(transportConn, net.JoinHostPort(cfg.Host, fmt.Sprint(port)), &gossh.ClientConfig{
 			User: cfg.User,
 			Auth: []gossh.AuthMethod{gossh.PublicKeys(cfg.Signer)},
+			// The pin is the trust anchor, so negotiation must target the
+			// pinned key's own type: left to its default preference the
+			// client may agree on a different algorithm (e.g. ecdsa) and
+			// then fail the pin check against the pinned key (ed25519)
+			// with a spurious "host key mismatch" — even though the pinned
+			// key is present and correct on the server.
+			HostKeyAlgorithms: []string{cfg.HostKey.Type()},
 			HostKeyCallback: func(hostname string, remote net.Addr, key gossh.PublicKey) error {
 				if !keysEqual(key, cfg.HostKey) {
 					return fmt.Errorf("ssh: host key mismatch for %s: got %s, pinned %s", hostname, gossh.FingerprintSHA256(key), gossh.FingerprintSHA256(cfg.HostKey))
