@@ -232,6 +232,10 @@ jobs:
         env:
           DEPLOYCTL_CODE: ${{ steps.deployctl.outputs.code }}
         run: |
+          # Machine result to stderr as well: job summaries are web-only
+          # (no API), so failed deployments were invisible to log-based
+          # debugging. stderr lands in the regular job log.
+          cat result.json >&2 || true
           {
             echo '### deployctl.result/v1'
             echo ''
