@@ -220,6 +220,7 @@ func runDeployPrepared(ctx context.Context, args []string, stdout, stderr io.Wri
 	env, _ := deployResult(rep, derr)
 	env.Data.(*deployResultData).Invocation = invocationPrepared
 	if jsonMode {
+		emitFailedStageDiagnostics(rep, stderr)
 		return emitJSON(stdout, env)
 	}
 	return reportDeploy(rep, derr, stdout, stderr)

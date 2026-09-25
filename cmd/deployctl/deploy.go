@@ -105,6 +105,7 @@ func runDeploy(ctx context.Context, args []string, stdout, stderr io.Writer) int
 	})
 	if jsonMode {
 		env, _ := deployResult(rep, err)
+		emitFailedStageDiagnostics(rep, stderr)
 		return emitJSON(stdout, env)
 	}
 	return reportDeploy(rep, err, humanOut, stderr)

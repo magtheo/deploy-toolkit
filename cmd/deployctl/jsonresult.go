@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -95,6 +96,31 @@ func stageOutcomes(stages []lifecycle.StageResult) []stageOutcome {
 		out = append(out, so)
 	}
 	return out
+}
+
+// emitFailedStageDiagnostics writes the captured output of failed
+// lifecycle hooks to stderr in JSON mode. The result document on stdout
+// deliberately carries stage statuses but never raw hook output (it may
+// contain secret-adjacent material), and stdout must stay a single pure
+// JSON document — so the diagnostics have nowhere to go but stderr.
+// Without this, JSON-mode failures report "migrate failed" with exit 1
+// and no way to see WHY from the machine-readable surfaces.
+func emitFailedStageDiagnostics(rep *lifecycle.Report, stderr io.Writer) {
+	if rep == nil {
+		return
+	}
+	for _, s := range rep.Stages {
+		if !s.Failed || s.Skipped || s.InfraError {
+			continue
+		}
+		fmt.Fprintf(stderr, "deployctl: hook %q failed with exit %d; captured output follows\n", s.Name, s.ExitCode)
+		if out := strings.TrimSpace(string(s.Stdout)); out != "" {
+			fmt.Fprintf(stderr, "--- hook %q stdout ---\n%s\n", s.Name, out)
+		}
+		if errOut := strings.TrimSpace(string(s.Stderr)); errOut != "" {
+			fmt.Fprintf(stderr, "--- hook %q stderr ---\n%s\n", s.Name, errOut)
+		}
+	}
 }
 
 func emitJSON(stdout io.Writer, env *resultEnvelope) int {
