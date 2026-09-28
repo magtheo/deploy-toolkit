@@ -307,7 +307,7 @@ The deployment exposes a single `deployctl.result/v1` document. The document —
 
 A normal successful deployment ends with observed state matching the promoted release.
 
-Query target state directly with:
+Classify the target with:
 
 ```bash
 deployctl status <environment> --repo-dir .
@@ -319,11 +319,107 @@ or, machine-readable:
 deployctl status <environment> --repo-dir . --json
 ```
 
+If the result was not a success, continue with §13 — do not start by inspecting the target by hand.
+
 ---
 
 ## 13. When a deployment fails
 
-Two different questions, never collapsed into one:
+Failure handling has a deliberate order of operations:
+
+```text
+the toolkit classifies  →  the operator gathers application-specific evidence
+                           where the toolkit cannot know  →  the toolkit
+                           performs recovery/resolution
+```
+
+Keeping that order is what prevents an incident from improvising a second, worse deployment control plane.
+
+> **Operator rule**
+>
+> Start deployment failure investigation with `deployctl.result/v1` and `deployctl status <environment> --json`.
+>
+> Treat direct target inspection as **application-specific evidence gathering, not state management**.
+>
+> If consequential work may have executed, do not blindly retry the deployment and do not delete toolkit-owned evidence. Establish a target condition compatible with the next action, then use the documented recovery/resolution path.
+
+### 13.1 Start with the deployment result
+
+The complete `deployctl.result/v1` document — never the process exit code alone — is the first failure evidence surface. Exit codes are broad process categories so a supervisor can route; decisions come from the document ([cli-v1.md](cli-v1.md)).
+
+Read at least:
+
+```text
+outcome                 success | failure | refused | uncertain |
+                        infrastructure-failure | usage-error
+safeToRetry             whether re-running the SAME operation can succeed as-is
+recoveryRequired        the toolkit's authoritative conclusion that recovery
+                        or resolution is currently required
+data.consequentialStarted              the durable attempt marker was written
+data.attemptId / data.recoveryId       the boundary identity needed for recovery
+stages[]                per-lifecycle-stage outcomes
+lockReleaseFailed / stagingLockReleaseFailed / data.lockRetained
+                        lock facts, when present
+```
+
+The result answers the first question:
+
+```text
+did the operation fail BEFORE consequential execution,
+or is there target-state uncertainty that requires recovery/resolution?
+```
+
+Note that `recoveryRequired` is a classification, not a marker-presence flag: `false` does not imply marker absence — a `locked` or `degraded` target can report marker facts without requiring recovery ([cli-v1.md](cli-v1.md)).
+
+### 13.2 Classify with `deployctl status` before reconstructing anything by hand
+
+The normal next command is:
+
+```bash
+deployctl status <environment> --repo-dir . --json
+```
+
+Its structured result is the **deployment-control-plane classification** of the target — desired release, observed release, observed bundle digest, environment lock state, unresolved deployment attempt, unresolved recovery, unreadable/degraded evidence:
+
+```text
+healthy | out-of-date | drift | not-deployed | locked | recovery-required | degraded
+```
+
+Do not normally reconstruct these relationships by manually reading files under `<deployRoot>` — that is what `status` is for. In particular, `degraded` means durable evidence exists but is unreadable and claims nothing else; a healthier state must never be reconstructed by inference from partial reads.
+
+### 13.3 Branch on the classification
+
+```text
+deployment fails
+      |
+      v
+inspect deployctl.result/v1
+      |
+      v
+deployctl status <environment> --repo-dir . --json
+      |
+      +-- safeToRetry == true
+      |       repair the stated pre-execution / infrastructure cause,
+      |       then rerun the operation
+      |
+      +-- recoveryRequired == true
+      |       STOP normal deploy/retry
+      |       gather application-specific evidence (13.4)
+      |       establish a target condition compatible with the next action
+      |       use documented rollback / recovery resolve (13.6)
+      |       run deployctl status again (13.7)
+      |
+      +-- state == locked
+      |       do not recover, do not remove markers
+      |       an operation may still be executing — establish whether it is
+      |       (see 13.5 for the exceptional retained-lock remedy)
+      |
+      +-- state == degraded
+              repair access/evidence first
+              do not infer a safe state manually
+```
+
+The exact precedence between these states is owned by [cli-v1.md](cli-v1.md) and [target-state.md](target-state.md); this section summarizes that contract, it does not redefine it. The two underlying questions remain distinct:
 
 ```text
 consequential work started?  → target-state risk (attempt/recovery marker; recoveryRequired)
@@ -332,9 +428,122 @@ safeToRetry                  → whether re-running the SAME operation can succe
 
 - **Nothing consequential ran** (for example, the target was unreachable before execution): `safeToRetry: true` — fix the cause and re-run.
 - **Refused before target contact** — policy gates, invalid evidence, prepared-material verification failures: `outcome: refused`, `safeToRetry: false`. Nothing was contacted or executed, but re-running the same bytes and inputs cannot succeed; fix the material or the state, then re-run.
-- **Consequential work started and the outcome is not safely known**: an attempt marker exists, `recoveryRequired: true`, `safeToRetry: false`. Normal deployment refuses to re-run into an unknown target state — inspect the target and follow the documented recovery path instead of retrying.
+- **Consequential work started and the outcome is not safely known**: an attempt marker exists, `recoveryRequired: true`, `safeToRetry: false`. This includes *determined* hook failures after the boundary — a migration can partially mutate state and then exit 1, so a known failure is not a safe repeat. Normal deployment refuses to re-run into an unknown target state; never infer retry safety merely from "the target looks unchanged."
 
-Never infer retry safety merely from "the target looks unchanged." The complete outcome and retry taxonomy is [cli-v1.md](cli-v1.md); the marker model is [target-state.md](target-state.md).
+### 13.4 Direct target inspection is evidence gathering, not state management
+
+Direct target inspection is appropriate when Deploy Toolkit requires the operator to establish application-specific reality that the toolkit cannot know — for example application health, the artifact/digest actually running, or the state migrations reached.
+
+These checks are **evidence gathering**. They do not replace `deployctl status`, and they must not be used to mutate toolkit-owned deployment state.
+
+The concrete procedures are consumer-specific — container/process inspection, systemd units, application logs, database migration queries, HTTP health checks, reverse-proxy/TLS state, application-specific configuration — and belong in the consuming repository's deployment/recovery documentation, not here. Deploy Toolkit describes **when and why** such checks are needed, never their application-specific implementation.
+
+### 13.5 Do not hand-edit toolkit-owned state
+
+Toolkit-owned deployment evidence is **not** a normal manual recovery interface:
+
+```text
+<deployRoot>/<project>/state/<env>.json
+<deployRoot>/<project>/attempts/<env>.json
+<deployRoot>/<project>/recoveries/<env>.json
+<deployRoot>/<project>/history/<env>.jsonl
+```
+
+In particular, this is **not** a recovery pattern:
+
+```text
+deployment failed
+→ SSH to target
+→ delete attempt marker
+→ retry deployment
+```
+
+The supported shape is:
+
+```text
+deployment failed
+→ inspect result/status
+→ establish actual target condition
+→ use the supported recovery/resolution mechanism
+→ inspect status again
+→ begin a fresh operation
+```
+
+Manual filesystem intervention remains appropriate **only** in the exceptional cases the contracts themselves define — and these stay distinct from attempt/recovery resolution:
+
+```text
+deliberately retained environment lock (data.lockRetained: true)
+    → verify by hand that nothing is still executing
+    → remove the environment lock by hand
+    → resolve the attempt/recovery marker if one exists
+    (docs/cli-v1.md, "lockRetained")
+
+a lock whose release failed (lockReleaseFailed: true)
+    → the environment stays locked until manual cleanup
+    (docs/cli-v1.md)
+
+crashed staging lock (.staging/<version>) or an interrupted stage
+directory without its .staged.json marker
+    → remove by hand; the fail-closed refusal keeps it from
+    masquerading as a complete release
+    (docs/target-state.md, docs/cli-v1.md)
+```
+
+Everything else waits for the supported mechanisms.
+
+### 13.6 Recovery resolution — the supported boundary
+
+When the classification is `recovery-required`, resolution is explicit:
+
+```bash
+deployctl recovery resolve <environment> [recovery <id>] [attempt <id>] \
+  --confirm "resolve <environment> [recovery <id>] [attempt <id>]"
+```
+
+`recovery resolve` does **not** run hooks, repair the application, prove that the failed deployment completed, or make an unknown target state trustworthy. It records that the operator has **independently established** a target condition compatible with the next action and explicitly authorizes removal of the named blocking evidence ([target-state.md](target-state.md)). "The app responds" is not sufficient inspection: the target must be understood to be in a condition compatible with the next action — typically manually restored to, and verified against, the known observed release.
+
+```text
+recovery-required
+      |
+      v
+inspect application-specific reality (13.4)
+      |
+      v
+establish a compatible/safe target condition
+      |
+      v
+deployctl recovery resolve ...
+      |
+      v
+deployctl status <environment> --repo-dir . --json
+      |
+      v
+fresh deployment/recovery operation
+```
+
+Resolution itself refuses on a genuinely held lock, unreadable evidence, or identity mismatch with the markers on the target; the result document reports what was authorized and what physically remains (`resolved*` / `left*` / `remaining*` — [cli-v1.md](cli-v1.md)).
+
+### 13.7 Close the loop with `status`
+
+After recovery, marker resolution, or an exceptional manual lock cleanup, rerun:
+
+```bash
+deployctl status <environment> --repo-dir . --json
+```
+
+before starting the next deployment operation. The consistent cycle is:
+
+```text
+toolkit classification
+        ↓
+application-specific evidence gathering
+        ↓
+toolkit recovery/resolution
+        ↓
+toolkit classification
+        ↓
+fresh operation
+```
 
 ---
 
@@ -371,7 +580,7 @@ deployctl rollback <environment> --to <version> \
 
 Emergency rollback records its authority in deployment history and leaves Git desired state drifted until reconciled ([release-lifecycle.md](release-lifecycle.md)).
 
-If a deployment or recovery has an unresolved marker, follow the recovery procedure — `deployctl recovery resolve` ([cli-v1.md](cli-v1.md)) — rather than repeatedly invoking deploy/rollback. The toolkit deliberately refuses ambiguous retries.
+If a deployment or recovery has an unresolved marker, follow the failure-investigation workflow (§13) — including `deployctl recovery resolve` ([cli-v1.md](cli-v1.md)) — rather than repeatedly invoking deploy/rollback. The toolkit deliberately refuses ambiguous retries.
 
 ---
 
@@ -430,6 +639,8 @@ what network/DNS/TLS configuration it needs
 what runtime is installed
 how infrastructure is provisioned
 ```
+
+The consumer's documentation also owns the **application-specific failure-evidence procedures** — how to identify the running artifact and verify its digest/version, check application health, establish migration state, and inspect service/process/container logs, proxy/TLS state, and application-specific configuration. Deploy Toolkit's failure workflow (§13) treats these as evidence gathering; it deliberately does not prescribe them.
 
 This keeps Deploy Toolkit usable across unrelated projects.
 
