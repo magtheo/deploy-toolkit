@@ -398,9 +398,14 @@ inspect deployctl.result/v1
       v
 deployctl status <environment> --repo-dir . --json
       |
-      +-- safeToRetry == true
-      |       repair the stated pre-execution / infrastructure cause,
-      |       then rerun the operation
+      +-- state == degraded
+      |       repair access/evidence first
+      |       do not infer a safe state manually
+      |
+      +-- state == locked
+      |       do not recover, do not remove markers
+      |       an operation may still be executing — establish whether it is
+      |       (see 13.5 for the exceptional retained-lock remedy)
       |
       +-- recoveryRequired == true
       |       STOP normal deploy/retry
@@ -409,15 +414,13 @@ deployctl status <environment> --repo-dir . --json
       |       use documented rollback / recovery resolve (13.6)
       |       run deployctl status again (13.7)
       |
-      +-- state == locked
-      |       do not recover, do not remove markers
-      |       an operation may still be executing — establish whether it is
-      |       (see 13.5 for the exceptional retained-lock remedy)
-      |
-      +-- state == degraded
-              repair access/evidence first
-              do not infer a safe state manually
+      +-- safeToRetry == true
+              repair the stated pre-execution / infrastructure (or cleanup)
+              problem, confirm status reports no higher-priority state,
+              then rerun the operation
 ```
+
+**Precedence.** The blocking states are listed first deliberately: `degraded` and `locked` status, and explicit lock-release failure facts (`lockReleaseFailed` / `stagingLockReleaseFailed`), take precedence over acting on `safeToRetry`. Those facts do not change the classification — but they gate acting on it. `safeToRetry: true` is orthogonal to cleanup facts: it means the same operation may be repeated only **after the stated infrastructure/cleanup problem has been repaired** and `deployctl status` no longer reports a higher-priority blocking state (`degraded` → `locked` → `recovery-required` → the normal desired/observed classification). A rerun into a genuinely held lock is refused, not queued.
 
 The exact precedence between these states is owned by [cli-v1.md](cli-v1.md) and [target-state.md](target-state.md); this section summarizes that contract, it does not redefine it. The two underlying questions remain distinct:
 
