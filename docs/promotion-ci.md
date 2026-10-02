@@ -54,17 +54,34 @@ jobs:
     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
   test:                      # every application job, definition unchanged
     needs: classify
-    if: needs.classify.outputs.promotion_only != 'true'
+    if: ${{ !cancelled() && (needs.classify.result != 'success' || needs.classify.outputs.promotion_only != 'true') }}
     ...
   publish:                   # main-only SHA-tagged artifact publication
     needs: classify
-    if: github.event_name == 'push' && needs.classify.outputs.promotion_only != 'true'
+    if: >-
+      ${{
+        !cancelled() && github.event_name == 'push' &&
+        (needs.classify.result != 'success' || needs.classify.outputs.promotion_only != 'true')
+      }}
     ...
 ```
 
-Jobs skipped by `if:` report `Skipped`, which satisfies branch protection
-deterministically. **Never `paths-ignore`:** a whole workflow skipped by
-filters leaves required check contexts pending and blocks merges.
+**The conditions must be status-aware — this is load-bearing.** GitHub
+treats skipped jobs as satisfied required checks, and GitHub skips jobs
+that `need` a failed job unless the condition uses a status function. A
+plain `promotion_only != 'true'` condition would therefore let a
+*machinery-failed* classify job skip application CI entirely while the
+required contexts still report green — a full-CI bypass through
+uncertainty. `!cancelled() && (needs.classify.result != 'success' ||
+promotion_only != 'true')` closes it: **uncertainty means the expensive
+path**, never the skipped path. (`!cancelled()` rather than `always()`
+also honors an explicit cancellation; on cancel the contexts stay
+unsatisfied and the merge stays blocked.)
+
+Jobs skipped by a *successful* classification report `Skipped`, which
+satisfies branch protection deterministically. **Never `paths-ignore`:**
+a whole workflow skipped by filters leaves required check contexts
+pending and blocks merges.
 
 ### `promotion-gate.yml` — authority
 
@@ -101,19 +118,33 @@ classifier. The gate workflow's definition always comes from the base
 branch (`pull_request_target`), so a PR cannot alter the pin, the
 conditions, or the output mapping — and it never checks out the PR head.
 
-## Failure semantics: the classifier reports; it never rules
+## Failure semantics: uncertainty means the expensive path
 
 The reusable workflow **always concludes success and always sets its
 outputs** for reported classifications (`PROMOTION`, `ORDINARY`,
-`INVALID`, `ERROR`). A failing classifier job would silently skip the
-expensive fallback jobs that depend on it — inverting fail-closed. The
-enforcement decision belongs to the gate; the cost decision to the plain
-`!= 'true'` output test.
+`INVALID`, `ERROR`). Only `PROMOTION` routes past the expensive path;
+every other result routes consumer jobs to it via the status-aware
+conditions above, and the gate decides authority. A failing classifier
+job must never be able to skip the expensive fallback jobs that depend on
+it — that failure mode is a full-CI bypass, not a cost defect.
 
 Workflow *machinery* failures (checkout/build errors, unsupported event,
-usage error) fail the run with outputs absent: the `if: always()` gate
-still runs and blocks, and a rerun is required. Classifier *result*
-failures fall back to full CI; machinery failures fail visibly.
+usage error) fail the run with outputs absent: the routing conditions
+still send consumer jobs to the expensive path (`result != 'success'`),
+and the caller's `if: always()` gate still runs and blocks. Machinery
+failures are additionally visible — a red run — and require a rerun for
+their classification to count.
+
+```text
+classifier result:
+    PROMOTION    → expensive path skips
+    anything else → expensive path runs
+
+classifier machinery failure:
+    → expensive path runs (status-aware routing)
+    → authority gate fails/blocks (its result is not success)
+    → red run; rerun required for a classification to count
+```
 
 ## Why the classify jobs differ in trust
 
@@ -139,6 +170,33 @@ bypass, not a cost defect.
 - `pull_request` from forks works: classification only reads (implicit
   read-only token, no PR code executed).
 
+## Operational boundaries (v1)
+
+- **Registry credentials.** The classification workflow holds zero
+  secrets by design. New-release evidence re-verification resolves the
+  release's source-SHA discovery tag from the OCI registry, using the
+  runner's ambient credentials — none, in CI. **v1 promotion CI therefore
+  requires anonymously readable qualification artifacts** (e.g. public
+  GHCR). Consumers with private registries run `promotion check` /
+  `promotion classify` from an operator machine with a configured
+  keychain for the new-release class; environment-only flips (rollbacks)
+  never touch the registry and work everywhere. An optional read-only
+  registry credential would be a consumer-contract change, decided
+  before any freeze — not an implicit gap.
+- **`pull_request_target` policy.** The trusted authority gate depends on
+  the `pull_request_target` event. GitHub is moving to **default
+  enforcement that blocks `pull_request_target` in public repositories**
+  (from November 2, 2026) unless the repository's Actions event policy
+  permits it. Public consumers adopting the canonical gate must
+  explicitly allow the event in their Actions settings; otherwise the
+  gate never runs and required contexts stay pending.
+- **Repository shape.** `repo_dir` selects the consumer repository
+  checkout that holds `.deploy/` (default `.`). v1 requires `.deploy/`
+  at the **Git repository root** — one project per repository; the
+  bundle path and the classifier's tree paths are root-anchored by
+  design. Project-root scoping inside a shared repository is a future
+  contract change, not an undocumented monorepo mode.
+
 ## Deliberate consequences
 
 - **Promotion merge commits are unreleasable.** Their publish jobs skip,
@@ -163,7 +221,8 @@ bypass, not a cost defect.
   toolkit SHA); PR code is never executed.
 - New releases are re-verified against current eligibility evidence in
   every frontend.
-- Ordinary source changes always receive the consumer's full required CI.
+- Ordinary source changes always receive the consumer's full required CI —
+  under every classifier outcome, including machinery failure.
 - Artifact publication remains tied to the exact qualified source revision
   recorded in the immutable release manifest.
 

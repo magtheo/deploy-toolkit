@@ -132,6 +132,10 @@ action_required — fails eligibility. No "probably fine."
   Git-tracked tree at the release revision — see
   [bundle-format-v1.md](bundle-format-v1.md). Leading `/`, backslashes, `.`
   and `..` segments are rejected; `*`/`**` are allowed only as whole segments.
+- `.deploy/` lives at the **Git repository root** in v1 — one project per
+  repository. `repo_dir` on the workflows selects the checkout root
+  holding `.deploy/`, never a project subdirectory inside a shared
+  repository; project-root scoping would be a versioned contract change.
 - OCI `repository`/`image` fields are **untagged repository names**; tags and
   floating references (`latest`) are structurally impossible, releases pin the
   digest separately.
@@ -413,7 +417,7 @@ jobs:
     uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-toolkit-sha>
     with:
       environment: production      # required
-      repo_dir: "."                # monorepo support (optional)
+      repo_dir: "."                # consumer checkout root holding .deploy/ (optional)
       owner: ""                    # audit identity (optional)
     secrets:
       target_host: ${{ secrets.TARGET_HOST }}
@@ -478,17 +482,36 @@ Contract surface:
   `job.workflow_repository@job.workflow_sha`, and the workflow fails
   closed on a floating ref. There is no caller-supplied toolkit ref input.
 - **Inputs** — all optional: `base`, `head` (override the event-derived
-  SHAs), `repo_dir` (monorepos). **Zero secrets** — the implicit
+  SHAs), `repo_dir` (the consumer repository checkout root holding
+  `.deploy/`, default `.` — v1 requires `.deploy/` at the Git repository
+  root, one project per repository). **Zero secrets** — the implicit
   `GITHUB_TOKEN` suffices; classification only reads, so fork PRs work.
+  Consequence: new-release evidence re-verification resolves the
+  source-SHA discovery tag with the runner's ambient registry
+  credentials, so **v1 promotion CI requires anonymously readable
+  qualification artifacts**; private registries use the operator-side
+  `promotion check`/`promotion classify` path, and an optional read-only
+  registry credential would be a versioned contract change.
 - **Events** — `pull_request`/`pull_request_target` classify the PR
   transition; `push` classifies `github.event.before → after` (stale and
   force-pushed transitions never classify as promotions). Any other
-  triggering event is a machinery failure.
+  triggering event is a machinery failure. Note: GitHub's Actions event
+  policy may block `pull_request_target` by default in public
+  repositories (from November 2026) — consumers adopting the gate
+  pattern must permit the event explicitly.
 - **Outputs** — `promotion_only` (`true` only for `PROMOTION`),
   `classification`, `reason` — **always set for reported
   classifications** (`PROMOTION`/`ORDINARY`/`INVALID`/`ERROR`). The
   classifier reports; the caller's gate decides. Only workflow machinery
   failures leave outputs absent and fail the run.
+- **Routing conditions are a consumer obligation.** GitHub skips jobs
+  that `need` a failed job and treats skipped jobs as satisfied required
+  checks; a plain `promotion_only != 'true'` condition would therefore
+  let a machinery-failed classify job skip application CI — a full-CI
+  bypass. Consumer routing conditions **must** be status-aware:
+  `!cancelled() && (needs.classify.result != 'success' ||
+  needs.classify.outputs.promotion_only != 'true')` — uncertainty means
+  the expensive path.
 - **Permissions** — the workflow requests exactly `contents: read` +
   `checks: read`; callers must grant at least that floor.
 - **Consumer code is never executed** — the job hardcodes

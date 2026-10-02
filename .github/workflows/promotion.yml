@@ -13,17 +13,25 @@
 #   INVALID          false            mixed/malformed: full CI AND gate fail
 #   ERROR            false            cannot classify: full CI AND gate fail
 #
-# The classifier REPORTS; the caller's gate decides. Pattern:
+# The classifier REPORTS; the caller's gate decides. Patterns:
 #
-#   # routing (cost) — inside the consumer's own ci.yml:
+#   # routing (cost) — inside the consumer's own ci.yml. The condition
+#   # MUST be status-aware: GitHub treats skipped jobs as satisfied
+#   # required checks, so a plain output test would let a failed classify
+#   # job skip application CI entirely — a full-CI bypass. Uncertainty
+#   # means the expensive path:
 #   classify:
 #     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
 #   test:
 #     needs: classify
-#     if: needs.classify.outputs.promotion_only != 'true'
+#     if: ${{ !cancelled() && (needs.classify.result != 'success' || needs.classify.outputs.promotion_only != 'true') }}
 #   publish:
 #     needs: classify
-#     if: github.event_name == 'push' && needs.classify.outputs.promotion_only != 'true'
+#     if: >-
+#       ${{
+#         !cancelled() && github.event_name == 'push' &&
+#         (needs.classify.result != 'success' || needs.classify.outputs.promotion_only != 'true')
+#       }}
 #
 #   # authority (required check) — caller workflow on pull_request_target:
 #   gate:
@@ -33,43 +41,54 @@
 #
 # Never `paths-ignore`: a whole workflow skipped by filters leaves required
 # checks pending; jobs skipped by `if:` report Skipped, which satisfies
-# branch protection deterministically.
+# branch protection deterministically — which is exactly why the routing
+# conditions above must be status-aware.
 #
 # Trust model:
 #
-#   - PR code is NEVER executed. The consumer checkout is data: the
-#     classifier reads commits, trees and manifests through the GitHub
-#     API, and the new-release evidence path reads only the release's
-#     pinned source revision — a main-qualified SHA — via `git cat-file`.
-#     deployctl is built from job.workflow_repository@job.workflow_sha —
-#     the exact commit of this workflow, the single machinery trust
-#     anchor. There is deliberately no caller-supplied toolkit ref input.
+#   - PR code is NEVER executed. The trusted build is isolated on disk:
+#     the toolkit is checked out into toolkit/ and deployctl is built
+#     (with GOWORK=off, so no parent go.work can redirect dependency
+#     resolution) BEFORE the consumer content is checked out into the
+#     sibling consumer/. The classifier reads commits, trees and
+#     manifests through the GitHub API, and the new-release evidence path
+#     reads only the release's pinned source revision — a main-qualified
+#     SHA — via `git cat-file`. deployctl is built from
+#     job.workflow_repository@job.workflow_sha — the exact commit of this
+#     workflow, the single machinery trust anchor. There is deliberately
+#     no caller-supplied toolkit ref input.
 #   - Zero secrets: the implicit GITHUB_TOKEN (read scopes only) suffices.
-#     Classification from fork PRs works for the same reason.
+#     Classification from fork PRs works for the same reason. Consequence:
+#     OCI evidence re-verification resolves the release's source-SHA
+#     discovery tag with the runner's ambient registry credentials — none,
+#     in CI — so promotion CI requires ANONYMOUSLY READABLE qualification
+#     artifacts. Private registries are an operator-side path (`promotion
+#     check`/`classify` from a machine with a configured keychain); an
+#     optional read-only registry credential would be a contract change.
 #   - runs-on is hardcoded to ubuntu-latest: the never-executes-PR-code
 #     property must not accidentally land on consumer self-hosted runners
 #     with persistent access to deployment material.
 #
-# Failure semantics — "the classifier reports; it never rules":
+# Failure semantics — uncertainty means the expensive path:
 #
 #   - Reported classifications (CLI exit 0 PROMOTION, 1 ORDINARY/INVALID,
-#     3 ERROR) ALWAYS conclude success and ALWAYS set the outputs. A
-#     failing classifier job would silently skip the expensive fallback
-#     jobs that depend on it — inverting fail-closed. The enforcement
-#     decision belongs to the caller's gate job and, for cost, to the
-#     plain `!= 'true'` output test — never to this job's exit code.
-#   - Workflow MACHINERY failures (checkout/build errors, unsupported
-#     event, usage error, unparsable output) fail the run with outputs
-#     absent: the caller's `if: always()` gate still runs and blocks, and
-#     a rerun is required. Classifier result failures fall back to full
-#     CI; machinery failures fail visibly and are retried.
+#     3 ERROR) ALWAYS conclude success and ALWAYS set the outputs. Only
+#     PROMOTION routes past the expensive path — every other result, and
+#     every machinery failure (checkout/build errors, unsupported event,
+#     usage error, unparsable output, which leave outputs absent and fail
+#     the run), routes consumer jobs to the expensive path via the
+#     status-aware conditions above, and the caller's always() gate still
+#     blocks. Machinery failures are additionally visible (red run) and
+#     require a rerun for their classification to count.
 #
 # Events: pull_request and pull_request_target classify the PR transition
 # (base → head, full compare-and-swap rules); push classifies the ref
 # transition (github.event.before → github.event.after; a stale or
 # force-pushed transition never classifies as a promotion). Any other
 # triggering event is a machinery failure. Inputs base/head override the
-# event-derived SHAs for explicit callers; repo_dir supports monorepos.
+# event-derived SHAs for explicit callers; repo_dir selects the consumer
+# repository checkout holding .deploy/ (default ".") — v1 requires
+# .deploy/ at the repository root, one project per repository.
 
 name: Promotion classify
 
@@ -87,7 +106,7 @@ on:
         type: string
         default: ""
       repo_dir:
-        description: Path inside the consumer repository holding .deploy/ (monorepos)
+        description: Consumer repository checkout root holding .deploy/ (default ".")
         required: false
         type: string
         default: "."
@@ -127,15 +146,9 @@ jobs:
             *) echo "::error::invoke this workflow pinned to a full 40-hex commit SHA (uses: ...@<full-sha>); a floating ref is not a trust anchor"; exit 1 ;;
           esac
 
-      - name: Check out the consumer repository with full history (data, never executed)
-        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
-        with:
-          persist-credentials: false
-          # The new-release evidence path reads the release's pinned
-          # source revision — older than the promotion head by
-          # construction — so a depth-1 checkout can never resolve it.
-          fetch-depth: 0
-
+      # Trusted build FIRST, before any PR-controlled content exists on
+      # disk, in a dedicated directory: a parent go.work of the consumer
+      # checkout must never influence dependency resolution.
       - name: Check out exactly the toolkit commit running this workflow
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
         with:
@@ -150,8 +163,20 @@ jobs:
           go-version-file: toolkit/go.mod
 
       - name: Build deployctl from the workflow's own toolkit commit
-        run: go build -o /tmp/deployctl ./cmd/deployctl
         working-directory: toolkit
+        env:
+          GOWORK: off
+        run: go build -o /tmp/deployctl ./cmd/deployctl
+
+      # Consumer content lands in a SIBLING directory, data only. Full
+      # history: the new-release evidence path reads the release's pinned
+      # source revision — older than the transition head by construction.
+      - name: Check out the consumer repository (data, never executed)
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          path: consumer
+          persist-credentials: false
+          fetch-depth: 0
 
       - name: Classify the transition (reported, never ruled)
         id: classify
@@ -188,6 +213,8 @@ jobs:
 
           base="${INPUT_BASE:-$event_base}"
           head="${INPUT_HEAD:-$event_head}"
+          repo_dir="$GITHUB_WORKSPACE/consumer/$REPO_DIR"
+          scratch="$RUNNER_TEMP/classify.json"
 
           set +e
           /tmp/deployctl promotion classify \
@@ -195,40 +222,52 @@ jobs:
             --mode "$mode" \
             --base "$base" \
             --head "$head" \
-            --repo-dir "$REPO_DIR" \
-            --json > classify.json
+            --repo-dir "$repo_dir" \
+            --json > "$scratch"
           code=$?
           set -e
 
           # The classifier reports; it never rules. Reported
           # classifications (exit 0 PROMOTION, 1 ORDINARY/INVALID, 3
-          # ERROR) always set the outputs and always conclude success: a
-          # failing classifier job would silently skip the dependent
-          # fallback jobs it exists to protect. Exit 2 (usage error) or
-          # anything without a parseable result is workflow machinery
-          # failure: outputs stay absent and the step fails — visible,
-          # rerunnable, and the caller's always() gate still blocks.
+          # ERROR) always set the outputs and always conclude success:
+          # the caller's status-aware routing conditions and always()
+          # gate own the decision. Exit 2 (usage error) or anything
+          # without a parseable result is workflow machinery failure:
+          # outputs stay absent and the step fails — the routing falls
+          # back to the expensive path and the gate blocks.
           case "$code" in
             0|1|3) ;;
             *)
-              cat classify.json >&2 || true
+              cat "$scratch" >&2 || true
               echo "::error::promotion classify machinery failure (exit $code): usage error or crash — fix the caller wiring, then rerun"
               exit 1
               ;;
           esac
-          classification="$(jq -er '.classification' classify.json)" || {
+          classification="$(jq -er '.classification' "$scratch")" || {
             echo "::error::promotion classify produced no parseable result (exit $code)"
             exit 1
           }
-          promotion_only="$(jq -er '.promotionOnly | tostring' classify.json)"
-          reason="$(jq -er '.reason' classify.json)"
+          promotion_only="$(jq -er '.promotionOnly | tostring' "$scratch")"
+          reason="$(jq -er '.reason' "$scratch")"
+
+          # GitHub's fixed-delimiter warning: never emit a fixed heredoc
+          # terminator for operator-influenced values. Generate a random
+          # delimiter and regenerate on the (astronomically unlikely)
+          # collision with the reason text.
+          gen_delim() {
+            printf 'PROMOTION_REASON_%s' "$(head -c 256 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)"
+          }
+          reason_delim="$(gen_delim)"
+          while printf '%s\n' "$reason" | grep -qF "$reason_delim"; do
+            reason_delim="$(gen_delim)"
+          done
 
           {
             echo "classification=$classification"
             echo "promotion_only=$promotion_only"
-            echo "reason<<PROMOTION_REASON_EOF"
+            echo "reason<<$reason_delim"
             echo "$reason"
-            echo "PROMOTION_REASON_EOF"
+            echo "$reason_delim"
           } >> "$GITHUB_OUTPUT"
 
           {

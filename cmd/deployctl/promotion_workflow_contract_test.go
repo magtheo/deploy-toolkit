@@ -146,23 +146,33 @@ func TestPromotionWorkflowLeastPrivilege(t *testing.T) {
 	}
 	checkouts := checkoutBlocks(jt)
 	if len(checkouts) != 2 {
-		t.Fatalf("classify job has %d checkouts, want 2 (consumer + toolkit)", len(checkouts))
+		t.Fatalf("classify job has %d checkouts, want 2 (toolkit + consumer)", len(checkouts))
 	}
 	for _, b := range checkouts {
 		if !strings.Contains(b, "persist-credentials: false") {
 			t.Error("every checkout must set persist-credentials: false")
 		}
 	}
-	consumer := checkouts[0]
+	toolkit := checkouts[0]
+	if !strings.Contains(toolkit, "path: toolkit") || !strings.Contains(toolkit, "repository: ${{ job.workflow_repository }}") {
+		t.Error("first checkout must be the pinned toolkit, isolated in toolkit/")
+	}
+	consumer := checkouts[1]
 	if strings.Contains(consumer, "repository:") {
-		t.Errorf("first checkout must be the caller repository, got: %s", consumer)
+		t.Errorf("second checkout must be the caller repository, got: %s", consumer)
+	}
+	if !strings.Contains(consumer, "path: consumer") {
+		t.Error("consumer checkout must land in the sibling consumer/ directory, never beside the trusted build")
 	}
 	if !strings.Contains(consumer, "fetch-depth: 0") {
 		t.Error("consumer checkout must set fetch-depth: 0 — the release pins a revision older than the transition head")
 	}
-	toolkit := checkouts[1]
-	if !strings.Contains(toolkit, "repository: ${{ job.workflow_repository }}") {
-		t.Error("second checkout must be the pinned toolkit")
+	// The trusted build must complete BEFORE any PR-controlled content
+	// exists on disk.
+	build := strings.Index(jt, "go build -o /tmp/deployctl")
+	consumerAt := strings.Index(jt, "path: consumer")
+	if build < 0 || consumerAt < 0 || consumerAt < build {
+		t.Error("deployctl must be built before the consumer checkout — no PR content on disk during the trusted build")
 	}
 }
 
@@ -210,7 +220,7 @@ func TestPromotionWorkflowClassifierReportsNeverRules(t *testing.T) {
 		"--mode \"$mode\"",
 		"--base \"$base\"",
 		"--head \"$head\"",
-		"--repo-dir \"$REPO_DIR\"",
+		"--repo-dir \"$repo_dir\"",
 	} {
 		if !strings.Contains(run, want) {
 			t.Errorf("classify step run misses %q", want)
@@ -228,20 +238,44 @@ func TestPromotionWorkflowClassifierReportsNeverRules(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimSpace(run), "exit 0") {
 		t.Error("a reported classification must conclude success — a failing classifier job would skip the fallback jobs it protects")
 	}
-	for _, want := range []string{"classification=$classification", "promotion_only=$promotion_only", "reason<<PROMOTION_REASON_EOF", "PROMOTION_REASON_EOF"} {
+	for _, want := range []string{"classification=$classification", "promotion_only=$promotion_only"} {
 		if !strings.Contains(run, want) {
 			t.Errorf("classify step must export %q to GITHUB_OUTPUT", want)
 		}
 	}
+	// GitHub warns against fixed heredoc delimiters for
+	// operator-influenced values: the reason delimiter must be generated
+	// and verified absent from the reason.
+	for _, want := range []string{"reason<<$reason_delim", "gen_delim()", "grep -qF \"$reason_delim\""} {
+		if !strings.Contains(run, want) {
+			t.Errorf("reason output must use a generated, collision-checked delimiter; misses %q", want)
+		}
+	}
+	if strings.Contains(run, "reason<<PROMOTION_REASON_EOF") {
+		t.Error("reason output must not use a fixed heredoc delimiter")
+	}
 }
 
-// PR code is never executed: the only deployctl binary is built from the
-// pinned toolkit commit, and no step runs with a working directory inside
-// the consumer checkout.
+// PR code is never executed: the trusted build is isolated from consumer
+// content on disk (sibling directories, build first), dependency
+// resolution cannot be redirected by a parent go.work, and scratch files
+// never mix into the consumer tree.
 func TestPromotionWorkflowNeverExecutesConsumerCode(t *testing.T) {
 	_, raw := loadPromotionWorkflow(t)
 	if !strings.Contains(raw, "go build -o /tmp/deployctl ./cmd/deployctl") {
 		t.Error("deployctl must be built from the pinned toolkit checkout")
+	}
+	if !strings.Contains(raw, "GOWORK: off") {
+		t.Error("the trusted build must set GOWORK: off — a parent go.work in the consumer checkout could otherwise redirect module resolution into attacker-controlled replacements")
+	}
+	if !strings.Contains(raw, "path: toolkit") || !strings.Contains(raw, "path: consumer") {
+		t.Error("toolkit and consumer content must live in separate sibling checkout directories")
+	}
+	if !strings.Contains(raw, "$GITHUB_WORKSPACE/consumer/$REPO_DIR") {
+		t.Error("classification must read the consumer checkout under consumer/, never the workspace root")
+	}
+	if !strings.Contains(raw, "$RUNNER_TEMP/classify.json") {
+		t.Error("classifier scratch output must go under RUNNER_TEMP, not the consumer or toolkit tree")
 	}
 	for _, m := range regexp.MustCompile(`(?m)^\s*working-directory: (.+)$`).FindAllStringSubmatch(raw, -1) {
 		if strings.TrimSpace(m[1]) != "toolkit" {
@@ -250,5 +284,28 @@ func TestPromotionWorkflowNeverExecutesConsumerCode(t *testing.T) {
 	}
 	if strings.Count(raw, "/tmp/deployctl promotion classify") != 1 {
 		t.Error("exactly one classification invocation, using the trusted binary")
+	}
+}
+
+// The documented consumer routing pattern must be fail-closed: GitHub
+// treats skipped jobs as satisfied required checks, so a plain
+// `promotion_only != 'true'` condition would let a failed classify job
+// skip application CI entirely. Uncertainty must mean the expensive path.
+func TestPromotionCIDocumentsFailClosedRouting(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "promotion-ci.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := string(raw)
+	for _, want := range []string{
+		"needs.classify.result != 'success'",
+		"!cancelled()",
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("docs/promotion-ci.md routing pattern misses %q — the documented conditions must be status-aware (fail closed)", want)
+		}
+	}
+	if strings.Count(doc, "needs.classify.result != 'success'") < 2 {
+		t.Error("both the PR-routing and push-publish conditions must be status-aware")
 	}
 }

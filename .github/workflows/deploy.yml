@@ -60,7 +60,7 @@ on:
         required: true
         type: string
       repo_dir:
-        description: Path inside the consumer repository holding .deploy/ (monorepos)
+        description: Consumer repository checkout root holding .deploy/ (the toolkit requires .deploy/ at the repository root in v1)
         required: false
         type: string
         default: "."
