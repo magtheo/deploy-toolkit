@@ -1,0 +1,244 @@
+# Reusable promotion-classification workflow for Deploy Toolkit consumers.
+#
+# This is the promotion-aware CI path (docs/promotion-ci-plan.md): one
+# semantic engine, three frontends. Application CI qualifies source;
+# promotion CI authorizes a transition between already-qualified immutable
+# release state. This workflow classifies which one a transition is — it
+# never qualifies source and never authorizes a merge.
+#
+#   classification   promotion_only   meaning
+#   --------------   --------------   --------------------------------------
+#   PROMOTION        true             valid promotion-only transition
+#   ORDINARY         false            ordinary source/admin change: full CI
+#   INVALID          false            mixed/malformed: full CI AND gate fail
+#   ERROR            false            cannot classify: full CI AND gate fail
+#
+# The classifier REPORTS; the caller's gate decides. Pattern:
+#
+#   # routing (cost) — inside the consumer's own ci.yml:
+#   classify:
+#     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
+#   test:
+#     needs: classify
+#     if: needs.classify.outputs.promotion_only != 'true'
+#   publish:
+#     needs: classify
+#     if: github.event_name == 'push' && needs.classify.outputs.promotion_only != 'true'
+#
+#   # authority (required check) — caller workflow on pull_request_target:
+#   gate:
+#     needs: classify
+#     if: always()   # a broken classifier must never skip the gate
+#     steps: fail unless classification == PROMOTION or ORDINARY
+#
+# Never `paths-ignore`: a whole workflow skipped by filters leaves required
+# checks pending; jobs skipped by `if:` report Skipped, which satisfies
+# branch protection deterministically.
+#
+# Trust model:
+#
+#   - PR code is NEVER executed. The consumer checkout is data: the
+#     classifier reads commits, trees and manifests through the GitHub
+#     API, and the new-release evidence path reads only the release's
+#     pinned source revision — a main-qualified SHA — via `git cat-file`.
+#     deployctl is built from job.workflow_repository@job.workflow_sha —
+#     the exact commit of this workflow, the single machinery trust
+#     anchor. There is deliberately no caller-supplied toolkit ref input.
+#   - Zero secrets: the implicit GITHUB_TOKEN (read scopes only) suffices.
+#     Classification from fork PRs works for the same reason.
+#   - runs-on is hardcoded to ubuntu-latest: the never-executes-PR-code
+#     property must not accidentally land on consumer self-hosted runners
+#     with persistent access to deployment material.
+#
+# Failure semantics — "the classifier reports; it never rules":
+#
+#   - Reported classifications (CLI exit 0 PROMOTION, 1 ORDINARY/INVALID,
+#     3 ERROR) ALWAYS conclude success and ALWAYS set the outputs. A
+#     failing classifier job would silently skip the expensive fallback
+#     jobs that depend on it — inverting fail-closed. The enforcement
+#     decision belongs to the caller's gate job and, for cost, to the
+#     plain `!= 'true'` output test — never to this job's exit code.
+#   - Workflow MACHINERY failures (checkout/build errors, unsupported
+#     event, usage error, unparsable output) fail the run with outputs
+#     absent: the caller's `if: always()` gate still runs and blocks, and
+#     a rerun is required. Classifier result failures fall back to full
+#     CI; machinery failures fail visibly and are retried.
+#
+# Events: pull_request and pull_request_target classify the PR transition
+# (base → head, full compare-and-swap rules); push classifies the ref
+# transition (github.event.before → github.event.after; a stale or
+# force-pushed transition never classifies as a promotion). Any other
+# triggering event is a machinery failure. Inputs base/head override the
+# event-derived SHAs for explicit callers; repo_dir supports monorepos.
+
+name: Promotion classify
+
+on:
+  workflow_call:
+    inputs:
+      base:
+        description: Override base SHA (pr trusted base / push.before). Defaults to the triggering event.
+        required: false
+        type: string
+        default: ""
+      head:
+        description: Override head SHA (pr PR head / push.after). Defaults to the triggering event.
+        required: false
+        type: string
+        default: ""
+      repo_dir:
+        description: Path inside the consumer repository holding .deploy/ (monorepos)
+        required: false
+        type: string
+        default: "."
+    outputs:
+      promotion_only:
+        description: "true only when the classification is PROMOTION; false otherwise (always set)"
+        value: ${{ jobs.classify.outputs.promotion_only }}
+      classification:
+        description: "PROMOTION | ORDINARY | INVALID | ERROR (always set)"
+        value: ${{ jobs.classify.outputs.classification }}
+      reason:
+        description: "Human-readable reason for the classification (always set)"
+        value: ${{ jobs.classify.outputs.reason }}
+
+# The workflow grants nothing by default; the job declares its own
+# least-privilege scope.
+permissions: {}
+
+jobs:
+  classify:
+    name: classify (trusted code, zero secrets, never PR code)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+    outputs:
+      promotion_only: ${{ steps.classify.outputs.promotion_only }}
+      classification: ${{ steps.classify.outputs.classification }}
+      reason: ${{ steps.classify.outputs.reason }}
+    steps:
+      - name: Fail closed unless this workflow was invoked by full SHA
+        env:
+          WORKFLOW_REF: ${{ job.workflow_ref }}
+        run: |
+          case "${WORKFLOW_REF##*@}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "::error::invoke this workflow pinned to a full 40-hex commit SHA (uses: ...@<full-sha>); a floating ref is not a trust anchor"; exit 1 ;;
+          esac
+
+      - name: Check out the consumer repository with full history (data, never executed)
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          persist-credentials: false
+          # The new-release evidence path reads the release's pinned
+          # source revision — older than the promotion head by
+          # construction — so a depth-1 checkout can never resolve it.
+          fetch-depth: 0
+
+      - name: Check out exactly the toolkit commit running this workflow
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: toolkit
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@34829cb9acb0c3aab260216f67d0867cc080dca5
+        with:
+          go-version-file: toolkit/go.mod
+
+      - name: Build deployctl from the workflow's own toolkit commit
+        run: go build -o /tmp/deployctl ./cmd/deployctl
+        working-directory: toolkit
+
+      - name: Classify the transition (reported, never ruled)
+        id: classify
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BASE: ${{ inputs.base }}
+          INPUT_HEAD: ${{ inputs.head }}
+          EVENT_PR_BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_PUSH_BEFORE: ${{ github.event.before }}
+          EVENT_PUSH_AFTER: ${{ github.event.after }}
+          REPO_DIR: ${{ inputs.repo_dir }}
+        run: |
+          set -euo pipefail
+
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target)
+              mode=pr
+              event_base="$EVENT_PR_BASE"
+              event_head="$EVENT_PR_HEAD"
+              ;;
+            push)
+              mode=push
+              event_base="$EVENT_PUSH_BEFORE"
+              event_head="$EVENT_PUSH_AFTER"
+              ;;
+            *)
+              echo "::error::promotion.yml classifies pull_request, pull_request_target and push events only (got: $EVENT_NAME) — machinery failure; fix the caller wiring, then rerun"
+              exit 1
+              ;;
+          esac
+
+          base="${INPUT_BASE:-$event_base}"
+          head="${INPUT_HEAD:-$event_head}"
+
+          set +e
+          /tmp/deployctl promotion classify \
+            --repo "$REPO" \
+            --mode "$mode" \
+            --base "$base" \
+            --head "$head" \
+            --repo-dir "$REPO_DIR" \
+            --json > classify.json
+          code=$?
+          set -e
+
+          # The classifier reports; it never rules. Reported
+          # classifications (exit 0 PROMOTION, 1 ORDINARY/INVALID, 3
+          # ERROR) always set the outputs and always conclude success: a
+          # failing classifier job would silently skip the dependent
+          # fallback jobs it exists to protect. Exit 2 (usage error) or
+          # anything without a parseable result is workflow machinery
+          # failure: outputs stay absent and the step fails — visible,
+          # rerunnable, and the caller's always() gate still blocks.
+          case "$code" in
+            0|1|3) ;;
+            *)
+              cat classify.json >&2 || true
+              echo "::error::promotion classify machinery failure (exit $code): usage error or crash — fix the caller wiring, then rerun"
+              exit 1
+              ;;
+          esac
+          classification="$(jq -er '.classification' classify.json)" || {
+            echo "::error::promotion classify produced no parseable result (exit $code)"
+            exit 1
+          }
+          promotion_only="$(jq -er '.promotionOnly | tostring' classify.json)"
+          reason="$(jq -er '.reason' classify.json)"
+
+          {
+            echo "classification=$classification"
+            echo "promotion_only=$promotion_only"
+            echo "reason<<PROMOTION_REASON_EOF"
+            echo "$reason"
+            echo "PROMOTION_REASON_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo '### promotion classification'
+            echo ''
+            echo '```'
+            echo "classification: $classification"
+            echo "promotion_only: $promotion_only"
+            echo "reason: $reason"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit 0
