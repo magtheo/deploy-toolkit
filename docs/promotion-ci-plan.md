@@ -36,7 +36,12 @@
    contexts report green (a full-CI bypass). Consumer routing conditions
    must therefore be status-aware:
    `!cancelled() && (needs.classify.result != 'success' ||
-   needs.classify.outputs.promotion_only != 'true')`. The *gate*
+   needs.classify.outputs.promotion_only != 'true')`. **Publication is
+   stricter than qualification**: artifact publication requires a
+   *decisive* non-promotion classification (`result == 'success' &&
+   promotion_only != 'true'`) — uncertain pushes qualify but publish
+   nothing, which is what makes "promotion merge commits are unreleasable"
+   hold under every classifier outcome, not just the fast path. The *gate*
    additionally fails closed on INVALID and ERROR and on any non-success
    classify result. Authority never depends on machinery succeeding;
    machinery failures are additionally visible (red run) and require a
@@ -82,6 +87,9 @@ on:
 
 jobs:
   classify:
+    permissions:               # caller ceiling; default token lacks checks:read
+      contents: read
+      checks: read
     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
   test:                      # every app job, unchanged definition
     needs: classify
@@ -92,7 +100,8 @@ jobs:
     if: >-
       ${{
         !cancelled() && github.event_name == 'push' &&
-        (needs.classify.result != 'success' || needs.classify.outputs.promotion_only != 'true')
+        needs.classify.result == 'success' &&
+        needs.classify.outputs.promotion_only != 'true'
       }}
     ...
 ```
@@ -303,16 +312,19 @@ both safe:
   `needs.classify.result != 'success'`, and fails — the required check is
   unsatisfied and the merge is blocked until classification works.
 - **Cost:** the status-aware routing conditions (`result != 'success' ||
-  promotion_only != 'true'`) send every consumer job to the expensive
+  promotion_only != 'true'`) send every consumer test job to the expensive
   path — machinery failure or not, the run is red and a rerun is required
   for the classification to count, but **no required context is ever
-  satisfied green without application CI having run**. (An earlier draft
-  of this plan argued machinery failures could leave routing jobs skipped
-  because "the enforce job still blocks the merge" — that reasoning held
-  only for the gate workflow and ignored that skipped *routing* jobs
-  satisfy required checks on ordinary source PRs, i.e. a full-CI bypass.
-  The invariant is therefore not narrowed: uncertainty means the
-  expensive path, unconditionally.)
+  satisfied green without application CI having run**. Publication is
+  additionally withheld under uncertainty (`result == 'success'` is part
+  of the publish condition): nothing is published until a push is
+  decisively classified, which keeps promotion merges unreleasable under
+  every outcome. (An earlier draft of this plan argued machinery failures
+  could leave routing jobs skipped because "the enforce job still blocks
+  the merge" — that reasoning held only for the gate workflow and ignored
+  that skipped *routing* jobs satisfy required checks on ordinary source
+  PRs, i.e. a full-CI bypass. The invariant is therefore not narrowed:
+  uncertainty means the expensive path — and never the published path.)
 
 Why INVALID must fail the gate and not merely "run full CI": a boolean model
 turns *mixed promotion + source* into a valid way to alter deployment state —
@@ -367,9 +379,12 @@ all** in this gate:
 - CODEOWNERS/ruleset requirement for `.github/workflows/**` (above).
 - Branch-protection guidance for the two CI classes.
 - **Deliberate property, documented:** promotion merge commits become
-  *unreleasable* — publish jobs skip, so the SHA never gets `success` contexts
-  and `release create` refuses it. Correct (they are not source revisions).
-  This composes with an existing eligibility rule, pinned by test:
+  *unreleasable under every classifier outcome* — publication requires a
+  decisive non-promotion classification, so a `PROMOTION` merge (or an
+  uncertain push) never produces the source-SHA discovery artifact and
+  `release create` refuses the SHA at artifact resolution. Correct (they
+  are not source revisions). This composes with an existing eligibility
+  rule, pinned by test:
 
   > GitHub accepts `conclusion: skipped` for required checks;
   > `release create` accepts **only `success`**. `skipped` is deliberately

@@ -19,8 +19,13 @@
 #   # MUST be status-aware: GitHub treats skipped jobs as satisfied
 #   # required checks, so a plain output test would let a failed classify
 #   # job skip application CI entirely — a full-CI bypass. Uncertainty
-#   # means the expensive path:
+#   # means the expensive path. The calling job MUST grant the permission
+#   # floor (a called workflow cannot elevate past its caller, and
+#   # GitHub's default token covers contents/packages but not checks):
 #   classify:
+#     permissions:
+#       contents: read
+#       checks: read
 #     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
 #   test:
 #     needs: classify
@@ -30,7 +35,8 @@
 #     if: >-
 #       ${{
 #         !cancelled() && github.event_name == 'push' &&
-#         (needs.classify.result != 'success' || needs.classify.outputs.promotion_only != 'true')
+#         needs.classify.result == 'success' &&
+#         needs.classify.outputs.promotion_only != 'true'
 #       }}
 #
 #   # authority (required check) — caller workflow on pull_request_target:
@@ -43,6 +49,14 @@
 # checks pending; jobs skipped by `if:` report Skipped, which satisfies
 # branch protection deterministically — which is exactly why the routing
 # conditions above must be status-aware.
+#
+# Publication is stricter than qualification: artifact publication requires
+# a DECISIVE non-promotion classification (`result == 'success' &&
+# promotion_only != 'true'`). PROMOTION merges never publish, and an
+# uncertain push publishes nothing — full tests run, the run is red, and a
+# rerun publishes after classification succeeds. That is what makes
+# "promotion merge commits are unreleasable" hold under every classifier
+# outcome, not just the fast path.
 #
 # Trust model:
 #
@@ -69,17 +83,20 @@
 #     property must not accidentally land on consumer self-hosted runners
 #     with persistent access to deployment material.
 #
-# Failure semantics — uncertainty means the expensive path:
+# Failure semantics — uncertainty means the expensive path, never the
+# published path:
 #
 #   - Reported classifications (CLI exit 0 PROMOTION, 1 ORDINARY/INVALID,
 #     3 ERROR) ALWAYS conclude success and ALWAYS set the outputs. Only
-#     PROMOTION routes past the expensive path — every other result, and
-#     every machinery failure (checkout/build errors, unsupported event,
-#     usage error, unparsable output, which leave outputs absent and fail
-#     the run), routes consumer jobs to the expensive path via the
-#     status-aware conditions above, and the caller's always() gate still
-#     blocks. Machinery failures are additionally visible (red run) and
-#     require a rerun for their classification to count.
+#     PROMOTION routes past the expensive path (tests and publish) —
+#     every other result, and every machinery failure (checkout/build
+#     errors, unsupported event, usage error, unparsable output, which
+#     leave outputs absent and fail the run), routes consumer test jobs
+#     to the expensive path via the status-aware conditions above, and
+#     the caller's always() gate still blocks. Publication additionally
+#     requires a decisive non-promotion classification: an uncertain push
+#     runs full tests, publishes nothing, and stays red until a rerun
+#     classifies it.
 #
 # Events: pull_request and pull_request_target classify the PR transition
 # (base → head, full compare-and-swap rules); push classifies the ref

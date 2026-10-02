@@ -51,6 +51,13 @@ on:
 
 jobs:
   classify:
+    # The caller's grant is a CEILING: a reusable workflow cannot elevate
+    # past it, and GitHub's default token covers contents/packages but
+    # NOT checks — without this floor, check-run evidence reads fail and
+    # the fast path can never engage.
+    permissions:
+      contents: read
+      checks: read
     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
   test:                      # every application job, definition unchanged
     needs: classify
@@ -61,22 +68,36 @@ jobs:
     if: >-
       ${{
         !cancelled() && github.event_name == 'push' &&
-        (needs.classify.result != 'success' || needs.classify.outputs.promotion_only != 'true')
+        needs.classify.result == 'success' &&
+        needs.classify.outputs.promotion_only != 'true'
       }}
     ...
 ```
 
-**The conditions must be status-aware — this is load-bearing.** GitHub
-treats skipped jobs as satisfied required checks, and GitHub skips jobs
-that `need` a failed job unless the condition uses a status function. A
-plain `promotion_only != 'true'` condition would therefore let a
-*machinery-failed* classify job skip application CI entirely while the
-required contexts still report green — a full-CI bypass through
+**The test conditions must be status-aware — this is load-bearing.**
+GitHub treats skipped jobs as satisfied required checks, and GitHub skips
+jobs that `need` a failed job unless the condition uses a status
+function. A plain `promotion_only != 'true'` condition would therefore
+let a *machinery-failed* classify job skip application CI entirely while
+the required contexts still report green — a full-CI bypass through
 uncertainty. `!cancelled() && (needs.classify.result != 'success' ||
 promotion_only != 'true')` closes it: **uncertainty means the expensive
 path**, never the skipped path. (`!cancelled()` rather than `always()`
 also honors an explicit cancellation; on cancel the contexts stay
 unsatisfied and the merge stays blocked.)
+
+**Publication is stricter than qualification.** The publish condition
+requires a *decisive* non-promotion classification
+(`result == 'success' && promotion_only != 'true'`): an ordinary push
+publishes, an `INVALID` push (decisively mixed) publishes like any
+ordinary change, but a `PROMOTION` merge never publishes and an
+*uncertain* push runs full tests while publishing nothing — the run is
+red, and a rerun publishes once classification succeeds. This is what
+makes "promotion merge commits are unreleasable" hold under every
+classifier outcome. The price is deliberate: an ordinary push during
+classifier uncertainty publishes only after the rerun — forgetting it
+surfaces as a loud `release create` artifact-resolution failure, never a
+silent gap.
 
 Jobs skipped by a *successful* classification report `Skipped`, which
 satisfies branch protection deterministically. **Never `paths-ignore`:**
@@ -118,30 +139,35 @@ classifier. The gate workflow's definition always comes from the base
 branch (`pull_request_target`), so a PR cannot alter the pin, the
 conditions, or the output mapping — and it never checks out the PR head.
 
-## Failure semantics: uncertainty means the expensive path
+## Failure semantics: uncertainty means the expensive path, never the published path
 
 The reusable workflow **always concludes success and always sets its
 outputs** for reported classifications (`PROMOTION`, `ORDINARY`,
 `INVALID`, `ERROR`). Only `PROMOTION` routes past the expensive path;
-every other result routes consumer jobs to it via the status-aware
-conditions above, and the gate decides authority. A failing classifier
-job must never be able to skip the expensive fallback jobs that depend on
-it — that failure mode is a full-CI bypass, not a cost defect.
+every other result routes test jobs to it via the status-aware
+conditions above, and the gate decides authority. Publication is
+stricter still: it requires a decisive non-promotion classification, so
+uncertainty qualifies but never publishes. A failing classifier job must
+never be able to skip the expensive fallback jobs that depend on it —
+that failure mode is a full-CI bypass, not a cost defect.
 
 Workflow *machinery* failures (checkout/build errors, unsupported event,
 usage error) fail the run with outputs absent: the routing conditions
-still send consumer jobs to the expensive path (`result != 'success'`),
-and the caller's `if: always()` gate still runs and blocks. Machinery
-failures are additionally visible — a red run — and require a rerun for
-their classification to count.
+still send test jobs to the expensive path (`result != 'success'`),
+publication is withheld, and the caller's `if: always()` gate still runs
+and blocks. Machinery failures are additionally visible — a red run —
+and require a rerun for their classification to count.
 
 ```text
 classifier result:
-    PROMOTION    → expensive path skips
-    anything else → expensive path runs
+    PROMOTION        → expensive path skips (tests and publish)
+    ORDINARY/INVALID → expensive path runs, publish runs
+                       (decisive non-promotion)
+    ERROR            → tests run; publish does NOT run (red run;
+                       rerun re-classifies and publishes)
 
 classifier machinery failure:
-    → expensive path runs (status-aware routing)
+    → tests run (status-aware routing), publish withheld
     → authority gate fails/blocks (its result is not success)
     → red run; rerun required for a classification to count
 ```
@@ -175,14 +201,15 @@ bypass, not a cost defect.
 - **Registry credentials.** The classification workflow holds zero
   secrets by design. New-release evidence re-verification resolves the
   release's source-SHA discovery tag from the OCI registry, using the
-  runner's ambient credentials — none, in CI. **v1 promotion CI therefore
-  requires anonymously readable qualification artifacts** (e.g. public
-  GHCR). Consumers with private registries run `promotion check` /
-  `promotion classify` from an operator machine with a configured
-  keychain for the new-release class; environment-only flips (rollbacks)
-  never touch the registry and work everywhere. An optional read-only
-  registry credential would be a consumer-contract change, decided
-  before any freeze — not an implicit gap.
+  runner's ambient credentials — none, in CI. **The new-release class of
+  promotion-aware CI therefore requires anonymously readable
+  qualification artifacts** (e.g. public GHCR). Consumers with private
+  registries have no automated new-release gate in v1: they run
+  `promotion check` / `promotion classify` from an operator machine with
+  a configured keychain; environment-only flips (rollbacks) never touch
+  the registry and work everywhere. An optional read-only registry
+  credential would be a consumer-contract change, decided before any
+  freeze — not an implicit gap.
 - **`pull_request_target` policy.** The trusted authority gate depends on
   the `pull_request_target` event. GitHub is moving to **default
   enforcement that blocks `pull_request_target` in public repositories**
@@ -199,10 +226,14 @@ bypass, not a cost defect.
 
 ## Deliberate consequences
 
-- **Promotion merge commits are unreleasable.** Their publish jobs skip,
-  so the SHA never gets `success` contexts — and `release create` accepts
-  only `success` (`skipped` is deliberately ineligible). A promotion merge
-  can never masquerade as a qualified source revision.
+- **Promotion merge commits are unreleasable — under every classifier
+  outcome.** Publication requires a decisive non-promotion
+  classification, so `PROMOTION` merges and uncertain pushes never
+  produce the source-SHA discovery artifact, and `release create` — which
+  must resolve that artifact for the candidate SHA — fails closed. On the
+  fast path the skipped application contexts are additionally ineligible
+  (`skipped` is deliberately not `success`). A promotion merge can never
+  masquerade as a qualified source revision.
 - **Stale push events are never promotions.** Push classification requires
   `after == live trusted head`; if two promotions race, the losing push
   event falls back to full CI. Correct by design — do not remove the

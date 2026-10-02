@@ -511,9 +511,18 @@ Contract surface:
   bypass. Consumer routing conditions **must** be status-aware:
   `!cancelled() && (needs.classify.result != 'success' ||
   needs.classify.outputs.promotion_only != 'true')` — uncertainty means
-  the expensive path.
+  the expensive path. **Publication is stricter:** artifact publication
+  requires a *decisive* non-promotion classification
+  (`needs.classify.result == 'success' &&
+  needs.classify.outputs.promotion_only != 'true'`) — `PROMOTION` merges
+  and uncertain pushes qualify but publish nothing; a rerun publishes
+  after classification succeeds.
 - **Permissions** — the workflow requests exactly `contents: read` +
-  `checks: read`; callers must grant at least that floor.
+  `checks: read`; callers must grant at least that floor **on the calling
+  job**. A called workflow can only be granted what its caller holds
+  (permissions are a ceiling), and GitHub's default token covers
+  `contents`/`packages` but not `checks` — an ungranted caller breaks
+  check-run evidence reads and the fast path can never engage.
 - **Consumer code is never executed** — the job hardcodes
   `runs-on: ubuntu-latest`; the consumer checkout is read as data
   (Git data API; the release's pinned source revision via `git cat-file`).
@@ -524,10 +533,17 @@ Two properties this enforces beyond the classifier itself:
    promotion transition** — a lone release-file addition (no `spec.release`
    transition) is `INVALID`. The rollback fast path treats the trusted-base
    release copy as authoritative; it must never be fed unaudited evidence.
-2. **Promotion merge commits are unreleasable** — fast-path merges skip
-   publish, so their SHAs never carry `success` contexts, and eligibility
-   accepts only `success` (see *Policy authority* above). A promotion merge
-   can never masquerade as a qualified source revision.
+2. **Promotion merge commits are unreleasable — under every classifier
+   outcome.** Publication requires a decisive non-promotion
+   classification, so `PROMOTION` merges and uncertain pushes never
+   produce the source-SHA discovery artifact, and `release create` —
+   which must resolve that artifact for the candidate SHA — fails
+   closed. On the fast path the skipped application contexts are
+   additionally ineligible (`skipped` ≠ `success`; see *Policy authority*
+   above). A promotion merge can never masquerade as a qualified source
+   revision. The price is deliberate: an ordinary push during classifier
+   uncertainty publishes only after the red run is rerun — forgetting it
+   surfaces as a loud `release create` failure, never a silent gap.
 
 **Required consumer control:** `.github/workflows/**` must be covered by
 CODEOWNERS (or a ruleset) so a PR cannot alter its own CI routing without

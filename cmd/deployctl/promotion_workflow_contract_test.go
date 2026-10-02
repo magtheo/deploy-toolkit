@@ -291,21 +291,38 @@ func TestPromotionWorkflowNeverExecutesConsumerCode(t *testing.T) {
 // treats skipped jobs as satisfied required checks, so a plain
 // `promotion_only != 'true'` condition would let a failed classify job
 // skip application CI entirely. Uncertainty must mean the expensive path.
+// The canonical caller must also grant the permission floor on the
+// calling job — a reusable workflow cannot elevate past its caller, and
+// GitHub's default token lacks checks:read.
 func TestPromotionCIDocumentsFailClosedRouting(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "promotion-ci.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	doc := string(raw)
-	for _, want := range []string{
-		"needs.classify.result != 'success'",
-		"!cancelled()",
-	} {
-		if !strings.Contains(doc, want) {
-			t.Errorf("docs/promotion-ci.md routing pattern misses %q — the documented conditions must be status-aware (fail closed)", want)
+	fence := docFenceContaining(t, doc, "promotion_only != 'true'")
+	if !strings.Contains(fence, "!cancelled()") || !strings.Contains(fence, "needs.classify.result != 'success'") {
+		t.Error("the documented test routing condition must be status-aware (fail closed)")
+	}
+	if !strings.Contains(fence, "needs.classify.result == 'success'") {
+		t.Error("the documented publish condition must require a decisive non-promotion classification — uncertainty qualifies but never publishes")
+	}
+	for _, want := range []string{"permissions:", "contents: read", "checks: read"} {
+		if !strings.Contains(fence, want) {
+			t.Errorf("the documented classify caller must grant the permission floor; misses %q — a called workflow cannot elevate past its caller and GitHub's default token lacks checks:read", want)
 		}
 	}
-	if strings.Count(doc, "needs.classify.result != 'success'") < 2 {
-		t.Error("both the PR-routing and push-publish conditions must be status-aware")
+}
+
+// docFenceContaining returns the fenced markdown code block containing
+// marker (the first one, in document order).
+func docFenceContaining(t *testing.T, doc, marker string) string {
+	t.Helper()
+	for _, fence := range strings.Split(doc, "```") {
+		if strings.Contains(fence, marker) {
+			return fence
+		}
 	}
+	t.Fatalf("no fenced block containing %q", marker)
+	return ""
 }
