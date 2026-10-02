@@ -511,12 +511,17 @@ Contract surface:
   bypass. Consumer routing conditions **must** be status-aware:
   `!cancelled() && (needs.classify.result != 'success' ||
   needs.classify.outputs.promotion_only != 'true')` — uncertainty means
-  the expensive path. **Publication is stricter:** artifact publication
-  requires a *decisive* non-promotion classification
-  (`needs.classify.result == 'success' &&
-  needs.classify.outputs.promotion_only != 'true'`) — `PROMOTION` merges
-  and uncertain pushes qualify but publish nothing; a rerun publishes
-  after classification succeeds.
+  the expensive path. **Publication is an allow-list:** artifact
+  publication requires the *decisive non-promotion* classifications by
+  name — `needs.classify.result == 'success' &&
+  (classification == 'ORDINARY' || classification == 'INVALID')`. `ERROR`
+  means *could not determine* and never publishes; a negation test would
+  auto-accept any state added later. A reported `ERROR` leaves the
+  classify job green (the classifier reports, it does not rule), so
+  consumers **must** run a `classifier-integrity` sentinel that fails the
+  run unless the classification is decisive (`PROMOTION`, `ORDINARY`,
+  `INVALID`) — uncertainty is both non-publishing and visibly red; a
+  rerun publishes after classification succeeds.
 - **Permissions** — the workflow requests exactly `contents: read` +
   `checks: read`; callers must grant at least that floor **on the calling
   job**. A called workflow can only be granted what its caller holds

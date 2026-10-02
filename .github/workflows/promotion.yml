@@ -11,7 +11,8 @@
 #   PROMOTION        true             valid promotion-only transition
 #   ORDINARY         false            ordinary source/admin change: full CI
 #   INVALID          false            mixed/malformed: full CI AND gate fail
-#   ERROR            false            cannot classify: full CI AND gate fail
+#   ERROR            false            cannot classify: gate fail; never
+#                                     publishes; red run (sentinel below)
 #
 # The classifier REPORTS; the caller's gate decides. Patterns:
 #
@@ -21,7 +22,10 @@
 #   # job skip application CI entirely — a full-CI bypass. Uncertainty
 #   # means the expensive path. The calling job MUST grant the permission
 #   # floor (a called workflow cannot elevate past its caller, and
-#   # GitHub's default token covers contents/packages but not checks):
+#   # GitHub's default token covers contents/packages but not checks).
+#   # Publication uses an explicit ALLOW-LIST of decisive
+#   # non-promotion classifications: ERROR means "could not determine",
+#   # and any state added later must fail closed, never auto-publish:
 #   classify:
 #     permissions:
 #       contents: read
@@ -36,8 +40,26 @@
 #       ${{
 #         !cancelled() && github.event_name == 'push' &&
 #         needs.classify.result == 'success' &&
-#         needs.classify.outputs.promotion_only != 'true'
+#         (
+#           needs.classify.outputs.classification == 'ORDINARY' ||
+#           needs.classify.outputs.classification == 'INVALID'
+#         )
 #       }}
+#   classifier-integrity:
+#     # Reported ERROR leaves the classify job green (the classifier
+#     # reports; it does not rule) — this sentinel makes uncertainty
+#     # visibly RED anyway: a push whose classification is ERROR or whose
+#     # classify job failed is a red run requiring a rerun.
+#     needs: classify
+#     if: ${{ !cancelled() }}
+#     steps:
+#       - run: |
+#           case "${{ needs.classify.result }}/${{ needs.classify.outputs.classification }}" in
+#             success/PROMOTION|success/ORDINARY|success/INVALID)
+#               echo "decisive classification"; exit 0 ;;
+#             *)
+#               echo "::error::classification is not decisive — rerun required"; exit 1 ;;
+#           esac
 #
 #   # authority (required check) — caller workflow on pull_request_target:
 #   gate:
@@ -50,13 +72,13 @@
 # branch protection deterministically — which is exactly why the routing
 # conditions above must be status-aware.
 #
-# Publication is stricter than qualification: artifact publication requires
-# a DECISIVE non-promotion classification (`result == 'success' &&
-# promotion_only != 'true'`). PROMOTION merges never publish, and an
-# uncertain push publishes nothing — full tests run, the run is red, and a
-# rerun publishes after classification succeeds. That is what makes
-# "promotion merge commits are unreleasable" hold under every classifier
-# outcome, not just the fast path.
+# Publication is stricter than qualification: artifact publication uses an
+# explicit allow-list of decisive non-promotion classifications
+# (ORDINARY, INVALID). PROMOTION merges never publish; ERROR and
+# machinery failures publish nothing — full tests run and the
+# classifier-integrity sentinel keeps the run red until a rerun decides.
+# That is what makes "promotion merge commits are unreleasable" hold under
+# every classifier outcome, not just the fast path.
 #
 # Trust model:
 #
@@ -84,7 +106,7 @@
 #     with persistent access to deployment material.
 #
 # Failure semantics — uncertainty means the expensive path, never the
-# published path:
+# published path, and it is always visibly red:
 #
 #   - Reported classifications (CLI exit 0 PROMOTION, 1 ORDINARY/INVALID,
 #     3 ERROR) ALWAYS conclude success and ALWAYS set the outputs. Only
@@ -93,10 +115,11 @@
 #     errors, unsupported event, usage error, unparsable output, which
 #     leave outputs absent and fail the run), routes consumer test jobs
 #     to the expensive path via the status-aware conditions above, and
-#     the caller's always() gate still blocks. Publication additionally
-#     requires a decisive non-promotion classification: an uncertain push
-#     runs full tests, publishes nothing, and stays red until a rerun
-#     classifies it.
+#     the caller's always() gate still blocks. Publication uses an
+#     explicit allow-list of decisive non-promotion classifications
+#     (ORDINARY, INVALID): an ERROR or machinery failure qualifies but
+#     publishes nothing, and the consumer's classifier-integrity sentinel
+#     keeps the run red until a rerun decides.
 #
 # Events: pull_request and pull_request_target classify the PR transition
 # (base → head, full compare-and-swap rules); push classifies the ref

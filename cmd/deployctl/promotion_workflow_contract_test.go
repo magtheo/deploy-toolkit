@@ -287,13 +287,24 @@ func TestPromotionWorkflowNeverExecutesConsumerCode(t *testing.T) {
 	}
 }
 
-// The documented consumer routing pattern must be fail-closed: GitHub
-// treats skipped jobs as satisfied required checks, so a plain
-// `promotion_only != 'true'` condition would let a failed classify job
-// skip application CI entirely. Uncertainty must mean the expensive path.
-// The canonical caller must also grant the permission floor on the
-// calling job — a reusable workflow cannot elevate past its caller, and
-// GitHub's default token lacks checks:read.
+// The documented consumer routing pattern must be fail-closed, matching
+// the full truth table:
+//
+//	PROMOTION       test skip / publish skip
+//	ORDINARY        test run  / publish run
+//	INVALID         test run  / publish run
+//	ERROR           test run  / publish skip (allow-listed out by name)
+//	machinery fail  test run  / publish skip
+//	ERROR / machinery → classifier-integrity sentinel fails the run
+//
+// GitHub treats skipped jobs as satisfied required checks, so a plain
+// `promotion_only != 'true'` test condition would let a failed classify
+// job skip application CI entirely; ERROR would slip through a negated
+// publish condition as "decisively not a promotion". Uncertainty must
+// mean the expensive path — and never the published path. The canonical
+// caller must also grant the permission floor on the calling job — a
+// reusable workflow cannot elevate past its caller, and GitHub's default
+// token lacks checks:read.
 func TestPromotionCIDocumentsFailClosedRouting(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "docs", "promotion-ci.md"))
 	if err != nil {
@@ -305,7 +316,17 @@ func TestPromotionCIDocumentsFailClosedRouting(t *testing.T) {
 		t.Error("the documented test routing condition must be status-aware (fail closed)")
 	}
 	if !strings.Contains(fence, "needs.classify.result == 'success'") {
-		t.Error("the documented publish condition must require a decisive non-promotion classification — uncertainty qualifies but never publishes")
+		t.Error("the documented publish condition must require a successful classification")
+	}
+	for _, want := range []string{"classification == 'ORDINARY'", "classification == 'INVALID'"} {
+		if !strings.Contains(fence, want) {
+			t.Errorf("the documented publish condition must allow-list %q by name — a negation would auto-accept ERROR and any future state", want)
+		}
+	}
+	if !strings.Contains(fence, "classifier-integrity") ||
+		!strings.Contains(fence, "success/PROMOTION|success/ORDINARY|success/INVALID") ||
+		!strings.Contains(fence, "exit 1") {
+		t.Error("the documented routing must include a classifier-integrity sentinel that fails the run on undecidable classifications (reported ERROR leaves the classify job green)")
 	}
 	for _, want := range []string{"permissions:", "contents: read", "checks: read"} {
 		if !strings.Contains(fence, want) {

@@ -37,15 +37,20 @@
    must therefore be status-aware:
    `!cancelled() && (needs.classify.result != 'success' ||
    needs.classify.outputs.promotion_only != 'true')`. **Publication is
-   stricter than qualification**: artifact publication requires a
-   *decisive* non-promotion classification (`result == 'success' &&
-   promotion_only != 'true'`) — uncertain pushes qualify but publish
-   nothing, which is what makes "promotion merge commits are unreleasable"
-   hold under every classifier outcome, not just the fast path. The *gate*
+   an explicit allow-list of decisive non-promotion classifications**
+   (`result == 'success' && (classification == 'ORDINARY' ||
+   classification == 'INVALID')`) — never a negation: `ERROR` means
+   *could not determine* and must not be read as "decisively not a
+   promotion", and any state added later must fail closed rather than
+   auto-publish. Uncertain pushes qualify but publish nothing, which is
+   what makes "promotion merge commits are unreleasable" hold under
+   every classifier outcome, not just the fast path. A reported `ERROR`
+   leaves the classify job green, so the consumer's
+   `classifier-integrity` sentinel (fail unless the classification is
+   decisive) keeps the run red — "rerun required" must be operationally
+   obvious, not deferred to a later `release create` failure. The *gate*
    additionally fails closed on INVALID and ERROR and on any non-success
-   classify result. Authority never depends on machinery succeeding;
-   machinery failures are additionally visible (red run) and require a
-   rerun for their classification to count.
+   classify result. Authority never depends on machinery succeeding.
 
 ## Architecture
 
@@ -101,9 +106,16 @@ jobs:
       ${{
         !cancelled() && github.event_name == 'push' &&
         needs.classify.result == 'success' &&
-        needs.classify.outputs.promotion_only != 'true'
+        (
+          needs.classify.outputs.classification == 'ORDINARY' ||
+          needs.classify.outputs.classification == 'INVALID'
+        )
       }}
     ...
+  classifier-integrity:      # reported ERROR / machinery failure = red run
+    needs: classify
+    if: ${{ !cancelled() }}
+    steps: fail unless the classification is decisive (PROMOTION/ORDINARY/INVALID)
 ```
 
 ```yaml
@@ -283,12 +295,18 @@ codes plus a human-readable reason (exact code values fixed at
 implementation; the observable distinctions the workflow needs are:
 promotion vs not, gate-pass vs gate-fail, and a reason string).
 
-| State | Meaning | `promotion_only` | Authority gate (enforce job) | Full CI / publish |
-|---|---|---|---|---|
-| `PROMOTION` | valid promotion-only transition | `true` | pass | skip |
-| `ORDINARY` | ordinary source/administrative change | `false` | pass ("not a promotion") | run |
-| `INVALID` | mixed or malformed — e.g. source change + `spec.release` flip | `false` | **fail** with reason | run |
-| `ERROR` | cannot classify (API, data, unreadable) | `false` | **fail** (fail closed) | run |
+| State | Meaning | `promotion_only` | Authority gate (enforce job) | Qualification (tests) | Publication (publish) | Run color |
+|---|---|---|---|---|---|---|
+| `PROMOTION` | valid promotion-only transition | `true` | pass | skip | skip | green |
+| `ORDINARY` | ordinary source/administrative change | `false` | pass ("not a promotion") | run | run | green |
+| `INVALID` | mixed or malformed — e.g. source change + `spec.release` flip | `false` | **fail** with reason | run | run (push-side) | green; PR blocked |
+| `ERROR` | cannot classify (API, data, unreadable) | `false` | **fail** (fail closed) | run | **skip** | **red** (sentinel) |
+| machinery failure | classify job cannot run | absent | **fail** | run | **skip** | **red** |
+
+Qualification and publication no longer share a column: uncertainty
+qualifies but never publishes, and the `classifier-integrity` sentinel
+keeps a reported-`ERROR` run visibly red (the classify job itself is
+green for reported outcomes — the classifier reports, it does not rule).
 
 ### Failure semantics: the classifier reports; it never rules
 
@@ -313,13 +331,15 @@ both safe:
   unsatisfied and the merge is blocked until classification works.
 - **Cost:** the status-aware routing conditions (`result != 'success' ||
   promotion_only != 'true'`) send every consumer test job to the expensive
-  path — machinery failure or not, the run is red and a rerun is required
-  for the classification to count, but **no required context is ever
-  satisfied green without application CI having run**. Publication is
-  additionally withheld under uncertainty (`result == 'success'` is part
-  of the publish condition): nothing is published until a push is
-  decisively classified, which keeps promotion merges unreleasable under
-  every outcome. (An earlier draft of this plan argued machinery failures
+  path, and the `classifier-integrity` sentinel keeps every non-decisive
+  run red — reported `ERROR` included (the classify job itself is green
+  for reported outcomes, so the sentinel is what makes "rerun required"
+  operationally obvious). **No required context is ever satisfied green
+  without application CI having run.** Publication uses the explicit
+  allow-list (`result == 'success'` plus `classification == 'ORDINARY'
+  || 'INVALID'`): nothing is published until a push is decisively
+  classified, which keeps promotion merges unreleasable under every
+  outcome. (An earlier draft of this plan argued machinery failures
   could leave routing jobs skipped because "the enforce job still blocks
   the merge" — that reasoning held only for the gate workflow and ignored
   that skipped *routing* jobs satisfy required checks on ordinary source
