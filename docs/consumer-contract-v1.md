@@ -463,3 +463,56 @@ toolkit itself must be consumed by a **full SHA**, never a tag or branch.
 Workflow inputs, outputs, permissions and secret names are contract items;
 changing them follows the versioning policy above. These properties are
 pinned by tests (`cmd/deployctl/workflow_contract_test.go`).
+
+### Promotion classification workflow
+
+`.github/workflows/promotion.yml` classifies a transition as
+`PROMOTION | ORDINARY | INVALID | ERROR` (the promotion-aware CI path,
+[docs/promotion-ci.md](promotion-ci.md)). It qualifies nothing and
+authorizes nothing; the consumer's gate and routing consume its outputs.
+
+Contract surface:
+
+- **Invocation** by full toolkit SHA — the same single-machinery-anchor
+  rule as the deployment workflow: `deployctl` is rebuilt from
+  `job.workflow_repository@job.workflow_sha`, and the workflow fails
+  closed on a floating ref. There is no caller-supplied toolkit ref input.
+- **Inputs** — all optional: `base`, `head` (override the event-derived
+  SHAs), `repo_dir` (monorepos). **Zero secrets** — the implicit
+  `GITHUB_TOKEN` suffices; classification only reads, so fork PRs work.
+- **Events** — `pull_request`/`pull_request_target` classify the PR
+  transition; `push` classifies `github.event.before → after` (stale and
+  force-pushed transitions never classify as promotions). Any other
+  triggering event is a machinery failure.
+- **Outputs** — `promotion_only` (`true` only for `PROMOTION`),
+  `classification`, `reason` — **always set for reported
+  classifications** (`PROMOTION`/`ORDINARY`/`INVALID`/`ERROR`). The
+  classifier reports; the caller's gate decides. Only workflow machinery
+  failures leave outputs absent and fail the run.
+- **Permissions** — the workflow requests exactly `contents: read` +
+  `checks: read`; callers must grant at least that floor.
+- **Consumer code is never executed** — the job hardcodes
+  `runs-on: ubuntu-latest`; the consumer checkout is read as data
+  (Git data API; the release's pinned source revision via `git cat-file`).
+
+Two properties this enforces beyond the classifier itself:
+
+1. **Release manifests enter trusted main only as part of a valid
+   promotion transition** — a lone release-file addition (no `spec.release`
+   transition) is `INVALID`. The rollback fast path treats the trusted-base
+   release copy as authoritative; it must never be fed unaudited evidence.
+2. **Promotion merge commits are unreleasable** — fast-path merges skip
+   publish, so their SHAs never carry `success` contexts, and eligibility
+   accepts only `success` (see *Policy authority* above). A promotion merge
+   can never masquerade as a qualified source revision.
+
+**Required consumer control:** `.github/workflows/**` must be covered by
+CODEOWNERS (or a ruleset) so a PR cannot alter its own CI routing without
+owner review. The routing rules in the consumer's `ci.yml` are a cost
+mechanism, not a security authority — this control is what keeps skipped
+CI from becoming a qualification bypass.
+
+These properties are pinned by tests
+(`cmd/deployctl/promotion_workflow_contract_test.go`). Canonical caller
+patterns and branch-protection guidance:
+[docs/promotion-ci.md](promotion-ci.md).

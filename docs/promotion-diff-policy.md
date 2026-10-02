@@ -48,7 +48,8 @@ it. Stale proposals are regenerated deliberately — never quietly re-based.
 The check must run from code the PR cannot influence: a trusted execution of
 `deployctl promotion check --repo <repo> --base <base-sha> --head <head-sha>
 [--repo-dir <checkout>]` against the Git data API — ultimately the toolkit's
-reusable workflow pinned by full commit SHA (planned; not published yet). It never executes PR-controlled code and needs no
+reusable workflow pinned by full commit SHA
+(`.github/workflows/promotion.yml`). It never executes PR-controlled code and needs no
 production secrets.
 
 ## Freshness is enforced inside the checker
@@ -98,6 +99,49 @@ PR (revision, migration claims, version) comes from the trusted-base object,
 never from local claims. Its pinned `repo@sha256:...` digests are the identity;
 promotion/rollback to it never depends on the disposable `<source-sha>`
 discovery tag still existing.
+
+## Promotion intent comes first
+
+The classifier (`deployctl promotion classify`, the engine behind
+`promotion.yml`) applies the freshness and evidence rules above only to
+**promotion attempts**. Intent is semantic: a transition is
+promotion-sensitive when it changes `spec.release` of a `.deploy/environments/<environment>.yaml`
+file, or when it adds, modifies or removes any file under
+`.deploy/releases/` — the namespace of immutable authority objects that
+future promotions treat as trusted-base inputs. Everything else is
+**ORDINARY**: an ordinary multi-commit PR or an out-of-date base is
+ordinary work, never INVALID for failing rules only promotion attempts are
+subject to.
+
+| Classification | Meaning                                                    |
+| -------------- | ---------------------------------------------------------- |
+| `PROMOTION`    | valid promotion-only transition                            |
+| `ORDINARY`     | no promotion intent; the consumer's full CI applies        |
+| `INVALID`      | promotion attempt that violates the policy (mixed, stale, malformed) |
+| `ERROR`        | cannot classify — read or infrastructure failure, never a policy verdict |
+
+A release manifest may enter trusted main **only as part of a valid
+promotion transition**: a lone release-file addition is INVALID, so the
+already-immutable-release fast path is never fed unaudited evidence.
+
+## Push transitions
+
+Push classification decides the **ref transition** (`before → after`), not
+commit topology: merge, squash, rebase and multi-commit pushes all reduce
+to the same complete-tree diff. The same two-entry rule, semantic
+environment equality and evidence rules apply. Hardening, applied within
+promotion-attempt evaluation only:
+
+- `after` must equal the **live trusted-branch head** — a stale push event
+  (e.g. a promotion merge that raced another) is never a promotion and
+  falls back to the consumer's full CI;
+- `before` must be an **ancestor** of `after` — force pushes never
+  classify as promotions, whatever their content shape;
+- all-zeros `before`/`after` (branch creation/deletion) is never a
+  promotion.
+
+Provenance remains branch protection's job; the classifier only refuses to
+reward a rewritten or stale transition with the fast path.
 
 ## Read-failure discipline
 
