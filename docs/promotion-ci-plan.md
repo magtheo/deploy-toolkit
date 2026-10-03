@@ -375,10 +375,12 @@ all** in this gate:
 - Mode inferred from the triggering event (`pull_request_target`/`pull_request`
   → pr mode; `push` → push mode), with explicit `base`/`head` overrides.
 - Inputs: optional `base`, `head`, `repo_dir` (monorepo parity with
-  `deploy.yml`). **Zero secrets** — the implicit `GITHUB_TOKEN` suffices.
-- Permissions floor (contract item): `contents: read`, `checks: read`
-  (check-run evidence reads; verify the exact fine-grained permission during
-  implementation).
+  `deploy.yml`). **No caller-supplied secrets** — the implicit
+  `GITHUB_TOKEN` suffices.
+- Permissions floor (contract item): `contents: read`, `checks: read`,
+  `packages: read` (check-run evidence reads; `packages` authenticates
+  ghcr.io for private caller-repository packages via an ephemeral
+  DOCKER_CONFIG keychain entry built from the same token).
 - Outputs (contract items): `promotion_only` (`true` only for PROMOTION),
   `classification`, `reason` — **always set, whatever the classify command
   reported, including ERROR**. The reusable workflow's jobs always conclude

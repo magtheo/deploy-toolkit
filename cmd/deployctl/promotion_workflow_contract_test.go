@@ -2,10 +2,10 @@ package main
 
 // Contract tests for the reusable promotion-classification workflow.
 // Like deploy.yml, promotion.yml is part of Consumer Contract v1: these
-// tests pin its SEMANTIC invariants — zero secrets, least privilege,
-// full-SHA anchoring, the always-success output contract ("the classifier
-// reports; the gate decides"), and never-executes-PR-code — never
-// brittle byte snapshots of the YAML.
+// tests pin its SEMANTIC invariants — no caller-supplied secrets, least
+// privilege, full-SHA anchoring, the always-success output contract ("the
+// classifier reports; the gate decides"), and never-executes-PR-code —
+// never brittle byte snapshots of the YAML.
 
 import (
 	"os"
@@ -60,7 +60,7 @@ func TestPromotionWorkflowIsReusableWithContractOutputs(t *testing.T) {
 		}
 	}
 	if len(call.Secrets) != 0 {
-		t.Errorf("secret inputs = %v, want none — classification needs zero secrets", call.Secrets)
+		t.Errorf("secret inputs = %v, want none — classification must not take caller-supplied secrets", call.Secrets)
 	}
 	for name, want := range map[string]string{
 		"promotion_only": "${{ jobs.classify.outputs.promotion_only }}",
@@ -84,12 +84,12 @@ func TestPromotionWorkflowIsReusableWithContractOutputs(t *testing.T) {
 	}
 }
 
-// Zero secrets end to end: no secret input, no secrets.* reference —
-// classification reads with the implicit GITHUB_TOKEN only.
-func TestPromotionWorkflowZeroSecrets(t *testing.T) {
+// No caller-supplied secrets end to end: no secret input, no secrets.*
+// reference — classification reads with the implicit GITHUB_TOKEN only.
+func TestPromotionWorkflowHasNoCallerSuppliedSecrets(t *testing.T) {
 	_, raw := loadPromotionWorkflow(t)
 	if strings.Contains(raw, "secrets.") {
-		t.Error("workflow must not reference any secret — classification needs none")
+		t.Error("workflow must not reference any secret — classification must not take caller-supplied secrets")
 	}
 	if !strings.Contains(raw, "GITHUB_TOKEN: ${{ github.token }}") {
 		t.Error("classify step must authenticate with the implicit github.token")
@@ -126,8 +126,9 @@ func TestPromotionWorkflowAnchoredByItsOwnSHA(t *testing.T) {
 }
 
 // Least privilege: the workflow grants nothing by default; the classify
-// job holds exactly contents:read + checks:read (check-run evidence and
-// Git data API reads); runs-on is hardcoded to ubuntu-latest so the
+// job holds exactly contents:read + checks:read + packages:read (Git and
+// check-run API reads plus ghcr.io authentication for private
+// caller-repository packages); runs-on is hardcoded to ubuntu-latest so the
 // never-executes-PR-code property never lands on consumer self-hosted
 // runners; every checkout leaks no token and the consumer checkout has
 // full history (the release pins a revision older than the head).
@@ -137,8 +138,8 @@ func TestPromotionWorkflowLeastPrivilege(t *testing.T) {
 		t.Errorf("top-level permissions = %v, want none (no default grants)", wf.Permissions)
 	}
 	p := wf.Jobs["classify"].Permissions
-	if len(p) != 2 || p["contents"] != "read" || p["checks"] != "read" {
-		t.Errorf("classify permissions = %v, want exactly contents: read + checks: read", p)
+	if len(p) != 3 || p["contents"] != "read" || p["checks"] != "read" || p["packages"] != "read" {
+		t.Errorf("classify permissions = %v, want exactly contents: read + checks: read + packages: read", p)
 	}
 	jt := jobText(t, raw, "classify")
 	if !strings.Contains(jt, "runs-on: ubuntu-latest") {
@@ -177,12 +178,13 @@ func TestPromotionWorkflowLeastPrivilege(t *testing.T) {
 }
 
 // The caller permission floor published in docs/consumer-contract-v1.md
-// for this workflow (contents: read, checks: read) must always COVER what
-// the reusable workflow itself requests. If this test fails, a job gained
-// a new permission — raise the documented floor in the same change.
+// for this workflow (contents: read, checks: read, packages: read) must
+// always COVER what the reusable workflow itself requests. If this test
+// fails, a job gained a new permission — raise the documented floor in
+// the same change.
 func TestPromotionWorkflowPermissionFloorCoversAllJobs(t *testing.T) {
 	wf, _ := loadPromotionWorkflow(t)
-	floor := map[string]string{"contents": "read", "checks": "read"}
+	floor := map[string]string{"contents": "read", "checks": "read", "packages": "read"}
 	seen := map[string]bool{}
 	collect := func(name string, perms map[string]any) {
 		if len(perms) == 0 {
@@ -328,10 +330,52 @@ func TestPromotionCIDocumentsFailClosedRouting(t *testing.T) {
 		!strings.Contains(fence, "exit 1") {
 		t.Error("the documented routing must include a classifier-integrity sentinel that fails the run on undecidable classifications (reported ERROR leaves the classify job green)")
 	}
-	for _, want := range []string{"permissions:", "contents: read", "checks: read"} {
+	for _, want := range []string{"permissions:", "contents: read", "checks: read", "packages: read"} {
 		if !strings.Contains(fence, want) {
-			t.Errorf("the documented classify caller must grant the permission floor; misses %q — a called workflow cannot elevate past its caller and GitHub's default token lacks checks:read", want)
+			t.Errorf("the documented classify caller must grant the permission floor; misses %q — a called workflow cannot elevate past its caller, GitHub's default token lacks checks:read, and packages:read authenticates ghcr.io for private caller-repository packages", want)
 		}
+	}
+}
+
+// Private GHCR resolution: the classify job gains packages:read and
+// authenticates ghcr.io with the caller's EPHEMERAL token via a
+// RUNNER_TEMP Docker config that authn.DefaultKeychain reads. No PAT, no
+// secret input, no write scope; only ghcr.io is authenticated so
+// anonymous registries keep working; the token reaches the script only
+// through env indirection; the credential is wiped on step exit.
+func TestPromotionWorkflowResolvesPrivateGHCRWithEphemeralToken(t *testing.T) {
+	wf, raw := loadPromotionWorkflow(t)
+	p := wf.Jobs["classify"].Permissions
+	if p["packages"] != "read" {
+		t.Errorf("classify permissions = %v, want packages: read — private GHCR packages of the caller repository must resolve with the caller's ephemeral token", p)
+	}
+	run := stepField(promotionClassifyStep(t, raw), "run")
+	for _, want := range []string{
+		`export DOCKER_CONFIG="$RUNNER_TEMP/.docker"`,
+		`{"auths":{"ghcr.io":{"auth":"`,
+		`printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN"`,
+		`chmod 600 "$DOCKER_CONFIG/config.json"`,
+		`rm -rf "$DOCKER_CONFIG"`,
+	} {
+		if !strings.Contains(run, want) {
+			t.Errorf("ephemeral GHCR auth setup misses %q", want)
+		}
+	}
+	env, ok := promotionClassifyStep(t, raw)["env"].(map[string]any)
+	if !ok {
+		t.Fatal("classify step must declare an env block")
+	}
+	if env["GHCR_TOKEN"] != "${{ github.token }}" {
+		t.Errorf("GHCR_TOKEN = %v, want the implicit github.token (never a caller-supplied secret)", env["GHCR_TOKEN"])
+	}
+	if env["GHCR_USER"] != "${{ github.actor }}" {
+		t.Errorf("GHCR_USER = %v, want the caller actor", env["GHCR_USER"])
+	}
+	if strings.Contains(run, "github.token") {
+		t.Error("the token must reach the script via env indirection only, never interpolated into it")
+	}
+	if strings.Count(run, `"auths"`) != 1 {
+		t.Error("the Docker config must list exactly one registry (ghcr.io) — every other registry stays anonymous")
 	}
 }
 

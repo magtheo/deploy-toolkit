@@ -58,12 +58,14 @@ on:
 jobs:
   classify:
     # The caller's grant is a CEILING: a reusable workflow cannot elevate
-    # past it, and GitHub's default token covers contents/packages but
-    # NOT checks — without this floor, check-run evidence reads fail and
-    # the fast path can never engage.
+    # past it. The floor carries every read scope the classifier needs:
+    # contents (API reads), checks (check-run evidence — GitHub's default
+    # token lacks it), packages (ghcr.io authentication for private
+    # caller-repository packages via an ephemeral token config).
     permissions:
       contents: read
       checks: read
+      packages: read
     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
   test:                      # every application job, definition unchanged
     needs: classify
@@ -146,6 +148,10 @@ permissions:
 jobs:
   classify:
     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
+    permissions:
+      contents: read
+      checks: read
+      packages: read
   gate:
     needs: classify
     if: always()             # a broken classifier must never skip the gate
@@ -233,18 +239,21 @@ bypass, not a cost defect.
 
 ## Operational boundaries (v1)
 
-- **Registry credentials.** The classification workflow holds zero
-  secrets by design. New-release evidence re-verification resolves the
-  release's source-SHA discovery tag from the OCI registry, using the
-  runner's ambient credentials — none, in CI. **The new-release class of
-  promotion-aware CI therefore requires anonymously readable
-  qualification artifacts** (e.g. public GHCR). Consumers with private
-  registries have no automated new-release gate in v1: they run
+- **Registry credentials.** Classification has **no caller-supplied
+  secrets**: it reads GitHub with the implicit token, and the same
+  ephemeral token (granted `packages: read` by the caller floor)
+  authenticates `ghcr.io` for **private GHCR packages accessible to the
+  caller repository's `GITHUB_TOKEN`** (normally its own linked/inherited
+  packages; GitHub's package access control is separate from the token
+  scope) — no PAT, no workflow secret, no write scope;
+  only `ghcr.io` is authenticated, so anonymously readable artifacts
+  keep resolving exactly as before. Private registries other than GHCR
+  have no automated new-release gate in v1: consumers run
   `promotion check` / `promotion classify` from an operator machine with
   a configured keychain; environment-only flips (rollbacks) never touch
-  the registry and work everywhere. An optional read-only registry
-  credential would be a consumer-contract change, decided before any
-  freeze — not an implicit gap.
+  the registry and work everywhere. Supporting other private registries
+  in CI would be a versioned consumer-contract change with a separately
+  defined authentication contract.
 - **`pull_request_target` policy.** The trusted authority gate depends on
   the `pull_request_target` event. GitHub is moving to **default
   enforcement that blocks `pull_request_target` in public repositories**
