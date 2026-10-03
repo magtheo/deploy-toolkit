@@ -101,13 +101,16 @@
 #     The caller's floor also grants packages:read, and the classify job
 #     turns that same ephemeral token into an ephemeral ghcr.io Docker
 #     config (DOCKER_CONFIG under RUNNER_TEMP) that authn.DefaultKeychain
-#     picks up — so release artifacts in PRIVATE GHCR packages associated
-#     with the caller repository resolve without any PAT, workflow secret
-#     or write scope. Only ghcr.io is authenticated; anonymous registries
-#     keep working. Other private registries remain outside v1 (operator
-#     side: `promotion check`/`classify` from a machine with a configured
-#     keychain; in CI they would need a separately defined authentication
-#     contract).
+#     picks up — so release artifacts in private GHCR packages ACCESSIBLE
+#     TO THE CALLER REPOSITORY'S GITHUB_TOKEN (normally the caller's own
+#     linked/inherited packages; Actions access can also be granted per
+#     package) resolve without any PAT, workflow secret or write scope.
+#     packages:read alone grants nothing — GitHub's package access control
+#     is separate from the token's scope. Only ghcr.io is authenticated;
+#     anonymous registries keep working. Other private registries remain
+#     outside v1 (operator side: `promotion check`/`classify` from a
+#     machine with a configured keychain; in CI they would need a
+#     separately defined authentication contract).
 #   - runs-on is hardcoded to ubuntu-latest: the never-executes-PR-code
 #     property must not accidentally land on consumer self-hosted runners
 #     with persistent access to deployment material.
@@ -245,9 +248,12 @@ jobs:
           set -euo pipefail
 
           # Ephemeral ghcr.io credential from the caller's own implicit
-          # token (the job holds packages:read): resolves PRIVATE GHCR
-          # packages associated with the caller repository. DOCKER_CONFIG
-          # redirects authn.DefaultKeychain to this RUNNER_TEMP config;
+          # token (the job holds packages:read): resolves private GHCR
+          # packages accessible to the caller repository's GITHUB_TOKEN
+          # (normally the caller's linked/inherited packages; access
+          # control is GitHub-side per package and packages:read grants
+          # nothing by itself). DOCKER_CONFIG redirects
+          # authn.DefaultKeychain to this RUNNER_TEMP config;
           # only ghcr.io is listed, so every other registry stays
           # anonymous. No PAT, no secret input, no write scope; wiped
           # when the step exits.

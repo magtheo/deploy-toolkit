@@ -242,8 +242,10 @@ bypass, not a cost defect.
 - **Registry credentials.** Classification has **no caller-supplied
   secrets**: it reads GitHub with the implicit token, and the same
   ephemeral token (granted `packages: read` by the caller floor)
-  authenticates `ghcr.io` for **private GHCR packages associated with
-  the caller repository** — no PAT, no workflow secret, no write scope;
+  authenticates `ghcr.io` for **private GHCR packages accessible to the
+  caller repository's `GITHUB_TOKEN`** (normally its own linked/inherited
+  packages; GitHub's package access control is separate from the token
+  scope) — no PAT, no workflow secret, no write scope;
   only `ghcr.io` is authenticated, so anonymously readable artifacts
   keep resolving exactly as before. Private registries other than GHCR
   have no automated new-release gate in v1: consumers run

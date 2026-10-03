@@ -488,8 +488,11 @@ Contract surface:
   implicit `GITHUB_TOKEN` suffices; classification only reads, so fork
   PRs work. The caller floor also grants `packages: read`, which the
   classify job turns into an ephemeral `ghcr.io` Docker config from that
-  same token, so release artifacts in **private GHCR packages associated
-  with the caller repository** resolve without a PAT or workflow secret
+  same token, so release artifacts in **private GHCR packages accessible
+  to the caller repository's `GITHUB_TOKEN`** — normally the caller's own
+  linked/inherited packages (GitHub's package access control is separate
+  from the token scope; `packages: read` grants nothing by itself) —
+  resolve without a PAT or workflow secret
   (only `ghcr.io` is authenticated; anonymous registries are unaffected).
   Other private registries use the operator-side `promotion check`/
   `promotion classify` path; supporting them in CI would be a versioned

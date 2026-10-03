@@ -86,7 +86,7 @@ func TestPromotionWorkflowIsReusableWithContractOutputs(t *testing.T) {
 
 // No caller-supplied secrets end to end: no secret input, no secrets.*
 // reference — classification reads with the implicit GITHUB_TOKEN only.
-func TestPromotionWorkflowZeroSecrets(t *testing.T) {
+func TestPromotionWorkflowHasNoCallerSuppliedSecrets(t *testing.T) {
 	_, raw := loadPromotionWorkflow(t)
 	if strings.Contains(raw, "secrets.") {
 		t.Error("workflow must not reference any secret — classification must not take caller-supplied secrets")
