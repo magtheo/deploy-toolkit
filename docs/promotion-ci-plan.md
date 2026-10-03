@@ -26,13 +26,31 @@
    governance control over `.github/workflows/**` (below). Without that
    control, a PR can alter its own CI routing, and skipped CI becomes a
    qualification bypass — not a cost defect.
-4. **Classifier *result* failures fall closed toward the expensive path**
-   (full CI); the *gate* additionally fails closed on INVALID and ERROR.
-   Workflow-*machinery* failures (the classify job cannot run at all) fail
-   the run and require a rerun: on PRs the enforce job still blocks the
-   merge; on pushes, publish is skipped in a red run until rerun. Authority
-   never depends on machinery succeeding; machinery failures are visible and
-   retried.
+4. **Uncertainty means the expensive path.** Only a reported `PROMOTION`
+   routes past full CI/publish — every other result *and every machinery
+   failure* routes to the expensive path. This is load-bearing because of
+   GitHub semantics: jobs that `need` a failed job are **skipped**, and
+   skipped jobs count as satisfied required checks — so a plain
+   `promotion_only != 'true'` routing condition would let a
+   machinery-failed classify job skip application CI entirely while
+   contexts report green (a full-CI bypass). Consumer routing conditions
+   must therefore be status-aware:
+   `!cancelled() && (needs.classify.result != 'success' ||
+   needs.classify.outputs.promotion_only != 'true')`. **Publication is
+   an explicit allow-list of decisive non-promotion classifications**
+   (`result == 'success' && (classification == 'ORDINARY' ||
+   classification == 'INVALID')`) — never a negation: `ERROR` means
+   *could not determine* and must not be read as "decisively not a
+   promotion", and any state added later must fail closed rather than
+   auto-publish. Uncertain pushes qualify but publish nothing, which is
+   what makes "promotion merge commits are unreleasable" hold under
+   every classifier outcome, not just the fast path. A reported `ERROR`
+   leaves the classify job green, so the consumer's
+   `classifier-integrity` sentinel (fail unless the classification is
+   decisive) keeps the run red — "rerun required" must be operationally
+   obvious, not deferred to a later `release create` failure. The *gate*
+   additionally fails closed on INVALID and ERROR and on any non-success
+   classify result. Authority never depends on machinery succeeding.
 
 ## Architecture
 
@@ -74,15 +92,30 @@ on:
 
 jobs:
   classify:
+    permissions:               # caller ceiling; default token lacks checks:read
+      contents: read
+      checks: read
     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
   test:                      # every app job, unchanged definition
     needs: classify
-    if: needs.classify.outputs.promotion_only != 'true'
+    if: ${{ !cancelled() && (needs.classify.result != 'success' || needs.classify.outputs.promotion_only != 'true') }}
     ...
   publish:                   # main-only SHA-tagged artifact publication
     needs: classify
-    if: github.event_name == 'push' && needs.classify.outputs.promotion_only != 'true'
+    if: >-
+      ${{
+        !cancelled() && github.event_name == 'push' &&
+        needs.classify.result == 'success' &&
+        (
+          needs.classify.outputs.classification == 'ORDINARY' ||
+          needs.classify.outputs.classification == 'INVALID'
+        )
+      }}
     ...
+  classifier-integrity:      # reported ERROR / machinery failure = red run
+    needs: classify
+    if: ${{ !cancelled() }}
+    steps: fail unless the classification is decisive (PROMOTION/ORDINARY/INVALID)
 ```
 
 ```yaml
@@ -262,12 +295,18 @@ codes plus a human-readable reason (exact code values fixed at
 implementation; the observable distinctions the workflow needs are:
 promotion vs not, gate-pass vs gate-fail, and a reason string).
 
-| State | Meaning | `promotion_only` | Authority gate (enforce job) | Full CI / publish |
-|---|---|---|---|---|
-| `PROMOTION` | valid promotion-only transition | `true` | pass | skip |
-| `ORDINARY` | ordinary source/administrative change | `false` | pass ("not a promotion") | run |
-| `INVALID` | mixed or malformed — e.g. source change + `spec.release` flip | `false` | **fail** with reason | run |
-| `ERROR` | cannot classify (API, data, unreadable) | `false` | **fail** (fail closed) | run |
+| State | Meaning | `promotion_only` | Authority gate (enforce job) | Qualification (tests) | Publication (publish) | Run color |
+|---|---|---|---|---|---|---|
+| `PROMOTION` | valid promotion-only transition | `true` | pass | skip | skip | green |
+| `ORDINARY` | ordinary source/administrative change | `false` | pass ("not a promotion") | run | run | green |
+| `INVALID` | mixed or malformed — e.g. source change + `spec.release` flip | `false` | **fail** with reason | run | run (push-side) | green; PR blocked |
+| `ERROR` | cannot classify (API, data, unreadable) | `false` | **fail** (fail closed) | run | **skip** | **red** (sentinel) |
+| machinery failure | classify job cannot run | absent | **fail** | run | **skip** | **red** |
+
+Qualification and publication no longer share a column: uncertainty
+qualifies but never publishes, and the `classifier-integrity` sentinel
+keeps a reported-`ERROR` run visibly red (the classify job itself is
+green for reported outcomes — the classifier reports, it does not rule).
 
 ### Failure semantics: the classifier reports; it never rules
 
@@ -290,13 +329,22 @@ both safe:
 - **Authority:** the enforce job runs `if: always()`, sees
   `needs.classify.result != 'success'`, and fails — the required check is
   unsatisfied and the merge is blocked until classification works.
-- **Cost:** routing jobs would be skipped for this run — the run is red and a
-  rerun is required. On PRs the merge is blocked regardless (authority); on
-  pushes, publish is skipped until the rerun. The invariant is deliberately
-  narrowed: **classifier *result* failures fall back to full CI;
-  workflow-*machinery* failures fail the run and require rerun.** Making even
-  machinery failures route to full CI would require `always()`/result-aware
-  conditions in every consumer job — complexity the design refuses.
+- **Cost:** the status-aware routing conditions (`result != 'success' ||
+  promotion_only != 'true'`) send every consumer test job to the expensive
+  path, and the `classifier-integrity` sentinel keeps every non-decisive
+  run red — reported `ERROR` included (the classify job itself is green
+  for reported outcomes, so the sentinel is what makes "rerun required"
+  operationally obvious). **No required context is ever satisfied green
+  without application CI having run.** Publication uses the explicit
+  allow-list (`result == 'success'` plus `classification == 'ORDINARY'
+  || 'INVALID'`): nothing is published until a push is decisively
+  classified, which keeps promotion merges unreleasable under every
+  outcome. (An earlier draft of this plan argued machinery failures
+  could leave routing jobs skipped because "the enforce job still blocks
+  the merge" — that reasoning held only for the gate workflow and ignored
+  that skipped *routing* jobs satisfy required checks on ordinary source
+  PRs, i.e. a full-CI bypass. The invariant is therefore not narrowed:
+  uncertainty means the expensive path — and never the published path.)
 
 Why INVALID must fail the gate and not merely "run full CI": a boolean model
 turns *mixed promotion + source* into a valid way to alter deployment state —
@@ -344,14 +392,19 @@ all** in this gate:
 - `ci.yml` conditional-job pattern — **no `paths-ignore`, ever**: a whole
   workflow skipped by filters leaves required checks pending and blocks PRs;
   jobs skipped by `if:` report `Skipped`, which satisfies branch protection
-  deterministically. Required-check list: the gate context plus the consumer's
-  app contexts; every context is created on every PR.
+  deterministically — which is exactly why the conditions must be
+  status-aware (Principle 4): the same mechanism is a full-CI bypass if a
+  failed classify can trigger it. Required-check list: the gate context plus
+  the consumer's app contexts; every context is created on every PR.
 - CODEOWNERS/ruleset requirement for `.github/workflows/**` (above).
 - Branch-protection guidance for the two CI classes.
 - **Deliberate property, documented:** promotion merge commits become
-  *unreleasable* — publish jobs skip, so the SHA never gets `success` contexts
-  and `release create` refuses it. Correct (they are not source revisions).
-  This composes with an existing eligibility rule, pinned by test:
+  *unreleasable under every classifier outcome* — publication requires a
+  decisive non-promotion classification, so a `PROMOTION` merge (or an
+  uncertain push) never produces the source-SHA discovery artifact and
+  `release create` refuses the SHA at artifact resolution. Correct (they
+  are not source revisions). This composes with an existing eligibility
+  rule, pinned by test:
 
   > GitHub accepts `conclusion: skipped` for required checks;
   > `release create` accepts **only `success`**. `skipped` is deliberately
@@ -387,7 +440,7 @@ all** in this gate:
 | New releases re-verified against current evidence | same evaluator in all three frontends |
 | Release manifests enter trusted main only via valid promotion transitions | release-namespace mutation is promotion-sensitive; without a valid pointer transition it is INVALID — the trusted-base fast path is never fed unaudited evidence |
 | Stale/modified proposals fail closed | CAS rules unchanged in pr mode |
-| Ordinary source changes get full required CI | `promotion_only=false` → all app jobs run |
+| Ordinary source changes get full required CI | non-`PROMOTION` outcome or machinery failure → status-aware conditions run all app jobs |
 | Mixed PR never fast-paths | INVALID: full CI **and** failing gate |
 | Publication tied to qualified source revisions | promotion merges publish nothing; merge commits unreleasable |
 | Deployment consumes the promoted immutable release | untouched |
@@ -419,7 +472,9 @@ all** in this gate:
    - INVALID mixed PR → full consumer CI runs → authority gate fails →
      merge blocked;
    - classifier machinery failure (classify job fails, outputs absent) →
-     the `if: always()` enforce job still runs and fails → merge blocked.
+     status-aware routing sends all application jobs to the expensive
+     path (never skipped-and-green) AND the `if: always()` enforce job
+     still runs and fails → merge blocked;
 6. **Live proof (consumer rehearsal):** the skipped-satisfies-protection
    behavior and the gate-blocking-INVALID behavior are demonstrated on a real
    protected branch — not assumed from documentation.

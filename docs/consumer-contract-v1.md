@@ -132,6 +132,10 @@ action_required — fails eligibility. No "probably fine."
   Git-tracked tree at the release revision — see
   [bundle-format-v1.md](bundle-format-v1.md). Leading `/`, backslashes, `.`
   and `..` segments are rejected; `*`/`**` are allowed only as whole segments.
+- `.deploy/` lives at the **Git repository root** in v1 — one project per
+  repository. `repo_dir` on the workflows selects the checkout root
+  holding `.deploy/`, never a project subdirectory inside a shared
+  repository; project-root scoping would be a versioned contract change.
 - OCI `repository`/`image` fields are **untagged repository names**; tags and
   floating references (`latest`) are structurally impossible, releases pin the
   digest separately.
@@ -413,7 +417,7 @@ jobs:
     uses: magtheo/deploy-toolkit/.github/workflows/deploy.yml@<full-toolkit-sha>
     with:
       environment: production      # required
-      repo_dir: "."                # monorepo support (optional)
+      repo_dir: "."                # consumer checkout root holding .deploy/ (optional)
       owner: ""                    # audit identity (optional)
     secrets:
       target_host: ${{ secrets.TARGET_HOST }}
@@ -463,3 +467,96 @@ toolkit itself must be consumed by a **full SHA**, never a tag or branch.
 Workflow inputs, outputs, permissions and secret names are contract items;
 changing them follows the versioning policy above. These properties are
 pinned by tests (`cmd/deployctl/workflow_contract_test.go`).
+
+### Promotion classification workflow
+
+`.github/workflows/promotion.yml` classifies a transition as
+`PROMOTION | ORDINARY | INVALID | ERROR` (the promotion-aware CI path,
+[docs/promotion-ci.md](promotion-ci.md)). It qualifies nothing and
+authorizes nothing; the consumer's gate and routing consume its outputs.
+
+Contract surface:
+
+- **Invocation** by full toolkit SHA — the same single-machinery-anchor
+  rule as the deployment workflow: `deployctl` is rebuilt from
+  `job.workflow_repository@job.workflow_sha`, and the workflow fails
+  closed on a floating ref. There is no caller-supplied toolkit ref input.
+- **Inputs** — all optional: `base`, `head` (override the event-derived
+  SHAs), `repo_dir` (the consumer repository checkout root holding
+  `.deploy/`, default `.` — v1 requires `.deploy/` at the Git repository
+  root, one project per repository). **Zero secrets** — the implicit
+  `GITHUB_TOKEN` suffices; classification only reads, so fork PRs work.
+  Consequence: new-release evidence re-verification resolves the
+  source-SHA discovery tag with the runner's ambient registry
+  credentials, so **v1 promotion CI requires anonymously readable
+  qualification artifacts**; private registries use the operator-side
+  `promotion check`/`promotion classify` path, and an optional read-only
+  registry credential would be a versioned contract change.
+- **Events** — `pull_request`/`pull_request_target` classify the PR
+  transition; `push` classifies `github.event.before → after` (stale and
+  force-pushed transitions never classify as promotions). Any other
+  triggering event is a machinery failure. Note: GitHub's Actions event
+  policy may block `pull_request_target` by default in public
+  repositories (from November 2026) — consumers adopting the gate
+  pattern must permit the event explicitly.
+- **Outputs** — `promotion_only` (`true` only for `PROMOTION`),
+  `classification`, `reason` — **always set for reported
+  classifications** (`PROMOTION`/`ORDINARY`/`INVALID`/`ERROR`). The
+  classifier reports; the caller's gate decides. Only workflow machinery
+  failures leave outputs absent and fail the run.
+- **Routing conditions are a consumer obligation.** GitHub skips jobs
+  that `need` a failed job and treats skipped jobs as satisfied required
+  checks; a plain `promotion_only != 'true'` condition would therefore
+  let a machinery-failed classify job skip application CI — a full-CI
+  bypass. Consumer routing conditions **must** be status-aware:
+  `!cancelled() && (needs.classify.result != 'success' ||
+  needs.classify.outputs.promotion_only != 'true')` — uncertainty means
+  the expensive path. **Publication is an allow-list:** artifact
+  publication requires the *decisive non-promotion* classifications by
+  name — `needs.classify.result == 'success' &&
+  (classification == 'ORDINARY' || classification == 'INVALID')`. `ERROR`
+  means *could not determine* and never publishes; a negation test would
+  auto-accept any state added later. A reported `ERROR` leaves the
+  classify job green (the classifier reports, it does not rule), so
+  consumers **must** run a `classifier-integrity` sentinel that fails the
+  run unless the classification is decisive (`PROMOTION`, `ORDINARY`,
+  `INVALID`) — uncertainty is both non-publishing and visibly red; a
+  rerun publishes after classification succeeds.
+- **Permissions** — the workflow requests exactly `contents: read` +
+  `checks: read`; callers must grant at least that floor **on the calling
+  job**. A called workflow can only be granted what its caller holds
+  (permissions are a ceiling), and GitHub's default token covers
+  `contents`/`packages` but not `checks` — an ungranted caller breaks
+  check-run evidence reads and the fast path can never engage.
+- **Consumer code is never executed** — the job hardcodes
+  `runs-on: ubuntu-latest`; the consumer checkout is read as data
+  (Git data API; the release's pinned source revision via `git cat-file`).
+
+Two properties this enforces beyond the classifier itself:
+
+1. **Release manifests enter trusted main only as part of a valid
+   promotion transition** — a lone release-file addition (no `spec.release`
+   transition) is `INVALID`. The rollback fast path treats the trusted-base
+   release copy as authoritative; it must never be fed unaudited evidence.
+2. **Promotion merge commits are unreleasable — under every classifier
+   outcome.** Publication requires a decisive non-promotion
+   classification, so `PROMOTION` merges and uncertain pushes never
+   produce the source-SHA discovery artifact, and `release create` —
+   which must resolve that artifact for the candidate SHA — fails
+   closed. On the fast path the skipped application contexts are
+   additionally ineligible (`skipped` ≠ `success`; see *Policy authority*
+   above). A promotion merge can never masquerade as a qualified source
+   revision. The price is deliberate: an ordinary push during classifier
+   uncertainty publishes only after the red run is rerun — forgetting it
+   surfaces as a loud `release create` failure, never a silent gap.
+
+**Required consumer control:** `.github/workflows/**` must be covered by
+CODEOWNERS (or a ruleset) so a PR cannot alter its own CI routing without
+owner review. The routing rules in the consumer's `ci.yml` are a cost
+mechanism, not a security authority — this control is what keeps skipped
+CI from becoming a qualification bypass.
+
+These properties are pinned by tests
+(`cmd/deployctl/promotion_workflow_contract_test.go`). Canonical caller
+patterns and branch-protection guidance:
+[docs/promotion-ci.md](promotion-ci.md).

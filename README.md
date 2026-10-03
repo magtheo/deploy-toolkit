@@ -94,6 +94,7 @@ deployctl validate <manifest.yaml>...      validate project/release/environment/
 deployctl release create [flags]           run eligibility and create an immutable release manifest
 deployctl promotion propose <env> [flags]  open the human-authorization PR for a release
 deployctl promotion check [flags]          verify a PR diff against the Promotion Diff Policy
+deployctl promotion classify [flags]       classify a transition: PROMOTION, ORDINARY, INVALID or ERROR
 deployctl version                          print version
 ```
 
@@ -251,6 +252,16 @@ Start from [`templates/`](templates/) and read
 [docs/consumer-contract-v1.md](docs/consumer-contract-v1.md); what a
 deployment target must provide — provider-neutrally — is
 [docs/target-prerequisites.md](docs/target-prerequisites.md).
+
+A second reusable workflow,
+[`promotion.yml`](docs/promotion-ci.md), classifies each transition as
+`PROMOTION | ORDINARY | INVALID | ERROR` so application CI runs only for
+work that needs it: a valid promotion-only PR (the two-line diff above)
+skips the rebuild/publish jobs, while anything else — including a mixed
+PR touching deployment state *and* source — gets full CI and fails the
+promotion gate. Promotion merge commits are deliberately unreleasable:
+they never publish artifacts, so they can never be mistaken for
+qualified source revisions.
 
 ## Design invariants
 
