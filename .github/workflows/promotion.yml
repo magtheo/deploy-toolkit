@@ -21,8 +21,10 @@
 #   # required checks, so a plain output test would let a failed classify
 #   # job skip application CI entirely — a full-CI bypass. Uncertainty
 #   # means the expensive path. The calling job MUST grant the permission
-#   # floor (a called workflow cannot elevate past its caller, and
-#   # GitHub's default token covers contents/packages but not checks).
+#   # floor (a called workflow cannot elevate past its caller; the floor
+#   # carries the three read scopes the classifier needs — contents for
+#   # API reads, checks for check-run evidence, packages for ghcr.io
+#   # authentication against private caller-repository packages).
 #   # Publication uses an explicit ALLOW-LIST of decisive
 #   # non-promotion classifications: ERROR means "could not determine",
 #   # and any state added later must fail closed, never auto-publish:
@@ -30,6 +32,7 @@
 #     permissions:
 #       contents: read
 #       checks: read
+#       packages: read
 #     uses: magtheo/deploy-toolkit/.github/workflows/promotion.yml@<full-sha>
 #   test:
 #     needs: classify
@@ -93,14 +96,18 @@
 #     job.workflow_repository@job.workflow_sha — the exact commit of this
 #     workflow, the single machinery trust anchor. There is deliberately
 #     no caller-supplied toolkit ref input.
-#   - Zero secrets: the implicit GITHUB_TOKEN (read scopes only) suffices.
-#     Classification from fork PRs works for the same reason. Consequence:
-#     OCI evidence re-verification resolves the release's source-SHA
-#     discovery tag with the runner's ambient registry credentials — none,
-#     in CI — so promotion CI requires ANONYMOUSLY READABLE qualification
-#     artifacts. Private registries are an operator-side path (`promotion
-#     check`/`classify` from a machine with a configured keychain); an
-#     optional read-only registry credential would be a contract change.
+#   - No caller-supplied secrets: the implicit GITHUB_TOKEN (read scopes
+#     only) suffices for API reads, so classification from fork PRs works.
+#     The caller's floor also grants packages:read, and the classify job
+#     turns that same ephemeral token into an ephemeral ghcr.io Docker
+#     config (DOCKER_CONFIG under RUNNER_TEMP) that authn.DefaultKeychain
+#     picks up — so release artifacts in PRIVATE GHCR packages associated
+#     with the caller repository resolve without any PAT, workflow secret
+#     or write scope. Only ghcr.io is authenticated; anonymous registries
+#     keep working. Other private registries remain outside v1 (operator
+#     side: `promotion check`/`classify` from a machine with a configured
+#     keychain; in CI they would need a separately defined authentication
+#     contract).
 #   - runs-on is hardcoded to ubuntu-latest: the never-executes-PR-code
 #     property must not accidentally land on consumer self-hosted runners
 #     with persistent access to deployment material.
@@ -167,11 +174,12 @@ permissions: {}
 
 jobs:
   classify:
-    name: classify (trusted code, zero secrets, never PR code)
+    name: classify (trusted code, no caller-supplied secrets, never PR code)
     runs-on: ubuntu-latest
     permissions:
       contents: read
       checks: read
+      packages: read
     outputs:
       promotion_only: ${{ steps.classify.outputs.promotion_only }}
       classification: ${{ steps.classify.outputs.classification }}
@@ -231,8 +239,25 @@ jobs:
           EVENT_PUSH_BEFORE: ${{ github.event.before }}
           EVENT_PUSH_AFTER: ${{ github.event.after }}
           REPO_DIR: ${{ inputs.repo_dir }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          # Ephemeral ghcr.io credential from the caller's own implicit
+          # token (the job holds packages:read): resolves PRIVATE GHCR
+          # packages associated with the caller repository. DOCKER_CONFIG
+          # redirects authn.DefaultKeychain to this RUNNER_TEMP config;
+          # only ghcr.io is listed, so every other registry stays
+          # anonymous. No PAT, no secret input, no write scope; wiped
+          # when the step exits.
+          export DOCKER_CONFIG="$RUNNER_TEMP/.docker"
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' \
+            "$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 | tr -d '\n')" \
+            > "$DOCKER_CONFIG/config.json"
+          chmod 600 "$DOCKER_CONFIG/config.json"
 
           case "$EVENT_NAME" in
             pull_request|pull_request_target)

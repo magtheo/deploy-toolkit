@@ -484,14 +484,16 @@ Contract surface:
 - **Inputs** — all optional: `base`, `head` (override the event-derived
   SHAs), `repo_dir` (the consumer repository checkout root holding
   `.deploy/`, default `.` — v1 requires `.deploy/` at the Git repository
-  root, one project per repository). **Zero secrets** — the implicit
-  `GITHUB_TOKEN` suffices; classification only reads, so fork PRs work.
-  Consequence: new-release evidence re-verification resolves the
-  source-SHA discovery tag with the runner's ambient registry
-  credentials, so **v1 promotion CI requires anonymously readable
-  qualification artifacts**; private registries use the operator-side
-  `promotion check`/`promotion classify` path, and an optional read-only
-  registry credential would be a versioned contract change.
+  root, one project per repository). **No caller-supplied secrets** — the
+  implicit `GITHUB_TOKEN` suffices; classification only reads, so fork
+  PRs work. The caller floor also grants `packages: read`, which the
+  classify job turns into an ephemeral `ghcr.io` Docker config from that
+  same token, so release artifacts in **private GHCR packages associated
+  with the caller repository** resolve without a PAT or workflow secret
+  (only `ghcr.io` is authenticated; anonymous registries are unaffected).
+  Other private registries use the operator-side `promotion check`/
+  `promotion classify` path; supporting them in CI would be a versioned
+  contract change with a separately defined authentication contract.
 - **Events** — `pull_request`/`pull_request_target` classify the PR
   transition; `push` classifies `github.event.before → after` (stale and
   force-pushed transitions never classify as promotions). Any other
@@ -523,11 +525,15 @@ Contract surface:
   `INVALID`) — uncertainty is both non-publishing and visibly red; a
   rerun publishes after classification succeeds.
 - **Permissions** — the workflow requests exactly `contents: read` +
-  `checks: read`; callers must grant at least that floor **on the calling
+  `checks: read` + `packages: read`; callers must grant at least that
+  floor **on the calling
   job**. A called workflow can only be granted what its caller holds
   (permissions are a ceiling), and GitHub's default token covers
   `contents`/`packages` but not `checks` — an ungranted caller breaks
-  check-run evidence reads and the fast path can never engage.
+  check-run evidence reads and the fast path can never engage; an
+  ungranted `packages` scope breaks ghcr.io authentication for private
+  caller-repository packages (anonymous reads still work for public
+  artifacts).
 - **Consumer code is never executed** — the job hardcodes
   `runs-on: ubuntu-latest`; the consumer checkout is read as data
   (Git data API; the release's pinned source revision via `git cat-file`).
