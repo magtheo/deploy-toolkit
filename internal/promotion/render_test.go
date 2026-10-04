@@ -37,5 +37,11 @@ func TestRenderBodyAuthorizationNamesEnvironment(t *testing.T) {
 		if strings.Contains(body, "production promotion") {
 			t.Errorf("hard-coded production wording must not appear, body:\n%s", body)
 		}
+		if !strings.Contains(body, "No additional authorization is required; deployment execution follows the environment's configured deployment trigger.") {
+			t.Errorf("authorization section must separate authorization (merge) from execution (deployment trigger), body:\n%s", body)
+		}
+		if strings.Contains(body, "No other button") {
+			t.Errorf("merging is authorization, not execution — 'No other button is required' misstates the deployment semantics, body:\n%s", body)
+		}
 	}
 }

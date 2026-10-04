@@ -82,7 +82,7 @@ func RenderBody(in BodyInput) string {
 
 	b.WriteString("\n## Authorization\n\n")
 	fmt.Fprintf(&b, "**Merging this PR authorizes promotion of this exact release to environment `%s`.** ", in.Environment)
-	b.WriteString("No other button is required. ")
+	b.WriteString("No additional authorization is required; deployment execution follows the environment's configured deployment trigger. ")
 	b.WriteString("This proposal was generated from deterministic eligibility evidence; AI review is advisory only.\n")
 	return b.String()
 }
