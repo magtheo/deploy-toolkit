@@ -81,7 +81,7 @@ func RenderBody(in BodyInput) string {
 	fmt.Fprintf(&b, "| rollback safe | %t |\n", in.Migration.RollbackSafe)
 
 	b.WriteString("\n## Authorization\n\n")
-	b.WriteString("**Merging this PR authorizes the production promotion of this exact release.** ")
+	fmt.Fprintf(&b, "**Merging this PR authorizes promotion of this exact release to environment `%s`.** ", in.Environment)
 	b.WriteString("No other button is required. ")
 	b.WriteString("This proposal was generated from deterministic eligibility evidence; AI review is advisory only.\n")
 	return b.String()
