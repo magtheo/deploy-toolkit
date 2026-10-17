@@ -60,6 +60,36 @@ The target must already satisfy the generic target contract. For SSH targets, [b
 
 Deploy Toolkit does not provision hosts, install runtimes, configure DNS, create databases, or create application secrets.
 
+### Local operator CLI provenance and authentication
+
+For local \`release create\`, \`promotion propose\`, \`promotion check\` and recovery operations, use a **known full Deploy Toolkit commit SHA**. Prefer the SHA pinned by the consumer's \`uses: .../deploy.yml@<40-hex-sha>\` caller so the locally run CLI and trusted deploy workflow are built from the same reviewed version. A globally installed \`deployctl\` can be older than that pin (or older than toolkit main) and produce outdated proposal wording or semantics. Do not silently replace the pinned version with a floating \`main\`.
+
+On an operator workstation, build an explicitly pinned copy instead of trusting an unverified binary on \`PATH\`:
+
+\`\`\`bash
+# Choose the exact 40-character SHA from the consumer's reviewed workflow pin.
+TOOLKIT_SHA=<full-40-character-toolkit-sha>
+git clone https://github.com/magtheo/deploy-toolkit.git /tmp/deploy-toolkit-operator
+git -C /tmp/deploy-toolkit-operator checkout --detach "$TOOLKIT_SHA"
+test "$(git -C /tmp/deploy-toolkit-operator rev-parse HEAD)" = "$TOOLKIT_SHA"
+(
+  cd /tmp/deploy-toolkit-operator
+  GOWORK=off go build -o /tmp/deployctl-pinned ./cmd/deployctl
+)
+# Use /tmp/deployctl-pinned instead of a possibly stale deployctl on PATH.
+\`\`\`
+
+If the checkout already exists, verify its provenance and worktree state before reusing it; do not overwrite operator files. To use a newer toolkit fix, update and review the consumer's workflow pin as a **separate** change. The v1 CLI does not yet expose a reliable \`deployctl version\` command; the checked-out full commit identity is the provenance evidence.
+
+**GitHub API authentication is separate from OCI registry authentication.** GitHub-backed CLI operations require \`GITHUB_TOKEN\` (for example \`gh auth status\`, then \`GITHUB_TOKEN="$(gh auth token)" /tmp/deployctl-pinned release create ...\`). The token must have the repository permissions needed to read checks and, for \`promotion propose\`, create branches and pull requests. Keep token values out of commands copied into logs or chat; never print them.
+
+Private image digest resolution uses the OCI keychain, **not** \`GITHUB_TOKEN\` automatically. Authenticate to the image registry independently (for GitHub Container Registry, use \`docker login ghcr.io\` with appropriate read access, or another compatible credential provider); verify authentication without showing the credential. The reusable promotion-classification workflow configures its own ephemeral GHCR authentication, but that does **not** implicitly authenticate a local CLI session.
+
+For a dirty consumer checkout, create a detached worktree at the exact eligible source SHA and run local release creation there. The checkout should be clean, and the SHA must belong to trusted \`main\`; do not use a PR head or uncommitted files as deployment material. Release creation only writes a local immutable manifest; proposal creates a reviewable PR; neither operation authorizes deployment by itself.
+
+Future operator automation for these deterministic steps is tracked separately in [#29](https://github.com/magtheo/deploy-toolkit/issues/29). Human promotion merge remains authorization, and the environment's configured trigger still controls deployment execution.
+
+
 ---
 
 ## 3. Step 1 — Choose the eligible revision
